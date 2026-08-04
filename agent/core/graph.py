@@ -16,6 +16,7 @@ from langchain_core.messages import (
     RemoveMessage,
     SystemMessage,
 )
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
@@ -140,11 +141,14 @@ def build_agent_graph(
     intent_classifier = LLMIntentClassifier(llm, fallback=RuleFallbackClassifier())
 
     # —— 会话与上下文 ——
-    async def load_context(state: AgentState) -> dict[str, Any]:
+    async def load_context(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         updates = set_status(Status.THINKING, message="正在加载会话上下文")
-        # 会话作用域兜底：缺失时用默认值（正常由调用方以 thread_id=session_id 传入）。
-        updates["session_id"] = state.get("session_id") or "default"
-        updates["user_id"] = state.get("user_id") or "default"
+        # 会话作用域兜底：优先对齐真实 checkpointer 线程（thread_id == session_id 契约），
+        # 二者都缺时给一次性匿名 id——绝不复用固定常量 "default"：若调用方以 session_id
+        # 派生 thread_id，固定兜底会让多个匿名会话挤进同一线程，checkpointer 跨会话串线。
+        thread_id = (config.get("configurable") or {}).get("thread_id")
+        updates["session_id"] = state.get("session_id") or thread_id or f"anon-{uuid.uuid4().hex}"
+        updates["user_id"] = state.get("user_id") or "anonymous"
         raw_input = (state.get("input") or "").strip()
         # 输入长度护栏（CLAUDE.md 资源上限）：超长截断而非拒绝，防止超长输入失控。
         if len(raw_input) > cfg.graph.max_input_chars:
