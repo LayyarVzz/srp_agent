@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from agent.share.models import Citation
 from agent.response.status import StatusEvent
+from agent.share.models import Citation
 from agent.tools.models import ToolCallRecord
 
 # —— finished_reason 常量（结束原因，供前端/调用方区分处理路径）——

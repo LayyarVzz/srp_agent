@@ -6,6 +6,19 @@
 
 from __future__ import annotations
 
+from pydantic import BaseModel
+
+
+class ErrorRecord(BaseModel):
+    """存放入 LangGraph state 的结构化错误信息（可被 checkpointer 序列化）。
+
+    WHY 与 `AgentError` 区分：`AgentError` 是 Exception 实例，无法可靠地经
+    msgpack checkpointer 序列化；凡要落进图状态的错误一律用本模型（code 可路由）。
+    """
+
+    code: str
+    message: str
+
 
 class AgentError(Exception):
     """Agent 模块统一的错误基类。
@@ -36,5 +49,6 @@ __all__ = [
     "LLM_ERROR_INVALID_OUTPUT",
     "LLM_ERROR_REQUEST",
     "AgentError",
+    "ErrorRecord",
     "LLMError",
 ]
