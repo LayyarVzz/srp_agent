@@ -44,6 +44,10 @@ class LLMService:
     ) -> None:
         self._config = config
         self._chat_model = chat_model
+        # 记录是否注入自定义模型：`chat_model` 属性懒缓存会改写 `_chat_model`，
+        # 不能再用「_chat_model is None」判断「未注入」，否则结构化输出会被缓存到的
+        # 普通模型污染（见 structured_model）。
+        self._chat_model_injected = chat_model is not None
 
     @property
     def chat_model(self) -> BaseChatModel:
@@ -91,7 +95,7 @@ class LLMService:
         """
         effective_method = method or self._config.structured_method
         extra_body = self._config.structured_extra_body
-        if extra_body is not None and self._chat_model is None:
+        if extra_body is not None and not self._chat_model_injected:
             # DeepSeek V4 思考模式拒绝显式 tool_choice，无法在思考模式下强制 schema 工具；
             # 未注入自定义模型时，构造带 extra_body（thinking=disabled）的专用模型再绑定，
             # 普通对话（ainvoke_text）仍走 self.chat_model、保留思考模式。
