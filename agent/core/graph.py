@@ -238,13 +238,21 @@ def build_agent_graph(
         updates = set_status(Status.SPEAKING, message="正在生成回答")
         messages = state.get("messages") or []
         try:
-            reply = await llm.ainvoke_text([SystemMessage(content=SYSTEM_PROMPT), *messages])
-            updates["final_answer"] = reply
+            reply = (
+                await llm.ainvoke_text([SystemMessage(content=SYSTEM_PROMPT), *messages]) or ""
+            ).strip()
         except LLMError as exc:
             logger.warning("回答生成失败（%s），降级话术", exc)
             reply = _FALLBACK_GENERIC_TEXT
-            updates["final_answer"] = reply
             updates["finished_reason"] = FINISHED_REASON_ERROR
+        if not reply:
+            # 与 fallback_chat 一致：生成节点内拦截空回复并落定最终文案。
+            # WHY 不能留给 validate_output：它只覆盖 final_answer，无法同步修正
+            # 追加进 messages 的空 AIMessage，会导致 checkpoint 历史与最终回复不一致。
+            logger.warning("回答为空，降级为固定话术")
+            reply = _FALLBACK_GENERIC_TEXT
+            updates["finished_reason"] = FINISHED_REASON_ERROR
+        updates["final_answer"] = reply
         updates["messages"] = [AIMessage(content=reply, id=_new_message_id("a"))]
         return updates
 

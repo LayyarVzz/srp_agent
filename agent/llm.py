@@ -116,7 +116,7 @@ class LLMService:
         """普通文本补全便利方法（P1 generate_answer 复用）。"""
         try:
             resp = await self.chat_model.ainvoke(prompt)
-            return str(resp.content)
+            return str(resp.content or "")
         except Exception as exc:
             logger.warning("文本生成失败: %s", exc)
             raise LLMError(LLM_ERROR_REQUEST, f"LLM 文本生成失败: {exc}") from exc
