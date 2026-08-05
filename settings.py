@@ -15,6 +15,7 @@ from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from agent.core.config import LLMProvider
+from services.tools_mcp.config import MCPTransport
 
 
 class RuntimeSettings(BaseSettings):
@@ -35,15 +36,17 @@ class RuntimeSettings(BaseSettings):
     llm_base_url: str | None = None  # 覆盖预设
     llm_model: str | None = None  # 覆盖预设
 
-    # —— 服务端口 ——
+    # —— FastAPI 服务端口 ——
     api_host: str = "0.0.0.0"  # noqa: S104  # 开发默认监听全部接口，部署时按需收紧
-    api_port: int = 8000
+    api_port: int = 8000 
 
-    # —— 外部 MCP 服务地址（先占位）——
-    rag_mcp_url: str | None = None
-    memory_mcp_url: str | None = None
-    tools_mcp_url: str | None = None  # tools_mcp（datetime/计算器等）；缺省走 stdio 子进程
-    qdrant_url: str | None = None
+    # —— tools_mcp 服务运行方式（stdio 默认；streamable-http 供端口/远程部署）——
+    mcp_transport: MCPTransport = MCPTransport.STDIO
+    mcp_host: str = "127.0.0.1"  # 云服务器/外部访问须设 0.0.0.0（默认回环更安全）
+    mcp_port: int = 8100  # 避开 API_PORT=8000
+    mcp_streamable_http_path: str = "/mcp"  # 与 fastmcp 默认一致，客户端连接地址即该路径
+    mcp_stateless_http: bool = True  # 工具纯函数无会话 → 默认无状态，支持水平扩展
+
 
     # —— 日志（运行期级别）——
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
