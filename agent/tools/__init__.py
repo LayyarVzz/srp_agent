@@ -1,27 +1,23 @@
-"""工具注册表与执行：统一分发本地工具与 MCP 工具（P1 类型级预留）。"""
+"""工具响应/适配模型与 MCP 接入工厂。
 
+工具执行统一由 LangChain `ToolNode` 承担；本包提供响应模型（ToolResult/ToolCallRecord）
+与 `build_tools_from_mcp` 装配工厂。
+"""
+
+from agent.tools.factory import build_tools_from_mcp
 from agent.tools.models import (
-    TOOL_ERROR_NO_TOOL,
-    TOOL_ERROR_NOT_IMPLEMENTED,
+    TOOL_ERROR_EXECUTION,
     TOOL_ERROR_UNKNOWN_TOOL,
     ToolCallRecord,
     ToolError,
     ToolResult,
-    ToolSpec,
-    UnknownToolError,
 )
-from agent.tools.registry import InMemoryToolRegistry, Tool, ToolRegistry
 
 __all__ = [
-    "TOOL_ERROR_NOT_IMPLEMENTED",
-    "TOOL_ERROR_NO_TOOL",
+    "TOOL_ERROR_EXECUTION",
     "TOOL_ERROR_UNKNOWN_TOOL",
-    "InMemoryToolRegistry",
-    "Tool",
     "ToolCallRecord",
     "ToolError",
-    "ToolRegistry",
     "ToolResult",
-    "ToolSpec",
-    "UnknownToolError",
+    "build_tools_from_mcp",
 ]

@@ -12,7 +12,9 @@ from collections.abc import Mapping, Sequence
 from typing import Literal, TypeVar
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
+from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -44,16 +46,17 @@ class LLMService:
     ) -> None:
         self._config = config
         self._chat_model = chat_model
-        # 记录是否注入自定义模型：`chat_model` 属性懒缓存会改写 `_chat_model`，
-        # 不能再用「_chat_model is None」判断「未注入」，否则结构化输出会被缓存到的
-        # 普通模型污染（见 structured_model）。
-        self._chat_model_injected = chat_model is not None
 
     @property
     def chat_model(self) -> BaseChatModel:
-        """返回底层聊天模型，未注入时按配置懒构造真客户端。"""
+        """返回底层聊天模型，未注入时按配置懒构造真客户端。
+
+        WHY 统一关闭思考：懒构造即带 `structured_extra_body`（DeepSeek V4 →
+        `thinking=disabled`），text/tool/structured 三条路径共用同一模型，
+        不再存在「普通对话保留思考 / 结构化关闭思考」的双模型切换。
+        """
         if self._chat_model is None:
-            self._chat_model = self._build_chat_model()
+            self._chat_model = self._build_chat_model(extra_body=self._config.structured_extra_body)
         return self._chat_model
 
     def _build_chat_model(self, *, extra_body: Mapping[str, object] | None = None) -> ChatOpenAI:
@@ -63,7 +66,8 @@ class LLMService:
             raise LLMError(LLM_ERROR_AUTH, "未配置 LLM_API_KEY（或 LLM_API_KEY 为空）")
         try:
             # base_url/model 经 effective_* 解析（显式覆盖优先，否则回退预设）。
-            # extra_body 供结构化输出关闭 DeepSeek V4 思考模式（见 structured_extra_body）。
+            # extra_body 统一携带关闭思考的 body（见 structured_extra_body），
+            # 所有 LLM 路径（text/tool/structured）共用。
             return ChatOpenAI(
                 model=cfg.effective_model,
                 api_key=api_key,
@@ -94,15 +98,32 @@ class LLMService:
         不要传 strict=True（DeepSeek 不支持强制 JSON Schema）。
         """
         effective_method = method or self._config.structured_method
-        extra_body = self._config.structured_extra_body
-        if extra_body is not None and not self._chat_model_injected:
-            # DeepSeek V4 思考模式拒绝显式 tool_choice，无法在思考模式下强制 schema 工具；
-            # 未注入自定义模型时，构造带 extra_body（thinking=disabled）的专用模型再绑定，
-            # 普通对话（ainvoke_text）仍走 self.chat_model、保留思考模式。
-            model: BaseChatModel = self._build_chat_model(extra_body=extra_body)
-        else:
-            model = self.chat_model
-        return model.with_structured_output(schema, method=effective_method)
+        # chat_model 已在懒构造时统一关闭思考（structured_extra_body），直接复用即可，
+        # 无需再构造带 extra_body 的专用模型。
+        return self.chat_model.with_structured_output(schema, method=effective_method)
+
+    def tool_model(self, tools: Sequence[BaseTool]) -> Runnable:
+        """把工具列表绑定到模型，返回可产出 `AIMessage.tool_calls` 的 Runnable。
+
+        WHY 复用 `chat_model`：懒构造时已统一关闭思考（DeepSeek V4 下带
+        `thinking=disabled`），`bind_tools` 可直接使用，无需再构造专用模型。
+        """
+        return self.chat_model.bind_tools(tools)
+
+    async def ainvoke_tools(self, tools: Sequence[BaseTool], prompt: str | Sequence) -> AIMessage:
+        """一次工具选择/作答调用；任何失败归一化为 LLMError(llm_error.request)。
+
+        返回带 `tool_calls`（模型选择工具）或不带 `tool_calls`（模型直接作答）的
+        AIMessage，由图内 `route_tool_choice` 据此分流。
+        """
+        try:
+            resp = await self.tool_model(tools).ainvoke(prompt)
+        except Exception as exc:
+            logger.warning("工具选择调用失败: %s", exc)
+            raise LLMError(LLM_ERROR_REQUEST, f"LLM 工具选择调用失败: {exc}") from exc
+        if not isinstance(resp, AIMessage):
+            raise LLMError(LLM_ERROR_REQUEST, "工具选择未返回 AIMessage")
+        return resp
 
     async def ainvoke_structured(self, schema: type[_S], prompt: str | Sequence) -> _S:
         """一次结构化输出调用；任何失败归一化为 LLMError(llm_error.request)。"""

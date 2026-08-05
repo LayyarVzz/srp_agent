@@ -2,8 +2,8 @@
 
 from agent.core.graph import build_agent_graph
 from agent.core.state import (
+    NODE_CALL_MODEL,
     NODE_CLASSIFY_INTENT,
-    NODE_DECIDE_TOOL,
     NODE_DISPATCH_TOOL,
     NODE_FALLBACK_CHAT,
     NODE_FORMAT_RESPONSE,
@@ -15,8 +15,8 @@ from agent.core.state import (
 )
 
 __all__ = [
+    "NODE_CALL_MODEL",
     "NODE_CLASSIFY_INTENT",
-    "NODE_DECIDE_TOOL",
     "NODE_DISPATCH_TOOL",
     "NODE_FALLBACK_CHAT",
     "NODE_FORMAT_RESPONSE",

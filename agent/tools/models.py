@@ -1,31 +1,19 @@
-"""工具契约数据模型与错误码（P1 类型级预留，无执行逻辑）。
+"""工具响应/适配模型与错误码。
 
-WHY P1 先立契约：`build_agent_graph` 的依赖注入需要带类型的 `ToolRegistry`，
-真实本地/MCP 工具在 P2 补齐；本模块只描述「工具长什么样、怎么调」。
+WHY 本模块只承载「响应与轨迹」契约：
+工具执行本身由 LangChain `ToolNode` 承担，适配层把 `AIMessage.tool_calls` +
+`ToolMessage` 翻译成这些模型；不在此定义工具声明/注册表（BaseTool 承担声明）。
 """
 
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import BaseModel, Field
 
-from agent.errors import AgentError
 from agent.share.models import Citation
 
-# —— 工具错误码（tool_error.* 命名空间，与 P6 错误分类兼容）——
-TOOL_ERROR_NO_TOOL = "tool_error.no_tool"
-TOOL_ERROR_NOT_IMPLEMENTED = "tool_error.not_implemented"
-TOOL_ERROR_UNKNOWN_TOOL = "tool_error.unknown_tool"
-
-
-class ToolSpec(BaseModel):
-    """工具声明：输入 JSON Schema + 可 JSON 序列化的输出契约（工具契约）。"""
-
-    name: str
-    description: str
-    input_schema: dict[str, object]
-    source: Literal["local", "mcp"]
+# —— 工具错误码（tool_error.* 命名空间）——
+TOOL_ERROR_EXECUTION = "tool_error.execution"  # 工具执行失败（含参数校验/运行时异常）
+TOOL_ERROR_UNKNOWN_TOOL = "tool_error.unknown_tool"  # 模型幻觉出未注册工具名
 
 
 class ToolError(BaseModel):
@@ -48,16 +36,13 @@ class ToolResult(BaseModel):
 
 
 class ToolCallRecord(BaseModel):
-    """一次工具调用轨迹记录（供 tool_trace 回溯）。"""
+    """一次工具调用轨迹记录（供 tool_trace 回溯）。
+
+    `status` 仅取值 `"ok"` / `"error"`（由适配层填写）；工具选择阶段的
+    「未选中/无需工具」不再产生独立记录（模型直接回答时 tool_trace 为空）。
+    """
 
     tool_name: str
     arguments: dict[str, object]
-    status: str  # ok / error / no_tool_matched ...
+    status: str  # ok / error
     result: ToolResult | None = None
-
-
-class UnknownToolError(AgentError):
-    """注册表未找到指定工具时抛出的进程内异常（不入 checkpointed state）。"""
-
-    def __init__(self, tool_name: str) -> None:
-        super().__init__(TOOL_ERROR_UNKNOWN_TOOL, f"未知工具: {tool_name}")

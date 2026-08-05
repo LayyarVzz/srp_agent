@@ -63,8 +63,7 @@ class LLMBehaviorConfig(BaseModel):
     # langchain-openai >= 0.3 默认 method 是 json_schema，DeepSeek 会拒绝
     # function_calling 是 DeepSeek / Qwen / 任意兼容端点最广的公共能力。
     structured_method: Literal["function_calling", "json_mode", "json_schema"] = "function_calling"
-    # DeepSeek V4 默认思考模式且拒绝显式 tool_choice；结构化输出需关闭思考模式。
-    disable_thinking_for_structured: bool = True
+    disable_thinking: bool = True
 
 
 class LLMConfig(LLMBehaviorConfig):
@@ -127,14 +126,11 @@ class LLMConfig(LLMBehaviorConfig):
     @property
     def structured_extra_body(self) -> dict[str, object] | None:
         """结构化输出请求需附加的 provider 特定 body 参数。
-
-        WHY 仅 DeepSeek V4：V4 默认思考模式拒绝显式 tool_choice，须附带
-        `thinking={"type": "disabled"}` 才能用 function_calling；非 V4 端点（Qwen /
-        兼容端点 / 旧版 deepseek-chat）不认识该参数，一律不附带。
+        这里先只处理deepseek
         """
         if (
             self.provider == LLMProvider.DEEPSEEK
-            and self.disable_thinking_for_structured
+            and self.disable_thinking
             and _DEEPSEEK_V4_MODEL_HINT in self.effective_model
         ):
             return {"thinking": {"type": "disabled"}}
@@ -150,13 +146,17 @@ class AgentGraphConfig(BaseModel):
     trim_keep_recent_rounds: int = Field(default=10, ge=0)  # 裁剪保留最近 N 轮
 
 
-class ToolRegistryConfig(BaseModel):
-    """工具注册与调用护栏行为（MCP 服务地址属运行环境，见根 settings.py）。"""
+class MCPToolsConfig(BaseModel):
+    """MCP 工具接入护栏行为（MCP 服务地址属运行环境，见根 settings.py）。
 
-    mcp_timeout_s: float = 10.0  # MCP 调用超时（默认 10s）
-    mcp_max_retries: int = Field(default=2, ge=0)
-    mcp_max_content_chars: int = Field(default=10_000, ge=1)  # 远端内容长度上限
-    allowed_local_tools: tuple[str, ...] = ()  # 本地工具白名单
+    超时/重试在 MCP 客户端连接配置（langchain-mcp-adapters）生效，不由图内节点承担；
+    `mcp_max_content_chars` 供响应适配层截断 ToolMessage 内容（长度上限护栏）。
+    所有工具一律经 MCP 客户端接入，无进程内本地工具直连。
+    """
+
+    mcp_timeout_s: float = 10.0  # MCP 客户端连接/调用超时（默认 10s）
+    mcp_max_retries: int = Field(default=2, ge=0)  # MCP 调用重试上限
+    mcp_max_content_chars: int = Field(default=10_000, ge=1)  # 工具返回内容长度上限
 
 
 class MemoryBehaviorConfig(BaseModel):
@@ -172,11 +172,10 @@ class AgentFrameworkConfig(BaseModel):
 
     graph: AgentGraphConfig = Field(default_factory=AgentGraphConfig)
     llm_behavior: LLMBehaviorConfig = Field(default_factory=LLMBehaviorConfig)
-    tools: ToolRegistryConfig = Field(default_factory=ToolRegistryConfig)
+    tools: MCPToolsConfig = Field(default_factory=MCPToolsConfig)
     memory: MemoryBehaviorConfig = Field(default_factory=MemoryBehaviorConfig)
 
     @classmethod
     def get_default(cls) -> AgentFrameworkConfig:
         """返回框架行为默认配置。"""
         return cls()
-
