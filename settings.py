@@ -42,6 +42,7 @@ class RuntimeSettings(BaseSettings):
     # —— 外部 MCP 服务地址（先占位）——
     rag_mcp_url: str | None = None
     memory_mcp_url: str | None = None
+    tools_mcp_url: str | None = None  # tools_mcp（datetime/计算器等）；缺省走 stdio 子进程
     qdrant_url: str | None = None
 
     # —— 日志（运行期级别）——

@@ -23,7 +23,7 @@ from agent.tools.models import ToolCallRecord, ToolResult
 NODE_LOAD_CONTEXT = "load_context"
 NODE_TRIM_HISTORY = "trim_history"
 NODE_CLASSIFY_INTENT = "classify_intent"
-NODE_DECIDE_TOOL = "decide_tool"
+NODE_CALL_MODEL = "call_model"
 NODE_DISPATCH_TOOL = "dispatch_tool"
 NODE_FALLBACK_CHAT = "fallback_chat"
 NODE_GENERATE_ANSWER = "generate_answer"
@@ -55,10 +55,10 @@ class AgentState(TypedDict, total=False):
     status: Status
     status_events: Annotated[list[StatusEvent], operator.add]
 
-    # —— 工具执行（循环，P1 预留）——
+    # —— 工具执行（循环）——
     tool_calls: Annotated[list[ToolCallRecord], operator.add]
     tool_result: ToolResult | None
-    tool_iterations: int
+    tool_iterations: int  # 普通覆盖字段：工具循环计数（上限语义）
 
     # —— 记忆（P4 预留）——
     memory_context: Annotated[list[MemoryItem], operator.add]
