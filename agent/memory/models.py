@@ -31,3 +31,20 @@ class MemoryRecallResult(BaseModel):
 
     items: list[MemoryItem] = Field(default_factory=list)
     sources: list[Citation] = Field(default_factory=list)
+
+class MemoryExtraction(BaseModel):
+    """一次结构化抽取结果（来自 LLM，可独立理解）。
+
+    `kind` 为宽松 str（不约束 Literal）：
+    强约束时模型偶发输出超纲值会导致整批校验失败被丢弃（降级保险，见 kind 策略）。
+    `importance` 由模型给出，作为 v2.0 非语义召回的确定性排序键。
+    """
+    kind: str  # fact / episode / preference（召回端未知值归入 other 组）
+    content: str
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class MemoryExtractionResult(BaseModel):
+    """整批抽取结果；没有值得记住的内容时为空列表。"""
+
+    memories: list[MemoryExtraction] = Field(default_factory=list)

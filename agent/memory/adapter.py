@@ -23,6 +23,17 @@ LONG_TERM_NAMESPACE = "long_term"
 KIND_FACT = "fact"
 KIND_EPISODE = "episode"
 KIND_PREFERENCE = "preference"
+# 召回兜底归类：抽取器输出的非规范 kind统一归入 other 组，
+# 保证未知 kind 条目结构上仍可召回（kinds 含 KIND_OTHER 时命中），且不污染定向召回。
+KIND_OTHER = "other"
+
+# 抽取器规范 kind 集合
+KNOWN_KINDS = frozenset({KIND_FACT, KIND_EPISODE, KIND_PREFERENCE})
+
+
+def _kind_group(kind: str) -> str:
+    """把任意 kind 归入可召回的组：规范三类保持原样，其余统一归入 KIND_OTHER。"""
+    return kind if kind in KNOWN_KINDS else KIND_OTHER
 
 
 class MemoryStore:
@@ -60,10 +71,11 @@ class MemoryStore:
                 # 脏数据（非法 value）跳过不中断召回，避免单条坏数据污染整轮。
                 logger.warning("跳过损坏的记忆条目 key=%s", hit.key, exc_info=True)
         if kinds:
-            items = [m for m in items if m.kind in kinds]
+            # 按「组」过滤：规范 kind 保持原样，未知 kind 统一归入 other 组
+            # （kinds 显式含 KIND_OTHER 时未知 kind 条目才被召回）。
+            allowed_groups = {_kind_group(k) for k in kinds}
+            items = [m for m in items if _kind_group(m.kind) in allowed_groups]
         items.sort(key=lambda m: (m.importance, m.timestamp), reverse=True)
         items = items[:top_k]
-        sources = [
-            Citation(source_id=m.id, source_title=m.kind, snippet=m.content) for m in items
-        ]
+        sources = [Citation(source_id=m.id, source_title=m.kind, snippet=m.content) for m in items]
         return MemoryRecallResult(items=items, sources=sources)
