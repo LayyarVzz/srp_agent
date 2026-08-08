@@ -19,6 +19,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
+from langgraph.store.base import BaseStore
 
 from agent.core.config import AgentFrameworkConfig
 from agent.core.state import (
@@ -37,6 +38,7 @@ from agent.errors import LLM_ERROR_REQUEST, ErrorRecord, LLMError
 from agent.intent.classifiers import LLMIntentClassifier, RuleFallbackClassifier
 from agent.intent.models import Intent
 from agent.llm import LLMService
+from agent.memory.factory import build_store
 from agent.response.models import (
     FINISHED_REASON_COMPLETED,
     FINISHED_REASON_ERROR,
@@ -128,6 +130,7 @@ def build_agent_graph(
     *,
     checkpointer: BaseCheckpointSaver | None = None,
     tools: list[BaseTool] | None = None,
+    store: BaseStore | None = None,
 ) -> CompiledStateGraph:
     """装配并编译 Agent 状态机（§3.4 完整图骨架）。
 
@@ -136,6 +139,8 @@ def build_agent_graph(
     """
     cfg = config or AgentFrameworkConfig.get_default()
     tools = list(tools or [])
+    # 长期记忆：dev 默认 InMemoryStore；生产显式注入 PostgresStore（store_type 校验快速失败）。
+    store = store or build_store(cfg.memory)
 
     tool_node = ToolNode(tools, handle_tool_errors=True)
     intent_classifier = LLMIntentClassifier(llm, fallback=RuleFallbackClassifier())
@@ -431,4 +436,5 @@ def build_agent_graph(
     builder.add_edge(NODE_FORMAT_RESPONSE, END)
 
     # §3.5：dev 默认 MemorySaver；thread_id == session_id 承载短期上下文。
-    return builder.compile(checkpointer=checkpointer or MemorySaver())
+    # §3.7：store 注入 langgraph Store，长期记忆由 P4-3 召回节点经 MemoryStore 适配访问。
+    return builder.compile(checkpointer=checkpointer or MemorySaver(), store=store)

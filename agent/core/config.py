@@ -163,7 +163,8 @@ class MemoryBehaviorConfig(BaseModel):
     """记忆行为（长期记忆抽取 / 召回参数）。"""
 
     top_k: int = Field(default=5, ge=1)
-    backend: Literal["in_memory", "mcp"] = "in_memory"  # 开发默认内存实现，生产切 MCP
+    #长期记忆统一走 langgraph Store，dev=InMemoryStore / prod=PostgresStore。
+    store_type: Literal["in_memory", "postgres"] = "in_memory"
     max_recall_chars: int = Field(default=8000, ge=1)  # 单次召回内容长度上限
 
 

@@ -23,6 +23,7 @@ class MemoryItem(BaseModel):
     user_id: str
     timestamp: datetime
     provenance: str  # 来源（会话、工具等）
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class MemoryRecallResult(BaseModel):
