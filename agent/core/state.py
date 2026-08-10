@@ -23,6 +23,7 @@ from agent.tools.models import ToolCallRecord, ToolResult
 NODE_LOAD_CONTEXT = "load_context"
 NODE_TRIM_HISTORY = "trim_history"
 NODE_CLASSIFY_INTENT = "classify_intent"
+NODE_RECALL_MEMORY = "recall_memory"
 NODE_CALL_MODEL = "call_model"
 NODE_DISPATCH_TOOL = "dispatch_tool"
 NODE_FALLBACK_CHAT = "fallback_chat"
@@ -32,12 +33,7 @@ NODE_FORMAT_RESPONSE = "format_response"
 
 
 class AgentState(TypedDict, total=False):
-    """Agent 图状态（§3.1 全量字段）。
-
-    WHY reducer 标注：`status_events`/`tool_calls`/`citations`/`memory_*` 需在同一轮
-    图运行内由多个节点追加，无 reducer 时后写节点会覆盖前写节点；`tool_iterations`
-    则必须为普通覆盖字段（§3.1），否则工具循环计数无法正确工作。
-    """
+    """Agent 图状态"""
 
     # —— 会话作用域 ——
     session_id: str
@@ -60,9 +56,8 @@ class AgentState(TypedDict, total=False):
     tool_result: ToolResult | None
     tool_iterations: int  # 普通覆盖字段：工具循环计数（上限语义）
 
-    # —— 记忆（P4 预留）——
-    memory_context: Annotated[list[MemoryItem], operator.add]
-    memory_facts: Annotated[list[MemoryItem], operator.add]
+    # —— 记忆 ——
+    memory_context: list[MemoryItem]  # 普通覆盖：load_context 重置、recall_memory 合并
 
     # —— 输出 ——
     final_answer: str | None
