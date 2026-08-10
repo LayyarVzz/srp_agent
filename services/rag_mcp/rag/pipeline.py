@@ -2,30 +2,35 @@
 
 from __future__ import annotations
 
+from services.rag_mcp.knowledge.loader import load_text_file
+from services.rag_mcp.rag.retriever import retrieve_chunks
+from services.rag_mcp.rag.splitter import split_text
 from services.rag_mcp.schemas import KnowledgeChunk, KnowledgeSource
+
+KNOWLEDGE_FILE_PATH = "services/rag_mcp/knowledge/data/employee_policy.txt"
 
 
 class RAGPipeline:
-    """简单 RAG Pipeline，当前仅返回固定 Mock 数据。"""
+    """简单 RAG Pipeline。"""
 
     def search(self, query: str, top_k: int = 5) -> list[KnowledgeChunk]:
-        """按 query 检索知识片段。
+        """按 query 检索知识片段。"""
+        text = load_text_file(KNOWLEDGE_FILE_PATH)
+        chunks = split_text(text)
+        retrieved_chunks = retrieve_chunks(query=query, chunks=chunks, top_k=top_k)
+        source = KnowledgeSource(
+            id="employee_policy",
+            title="员工制度",
+            url=None,
+        )
 
-        当前实现不调用 LLM、Embedding、向量数据库或 Retriever，仅用于验证数据流。
-        """
-        chunks = [
+        return [
             KnowledgeChunk(
-                content="员工年假按照工作年限计算。",
-                source=KnowledgeSource(
-                    id="doc001",
-                    title="员工制度.pdf",
-                    url=None,
-                ),
-                metadata={
-                    "chunk_id": "chunk001",
-                    "page": 5,
-                },
-                score=0.92,
+                content=chunk,
+                source=source,
+                metadata={"chunk_index": index},
+                # 当前 MVP Retriever 只返回文本片段，尚未返回相关性分数。
+                score=0.0,
             )
+            for index, chunk in enumerate(retrieved_chunks)
         ]
-        return chunks[:top_k]

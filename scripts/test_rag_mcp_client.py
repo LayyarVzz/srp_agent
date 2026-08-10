@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 from fastmcp import Client
@@ -17,7 +18,7 @@ TOOL_NAME = "search_knowledge"
 async def main() -> None:
     """List RAG MCP tools and call search_knowledge."""
     transport = StdioTransport(
-        command="python",
+        command=sys.executable,
         args=["-m", "services.rag_mcp.server"],
         cwd=str(REPO_ROOT),
     )
