@@ -13,11 +13,14 @@ KNOWLEDGE_FILE_PATH = "services/rag_mcp/knowledge/data/employee_policy.txt"
 class RAGPipeline:
     """简单 RAG Pipeline。"""
 
+    def __init__(self) -> None:
+        """为当前Pipeline实例加载并切分一次知识文本。"""
+        text = load_text_file(KNOWLEDGE_FILE_PATH)
+        self._chunks: list[str] = split_text(text)
+
     def search(self, query: str, top_k: int = 5) -> list[KnowledgeChunk]:
         """按 query 检索知识片段。"""
-        text = load_text_file(KNOWLEDGE_FILE_PATH)
-        chunks = split_text(text)
-        retrieved_chunks = retrieve_chunks(query=query, chunks=chunks, top_k=top_k)
+        retrieved_chunks = retrieve_chunks(query=query, chunks=self._chunks, top_k=top_k)
         source = KnowledgeSource(
             id="employee_policy",
             title="员工制度",
