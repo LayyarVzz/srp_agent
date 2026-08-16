@@ -10,6 +10,10 @@ from agent.core.graph import build_agent_graph
 from agent.llm import LLMService
 from agent.response.models import AgentResponse
 from agent.tools import build_tools_from_mcp
+from services.rag_mcp.client_config import (
+    RAG_MCP_SERVER_NAME,
+    build_rag_mcp_stdio_connection,
+)
 from settings import get_settings
 
 
@@ -59,56 +63,62 @@ async def main() -> None:
     )
     llm = LLMService(config=llm_config)
 
-    tools = await build_tools_from_mcp()
-    tool_names = [tool.name for tool in tools]
-    print("MCP tools:")
-    print(tool_names)
-
-    graph = build_agent_graph(
-        llm=llm,
+    servers = {
+        RAG_MCP_SERVER_NAME: build_rag_mcp_stdio_connection(),
+    }
+    async with build_tools_from_mcp(
         config=framework_config,
-        tools=tools,
-    )
+        servers=servers,
+    ) as tools:
+        tool_names = [tool.name for tool in tools]
+        print("MCP tools:")
+        print(tool_names)
 
-    result = await graph.ainvoke(
-        {
-            "input": DEMO_INPUT,
-        },
-        config={
-            "configurable": {
-                "thread_id": THREAD_ID,
-            }
-        },
-    )
+        graph = build_agent_graph(
+            llm=llm,
+            config=framework_config,
+            tools=tools,
+        )
 
-    response = result.get("response")
-    if not isinstance(response, AgentResponse):
-        raise RuntimeError("graph.ainvoke 返回结果中未找到 AgentResponse")
+        result = await graph.ainvoke(
+            {
+                "input": DEMO_INPUT,
+            },
+            config={
+                "configurable": {
+                    "thread_id": THREAD_ID,
+                }
+            },
+        )
 
-    print("Final answer:")
-    print(result.get("final_answer"))
-    print("finished_reason:")
-    print(response.finished_reason)
-    _print_tool_trace(response)
+        response = result.get("response")
+        if not isinstance(response, AgentResponse):
+            raise RuntimeError("graph.ainvoke 返回结果中未找到 AgentResponse")
 
-    successful_rag_calls = [
-        record
-        for record in response.tool_trace
-        if record.tool_name == TARGET_TOOL_NAME and record.status == "ok"
-    ]
-    if successful_rag_calls:
+        print("Final answer:")
+        print(result.get("final_answer"))
+        print("finished_reason:")
+        print(response.finished_reason)
+        _print_tool_trace(response)
+
+        successful_rag_calls = [
+            record
+            for record in response.tool_trace
+            if record.tool_name == TARGET_TOOL_NAME and record.status == "ok"
+        ]
+        if successful_rag_calls:
+            print("search_knowledge调用验证:")
+            print("ok")
+            return
+
         print("search_knowledge调用验证:")
-        print("ok")
-        return
-
-    print("search_knowledge调用验证:")
-    print("not_called_or_failed")
-    print("intent:")
-    print(_dump_value(result.get("intent")))
-    print("status_trace:")
-    print([event.model_dump() for event in response.status_trace])
-    print("tool_trace:")
-    print([record.model_dump() for record in response.tool_trace])
+        print("not_called_or_failed")
+        print("intent:")
+        print(_dump_value(result.get("intent")))
+        print("status_trace:")
+        print([event.model_dump() for event in response.status_trace])
+        print("tool_trace:")
+        print([record.model_dump() for record in response.tool_trace])
 
 
 if __name__ == "__main__":

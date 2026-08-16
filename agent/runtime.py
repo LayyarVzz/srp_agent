@@ -10,6 +10,10 @@ from agent.core.config import AgentFrameworkConfig, LLMConfig
 from agent.core.graph import build_agent_graph
 from agent.llm import LLMService
 from agent.tools import build_tools_from_mcp
+from services.rag_mcp.client_config import (
+    RAG_MCP_SERVER_NAME,
+    build_rag_mcp_stdio_connection,
+)
 from settings import get_settings
 
 
@@ -32,10 +36,16 @@ class AgentRuntime:
             behavior=framework_config.llm_behavior,
         )
         llm = LLMService(config=llm_config)
-        tools = await build_tools_from_mcp()
-        graph = build_agent_graph(
-            llm=llm,
+        servers = {
+            RAG_MCP_SERVER_NAME: build_rag_mcp_stdio_connection(),
+        }
+        async with build_tools_from_mcp(
             config=framework_config,
-            tools=tools,
-        )
+            servers=servers,
+        ) as tools:
+            graph = build_agent_graph(
+                llm=llm,
+                config=framework_config,
+                tools=tools,
+            )
         return cls(graph=graph)
