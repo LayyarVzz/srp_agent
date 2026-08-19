@@ -2,8 +2,21 @@
 
 from __future__ import annotations
 
+from services.rag_mcp.rag.builder import KnowledgeBuilder
 from services.rag_mcp.rag.pipeline import RAGPipeline
-from services.rag_mcp.schemas import KnowledgeChunk, SearchKnowledgeResponse
+from services.rag_mcp.schemas import KnowledgeChunk, KnowledgeSource, SearchKnowledgeResponse
+
+KNOWLEDGE_FILE_PATH = "services/rag_mcp/knowledge/data/employee_policy.txt"
+
+
+def _build_pipeline() -> RAGPipeline:
+    source = KnowledgeSource(
+        id="employee_policy",
+        title="员工制度",
+        url=None,
+    )
+    chunks = KnowledgeBuilder(KNOWLEDGE_FILE_PATH, source).build()
+    return RAGPipeline(chunks)
 
 
 def _normalize(text: str) -> str:
@@ -104,7 +117,7 @@ def _validate_top_k(pipeline: RAGPipeline) -> None:
 
 def main() -> None:
     """直接调用RAGPipeline，验证BM25已经进入Pipeline。"""
-    pipeline = RAGPipeline()
+    pipeline = _build_pipeline()
 
     cases = [
         {
