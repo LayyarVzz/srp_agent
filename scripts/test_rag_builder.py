@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 from services.rag_mcp.knowledge.loader import load_text_file
 from services.rag_mcp.rag.builder import KnowledgeBuilder
 from services.rag_mcp.rag.models import DocumentChunk
-from services.rag_mcp.rag.splitter import split_text
+from services.rag_mcp.rag.splitter import split_markdown, split_text
 from services.rag_mcp.schemas import KnowledgeSource
 
 KNOWLEDGE_FILE_PATH = "services/rag_mcp/knowledge/data/employee_policy.txt"
@@ -54,6 +57,23 @@ def main() -> None:
     _validate_chunks(chunks, expected_chunks)
     if repeated_chunks != chunks:
         raise RuntimeError("重复build结果结构不稳定")
+
+    markdown_text = """# 员工制度
+## 请假管理
+### 病假
+病假应提交医院证明材料。
+"""
+    with TemporaryDirectory() as temp_dir:
+        markdown_path = Path(temp_dir) / "employee_policy.md"
+        markdown_path.write_text(markdown_text, encoding="utf-8")
+        markdown_builder = KnowledgeBuilder(markdown_path, source)
+        markdown_chunks = markdown_builder.build()
+        expected_markdown_chunks = split_markdown(markdown_text, source)
+
+    if markdown_chunks != expected_markdown_chunks:
+        raise RuntimeError("KnowledgeBuilder未按Markdown splitter构建结果")
+    if markdown_chunks[0].metadata.get("heading_path") != ["员工制度", "请假管理", "病假"]:
+        raise RuntimeError("KnowledgeBuilder Markdown分流未保留heading_path")
 
     print("KnowledgeBuilder验证通过")
     print(f"chunk数量: {len(chunks)}")

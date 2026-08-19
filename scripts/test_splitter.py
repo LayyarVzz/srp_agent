@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from services.rag_mcp.knowledge.loader import load_text_file
 from services.rag_mcp.rag.models import DocumentChunk
-from services.rag_mcp.rag.splitter import split_text
+from services.rag_mcp.rag.splitter import split_markdown, split_text
 from services.rag_mcp.schemas import KnowledgeSource
 
 
@@ -83,6 +83,44 @@ def main() -> None:
             raise RuntimeError("fallback chunk metadata不符合当前MVP规则")
         if chunk.chunk_id != f"{source.id}:{chunk_index}":
             raise RuntimeError("fallback chunk_id不符合当前MVP规则")
+
+    markdown_text = """# 员工制度
+## 请假管理
+### 病假
+病假应提交医院证明材料。
+
+员工申请病假时应提前在系统提交申请并补充证明材料主管审批通过后员工应按时返岗并完成销假确认必要时还应继续补充有效证明材料以便人力资源部门留存
+## 年假管理
+年假应在当年度内使用。
+"""
+    markdown_chunks = split_markdown(markdown_text, source)
+    if not markdown_chunks:
+        raise RuntimeError("Markdown Splitter未返回任何chunk")
+    if any(chunk.content.lstrip().startswith("#") for chunk in markdown_chunks):
+        raise RuntimeError("Markdown标题被单独或原样生成为chunk")
+    if not all(len(chunk.content) <= 80 for chunk in markdown_chunks):
+        raise RuntimeError("Markdown正文切分后存在超过80字符的chunk")
+
+    actual_heading_paths = [chunk.metadata.get("heading_path") for chunk in markdown_chunks]
+    sick_leave_path = ["员工制度", "请假管理", "病假"]
+    annual_leave_path = ["员工制度", "年假管理"]
+    if actual_heading_paths[0] != sick_leave_path:
+        raise RuntimeError("Markdown三级heading_path不符合预期")
+    if actual_heading_paths[-1] != annual_leave_path:
+        raise RuntimeError("Markdown浅层标题出现时未丢弃更深层级")
+    if sum(heading_path == sick_leave_path for heading_path in actual_heading_paths) < 2:
+        raise RuntimeError("Markdown正文未按80字符规则切分为多个chunk")
+    if markdown_chunks[0].content != "病假应提交医院证明材料。":
+        raise RuntimeError("Markdown标题未与后续正文按section自然绑定")
+    for chunk_index, chunk in enumerate(markdown_chunks):
+        expected_metadata = {
+            "chunk_index": chunk_index,
+            "heading_path": actual_heading_paths[chunk_index],
+        }
+        if chunk.metadata != expected_metadata:
+            raise RuntimeError("Markdown chunk metadata不符合当前规则")
+        if chunk.chunk_id != f"{source.id}:{chunk_index}":
+            raise RuntimeError("Markdown chunk_id不符合当前MVP规则")
 
     print("Splitter DocumentChunk验证通过")
 

@@ -10,6 +10,7 @@ from services.rag_mcp.schemas import KnowledgeSource
 _CHUNK_SIZE = 80
 _PARAGRAPH_SEPARATOR = "\n\n"
 _SENTENCE_END_PATTERN = re.compile(r"[^。！？；]+[。！？；]?")
+_MARKDOWN_HEADING_PATTERN = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
 
 
 def _split_paragraphs(text: str) -> list[str]:
@@ -61,8 +62,7 @@ def _split_long_paragraph(paragraph: str) -> list[str]:
     return _pack_texts(sentence_units, "")
 
 
-def split_text(text: str, source: KnowledgeSource) -> list[DocumentChunk]:
-    """Split text into source-aware chunks."""
+def _split_body_text(text: str) -> list[str]:
     paragraphs = _split_paragraphs(text)
     chunks: list[str] = []
     current_paragraphs: list[str] = []
@@ -86,12 +86,65 @@ def split_text(text: str, source: KnowledgeSource) -> list[DocumentChunk]:
     if current_paragraphs:
         chunks.append(_PARAGRAPH_SEPARATOR.join(current_paragraphs))
 
-    return [
-        DocumentChunk(
-            chunk_id=f"{source.id}:{chunk_index}",
-            content=chunk,
-            source=source,
-            metadata={"chunk_index": chunk_index},
+    return chunks
+
+
+def _build_document_chunks(
+    chunks: list[str],
+    source: KnowledgeSource,
+    heading_paths: list[list[str]] | None = None,
+) -> list[DocumentChunk]:
+    document_chunks: list[DocumentChunk] = []
+    for chunk_index, chunk in enumerate(chunks):
+        metadata: dict[str, object] = {"chunk_index": chunk_index}
+        if heading_paths is not None:
+            metadata["heading_path"] = heading_paths[chunk_index]
+
+        document_chunks.append(
+            DocumentChunk(
+                chunk_id=f"{source.id}:{chunk_index}",
+                content=chunk,
+                source=source,
+                metadata=metadata,
+            )
         )
-        for chunk_index, chunk in enumerate(chunks)
-    ]
+
+    return document_chunks
+
+
+def split_text(text: str, source: KnowledgeSource) -> list[DocumentChunk]:
+    """Split text into source-aware chunks."""
+    chunks = _split_body_text(text)
+    return _build_document_chunks(chunks, source)
+
+
+def split_markdown(text: str, source: KnowledgeSource) -> list[DocumentChunk]:
+    """Split Markdown text into source-aware chunks with heading metadata."""
+    chunks: list[str] = []
+    heading_paths: list[list[str]] = []
+    heading_path: list[str] = []
+    section_lines: list[str] = []
+
+    def flush_section() -> None:
+        section_text = "\n".join(section_lines).strip()
+        if not section_text:
+            return
+
+        section_chunks = _split_body_text(section_text)
+        chunks.extend(section_chunks)
+        heading_paths.extend([heading_path.copy() for _ in section_chunks])
+        section_lines.clear()
+
+    for line in text.splitlines():
+        heading_match = _MARKDOWN_HEADING_PATTERN.match(line.strip())
+        if heading_match is None:
+            section_lines.append(line)
+            continue
+
+        flush_section()
+        level = len(heading_match.group(1))
+        title = heading_match.group(2).strip()
+        heading_path = [*heading_path[: level - 1], title]
+
+    flush_section()
+    return _build_document_chunks(chunks, source, heading_paths)
