@@ -36,6 +36,11 @@ class RuntimeSettings(BaseSettings):
     llm_base_url: str | None = None  # 覆盖预设
     llm_model: str | None = None  # 覆盖预设
 
+    # —— Embedding（OpenAI-compatible 文本向量化）——
+    embedding_api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    embedding_base_url: str | None = None
+    embedding_model: str | None = None
+
     # —— FastAPI 服务端口 ——
     api_host: str = "0.0.0.0"  # noqa: S104  # 开发默认监听全部接口，部署时按需收紧
     api_port: int = 8000 
