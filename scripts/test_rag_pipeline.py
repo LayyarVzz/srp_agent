@@ -61,8 +61,7 @@ def _run_case(
     *,
     index: int,
     query: str,
-    expected_top1: str | None = None,
-    expected_in_top_k: set[str] | None = None,
+    expected_top1_parts: list[str] | None = None,
     expected_parts: list[str] | None = None,
 ) -> None:
     chunks = pipeline.search(query=query, top_k=5)
@@ -79,13 +78,11 @@ def _run_case(
         print(f"    metadata: {chunk.metadata}")
         print(f"    score: {chunk.score}")
 
-    retrieved_ids = [_chunk_id(chunk) for chunk in response.chunks]
-
-    if expected_top1 is not None and retrieved_ids[0] != expected_top1:
-        raise RuntimeError(f"Top1不是预期Chunk：expected={expected_top1}, actual={retrieved_ids[0]}")
-
-    if expected_in_top_k is not None and expected_in_top_k.isdisjoint(retrieved_ids):
-        raise RuntimeError(f"TopK中未找到预期Chunk：expected_any={sorted(expected_in_top_k)}")
+    if expected_top1_parts is not None and not _contains_all(
+        response.chunks[0],
+        expected_top1_parts,
+    ):
+        raise RuntimeError("Top1不是预期制度内容")
 
     if expected_parts is not None and not any(
         _contains_all(chunk, expected_parts) for chunk in response.chunks
@@ -122,32 +119,26 @@ def main() -> None:
     cases = [
         {
             "query": "员工工作10年有多少天年假？",
-            "expected_top1": "employee_policy:7",
+            "expected_top1_parts": ["10 年不满 20 年", "10 天"],
             "expected_parts": ["10 年不满 20 年", "10 天"],
         },
         {
             "query": "员工工作20年有多少天年假？",
-            "expected_in_top_k": {"employee_policy:8"},
+            "expected_top1_parts": ["20 年及以上", "15 天"],
             "expected_parts": ["20 年及以上", "15 天"],
         },
         {
             "query": "员工工作不满1年有年假吗？",
-            "expected_top1": "employee_policy:5",
+            "expected_top1_parts": ["不满 1 年", "不享受带薪年休假"],
             "expected_parts": ["不满 1 年", "不享受带薪年休假"],
         },
         {
             "query": "员工请假需要提交什么？",
-            "expected_in_top_k": {
-                "employee_policy:11",
-                "employee_policy:12",
-                "employee_policy:13",
-                "employee_policy:14",
-                "employee_policy:15",
-            },
+            "expected_parts": ["提交请假申请"],
         },
         {
             "query": "病假需要什么证明？",
-            "expected_top1": "employee_policy:14",
+            "expected_top1_parts": ["病假", "医院证明", "有效证明材料"],
             "expected_parts": ["病假", "医院证明", "有效证明材料"],
         },
         {
