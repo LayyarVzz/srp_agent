@@ -21,6 +21,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.store.base import BaseStore
+from langgraph.store.memory import InMemoryStore
 
 from agent.core.config import AgentFrameworkConfig
 from agent.core.state import (
@@ -41,7 +42,6 @@ from agent.intent.classifiers import LLMIntentClassifier, RuleFallbackClassifier
 from agent.intent.models import Intent
 from agent.llm import LLMService
 from agent.memory import KIND_EPISODE, KIND_FACT, KIND_PREFERENCE, MemoryStore
-from agent.memory.factory import build_store
 from agent.memory.models import MemoryItem
 from agent.response.models import (
     FINISHED_REASON_COMPLETED,
@@ -184,8 +184,11 @@ def build_agent_graph(
     """
     cfg = config or AgentFrameworkConfig.get_default()
     tools = list(tools or [])
-    # 长期记忆：dev 默认 InMemoryStore；生产显式注入 PostgresStore（store_type 校验快速失败）。
-    store = store or build_store(cfg.memory)
+    # 长期记忆后端由装配层经 build_memory_backends() 注入
+    # （prod=AsyncPostgresStore / dev=InMemoryStore）；未注入（测试/dev 直建图）时
+    # 兜底 InMemoryStore——生产装配一律经工厂，postgres 的裁决/快速失败由工厂统一承担。
+    if store is None:
+        store = InMemoryStore()
     memory = MemoryStore(store)
 
     tool_node = ToolNode(tools, handle_tool_errors=True)
