@@ -172,11 +172,11 @@ class MemoryBehaviorConfig(BaseModel):
 class SessionBehaviorConfig(BaseModel):
     """会话元数据行为（消息本体由 checkpointer 承载，本配置只管元数据层）。
 
-    命名空间后缀不做运行时配置：`SESSIONS_NAMESPACE` 是模块级常量，运行时改后缀
-    会与既有数据的布局漂移，收益为零。
+    TTL 不做运行时命名空间约定：过期语义由 `sessions` 表（SQLAlchemy）的
+    `expires_at` 承载，读路径过滤过期行（见 agent/session/repository.py）。
     """
 
-    # TTL：dev InMemoryStore 不支持（supports_ttl=False）恒忽略；prod PostgresStore 生效。
+    # TTL：折算为 expires_at 落库；None 表示永不过期。SQLite/Postgres 两方言均生效。
     ttl_minutes: int | None = Field(default=None, ge=1)
 
 
