@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from services.rag_mcp.rag.embeddings import EmbeddingClient
+from embedding import build_embedding_client
+from settings import get_settings
 
 
 def _validate_vector(vector: list[float], name: str) -> None:
@@ -14,7 +15,12 @@ def _validate_vector(vector: list[float], name: str) -> None:
 
 def main() -> None:
     """Call the OpenAI-compatible embedding API and validate vector shape."""
-    client = EmbeddingClient()
+    settings = get_settings()
+    client = build_embedding_client(
+        api_key=settings.embedding_api_key.get_secret_value(),
+        base_url=settings.embedding_base_url,
+        model=settings.embedding_model,
+    )
     documents = [
         "员工累计工作年限已满 10 年不满 20 年的，每年享有 10 天带薪年休假。",
         "病假应按公司要求补充医院证明或其他有效证明材料。",
