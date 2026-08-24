@@ -169,6 +169,17 @@ class MemoryBehaviorConfig(BaseModel):
     preload_profile: bool = True  # load_context 预加载 preference 记忆
 
 
+class SessionBehaviorConfig(BaseModel):
+    """会话元数据行为（消息本体由 checkpointer 承载，本配置只管元数据层）。
+
+    命名空间后缀不做运行时配置：`SESSIONS_NAMESPACE` 是模块级常量，运行时改后缀
+    会与既有数据的布局漂移，收益为零。
+    """
+
+    # TTL：dev InMemoryStore 不支持（supports_ttl=False）恒忽略；prod PostgresStore 生效。
+    ttl_minutes: int | None = Field(default=None, ge=1)
+
+
 class AgentFrameworkConfig(BaseModel):
     """Agent 框架行为配置聚合（纯代码默认值，供装配层读取）。"""
 
@@ -176,6 +187,7 @@ class AgentFrameworkConfig(BaseModel):
     llm_behavior: LLMBehaviorConfig = Field(default_factory=LLMBehaviorConfig)
     tools: MCPToolsConfig = Field(default_factory=MCPToolsConfig)
     memory: MemoryBehaviorConfig = Field(default_factory=MemoryBehaviorConfig)
+    session: SessionBehaviorConfig = Field(default_factory=SessionBehaviorConfig)
 
     @classmethod
     def get_default(cls) -> AgentFrameworkConfig:

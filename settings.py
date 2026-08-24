@@ -43,7 +43,7 @@ class RuntimeSettings(BaseSettings):
 
     # —— FastAPI 服务端口 ——
     api_host: str = "0.0.0.0"  # noqa: S104  # 开发默认监听全部接口，部署时按需收紧
-    api_port: int = 8000 
+    api_port: int = 8000
 
     # —— tools_mcp 服务运行方式（stdio 默认；streamable-http 供端口/远程部署）——
     mcp_transport: MCPTransport = MCPTransport.STDIO
@@ -52,6 +52,12 @@ class RuntimeSettings(BaseSettings):
     mcp_streamable_http_path: str = "/mcp"  # 与 fastmcp 默认一致，客户端连接地址即该路径
     mcp_stateless_http: bool = True  # 工具纯函数无会话 → 默认无状态，支持水平扩展
 
+    # —— Postgres 记忆后端（生产持久化；缺省则不启用，回退 InMemoryStore + MemorySaver）——
+    # checkpointer（会话/短期）与 Store（长期/会话元数据）共用此库，各自独立连接池与表。
+    database_url: SecretStr | None = Field(
+        default=None,
+        description="postgresql://user:pass@host:port/db",
+    )
 
     # —— 日志（运行期级别）——
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
