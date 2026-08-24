@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from typing import Any
 
+from langchain_core.embeddings import Embeddings
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.base import BaseStore
@@ -19,6 +21,7 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
 from agent.core.config import AgentFrameworkConfig
+from shared.embeddings import EmbeddingsFactory
 
 
 @dataclass
@@ -50,7 +53,10 @@ class MemoryBackends:
 
 
 async def build_memory_backends(
-    cfg: AgentFrameworkConfig, *, database_url: str | None = None
+    cfg: AgentFrameworkConfig,
+    *,
+    database_url: str | None = None,
+    embedder: Embeddings | None = None,
 ) -> MemoryBackends:
     """统一记忆后端入口：有 DSN 建 Postgres 后端；无 DSN 降级 InMemory。
 
@@ -63,23 +69,28 @@ async def build_memory_backends(
     """
     if cfg.memory.store_type == "postgres" and not database_url:
         raise ValueError("store_type=postgres 必须配置 DATABASE_URL（settings.py / .env）")
+    # 语义召回底座：把 embedding 转译为 langgraph Store 的 index 配置。
+    factory = EmbeddingsFactory(cfg.memory.embedding, embedder=embedder)
+    index_config = factory.build_index_config()
     if database_url is not None:
-        return await _build_postgres_backends(database_url=database_url)
-    return MemoryBackends(store=InMemoryStore(), checkpointer=None)
+        return await _build_postgres_backends(database_url=database_url, index=index_config)
+    return MemoryBackends(store=InMemoryStore(index=index_config), checkpointer=None)
 
 
 async def _build_postgres_backends(
     *,
     database_url: str,
+    index: dict[str, Any] | None = None,
 ) -> MemoryBackends:
     """prod 后端：AsyncPostgresStore + AsyncPostgresSaver（长期记忆 + 短期上下文）。
 
     checkpointer 与 Store 是 compile() 的两个独立参数、各有独立表结构
     （checkpoints/checkpoint_writes/checkpoint_blobs + store）。共用同一 Postgres
-    实例，`.setup()` 幂等建表，首次运行自动完成。会话元数据由 `agent/session`
-    自装，落在独立 `sessions` 表（不经本工厂）。
+    实例，`.setup()` 幂等建表，首次运行自动完成。`index` 非 None 时语义检索底座生效：
+    `.setup()` 会建 pgvector 扩展 + `store_vectors` 表 + HNSW 索引（见 P1.md §2.1）。
+    会话元数据由 `agent/session` 自装，落在独立 `sessions` 表（不经本工厂）。
     """
-    store_cm = AsyncPostgresStore.from_conn_string(database_url)
+    store_cm = AsyncPostgresStore.from_conn_string(database_url, index=index)
     store = await store_cm.__aenter__()
     try:
         saver_cm = AsyncPostgresSaver.from_conn_string(database_url)

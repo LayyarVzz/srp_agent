@@ -14,6 +14,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr
 
+from shared.embeddings import EmbeddingConfig
+
 
 class LLMProvider(StrEnum):
     """LLM 提供方（provider 无关：任何 OpenAI 兼容端点均可用）。"""
@@ -167,6 +169,8 @@ class MemoryBehaviorConfig(BaseModel):
     store_type: Literal["in_memory", "postgres"] = "in_memory"
     max_recall_chars: int = Field(default=8000, ge=1)  # 单次召回内容长度上限
     preload_profile: bool = True  # load_context 预加载 preference 记忆
+    # 语义召回开关/模型对齐。
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
 
 
 class SessionBehaviorConfig(BaseModel):

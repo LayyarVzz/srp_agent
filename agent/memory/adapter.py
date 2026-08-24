@@ -36,6 +36,15 @@ def _kind_group(kind: str) -> str:
     return kind if kind in KNOWN_KINDS else KIND_OTHER
 
 
+def store_has_embeddings(store: BaseStore) -> bool:
+    """store 实例是否配置了 embeddings（语义检索可用信号，D3 降级判定）。
+
+    langgraph InMemoryStore / PostgresStore 配 index 后经 `_ensure_index_config`
+    暴露 `embeddings` 属性，未配则为 None。RAG 用 Qdrant 无此概念，故该判定只存在于记忆侧。
+    """
+    return getattr(store, "embeddings", None) is not None
+
+
 class MemoryStore:
     """langgraph Store 适配：InMemoryStore(dev) / PostgresStore(prod) 均可。
 
