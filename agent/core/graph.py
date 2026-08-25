@@ -189,7 +189,8 @@ def build_agent_graph(
     # 兜底 InMemoryStore——生产装配一律经工厂，postgres 的裁决/快速失败由工厂统一承担。
     if store is None:
         store = InMemoryStore()
-    memory = MemoryStore(store)
+    # 语义召回混合重排参数由 cfg.memory.recall 注入。
+    memory = MemoryStore(store, recall_config=cfg.memory.recall)
 
     tool_node = ToolNode(tools, handle_tool_errors=True)
     intent_classifier = LLMIntentClassifier(llm, fallback=RuleFallbackClassifier())
@@ -209,24 +210,29 @@ def build_agent_graph(
         updates["tool_iterations"] = 0
         updates["tool_result"] = None
         # 长期记忆：每轮重置 memory_context（普通覆盖，防 operator.add 跨轮残留累积），
-        # 再按 preload_profile 预加载 preference
+        # 再按 preload_profile 预加载 preference。
+        # raw_input 提前计算：recall 的 query 用截断后的输入（预加载语义化）。
         updates["memory_context"] = []
+        raw_input = (state.get("input") or "").strip()
+        # 输入长度护栏：超长截断而非拒绝，防止超长输入失控。
+        if len(raw_input) > cfg.graph.max_input_chars:
+            raw_input = raw_input[: cfg.graph.max_input_chars]
+            logger.warning("输入超长，已截断到 %d 字符", cfg.graph.max_input_chars)
         if cfg.memory.preload_profile:
             result = await memory.recall(
                 user_id=updates["user_id"],
                 kinds=[KIND_PREFERENCE],
                 top_k=cfg.memory.top_k,
+                # query 传截断后输入：空输入走确定性模式；preference 专用权重
+                # importance 主导（身份先验），query 语义只做辅助决胜。
+                query=raw_input or None,
+                hybrid_weights=cfg.memory.recall.preference_weights,
             )
             if result.items:
                 updates["memory_context"] = result.items
                 updates["citations"] = _dedup_citations(
                     state.get("citations") or [], result.sources
                 )
-        raw_input = (state.get("input") or "").strip()
-        # 输入长度护栏：超长截断而非拒绝，防止超长输入失控。
-        if len(raw_input) > cfg.graph.max_input_chars:
-            raw_input = raw_input[: cfg.graph.max_input_chars]
-            logger.warning("输入超长，已截断到 %d 字符", cfg.graph.max_input_chars)
         if raw_input:
             updates["input"] = raw_input
             updates["messages"] = [HumanMessage(content=raw_input, id=_new_message_id("h"))]
@@ -254,11 +260,15 @@ def build_agent_graph(
 
     # —— 长期记忆召回（P4-3）：fact/episode 注入 memory_context，闲聊/工具共同上游 ——
     async def recall_memory(state: AgentState) -> dict[str, Any]:
-        """按需召回 fact/episode（user 隔离 + importance 确定性排序，语义检索预留）"""
+        """
+        按需召回 fact/episode（user 隔离，未配 embedding 自动降级 importance）
+        """
         result = await memory.recall(
             user_id=state.get("user_id") or "anonymous",
             kinds=[KIND_FACT, KIND_EPISODE],
             top_k=cfg.memory.top_k,
+            # 不传 hybrid_weights → 默认 content_weights（query 主导），与偏好预加载区分。
+            query=state.get("input") or None,
         )
         if not result.items:
             return {}
