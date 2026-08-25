@@ -42,6 +42,7 @@ EXTRACT_PROMPT = """你是记忆抽取器。从对话中抽取值得长期记住
 - 「现在几点了？」→ 不抽取
 - 「好的，谢谢」→ 不抽取"""
 
+
 def _recent_messages(messages: Sequence[BaseMessage], max_input_chars: int) -> list[BaseMessage]:
     """倒序取最近消息至字符预算；首条（最新）即使超预算也整体保留。
 

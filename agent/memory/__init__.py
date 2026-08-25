@@ -28,6 +28,7 @@ from agent.memory.persist import (
     submit_memory_save,
     wait_pending_saves,
 )
+from agent.share.models import MemoryRecallConfig
 
 __all__ = [
     "KIND_EPISODE",
@@ -42,6 +43,7 @@ __all__ = [
     "MemoryExtractionResult",
     "MemoryExtractor",
     "MemoryItem",
+    "MemoryRecallConfig",
     "MemoryRecallResult",
     "MemoryStore",
     "build_memory_backends",

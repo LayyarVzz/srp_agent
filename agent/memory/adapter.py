@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
-from langgraph.store.base import BaseStore
+from langgraph.store.base import BaseStore, SearchItem
 
 from agent.memory.models import MemoryItem, MemoryRecallResult
-from agent.share.models import Citation
+from agent.share.models import Citation, MemoryRecallConfig
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +46,65 @@ def store_has_embeddings(store: BaseStore) -> bool:
     return getattr(store, "embeddings", None) is not None
 
 
+def _aware_utc(ts: datetime) -> datetime:
+    """归一为 UTC-aware：naive 视为 UTC（手工构造/旧数据可能无时区），保证跨时区/naive 可比。
+
+    WHY 独立 helper：recency 年龄计算与确定性排序 tie-break 都需要「可比时间」；
+    Python 3.11+ 对 naive/aware 混合 datetime 直接比较会抛 TypeError。
+    """
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
+
+
+def _clamp01(value: float) -> float:
+    """clamp 到 [0,1]：cosine 相似度可为负（语义相反），混合信号统一归到非负区间。"""
+    return max(0.0, min(1.0, value))
+
+
+def _recency_signal(ts: datetime, *, half_life_days: float) -> float:
+    """近因信号：1/(1 + age_days/half_life)，越近越高；未来时间防御 clamp 到 [0,1]。"""
+    aware = _aware_utc(ts)
+    age_seconds = max(0.0, (datetime.now(UTC) - aware).total_seconds())
+    age_days = age_seconds / 86_400.0
+    return 1.0 / (1.0 + age_days / half_life_days)
+
+
+def _rerank_signals(
+    item: MemoryItem, raw_score: float | None, *, half_life_days: float
+) -> tuple[float, float, float]:
+    """提取三路混合重排信号（score / importance / recency），顺序与权重元组一一对应。
+
+    WHY 可插拔信号形式：未来加 lexical(BM25) 信号 = 本函数返回四元组 +
+    `MemoryRecallConfig` 权重元组类型注解/默认扩为四元组，调用方零改动。
+    score 缺失（asearch 兜底填充条目）按 0 计；负数 clamp。
+    """
+    score = _clamp01(raw_score) if raw_score is not None else 0.0
+    return (
+        score,
+        item.importance,
+        _recency_signal(item.timestamp, half_life_days=half_life_days),
+    )
+
+
 class MemoryStore:
     """langgraph Store 适配：InMemoryStore(dev) / PostgresStore(prod) 均可。
 
     命名空间 `(user_id, "long_term")`、key=memory_id、value=`MemoryItem` 的 JSON dump。
-    `recall` 为 v2.0 确定性召回（§3.4）：kind 过滤 + importance 降序 + top_k（时间倒序兜底）；
-    语义检索（`search(query=...)`）留 §9 开放项，配 embeddings 后接入。
+    `recall` 双模式：语义（query 非空且 store 配 embeddings）→ 混合重排
+    （score/importance/recency）；
+    确定性（无 query 或 embeddings 不可用）→ importance 降序（零回归）。
     """
 
-    def __init__(self, store: BaseStore) -> None:
+    def __init__(
+        self,
+        store: BaseStore,
+        *,
+        recall_config: MemoryRecallConfig | None = None,
+    ) -> None:
+        """构造适配层。`recall_config` 缺省用 spec 默认值，保证 `MemoryStore(store)` 零改动可用。"""
         self._store = store
+        self._recall_config = recall_config or MemoryRecallConfig()
 
     async def save(self, item: MemoryItem) -> None:
         """保存一条长期记忆。失败向上抛，由带外调用方（P4-2）负责降级与日志。"""
@@ -68,23 +118,114 @@ class MemoryStore:
         user_id: str,
         top_k: int = 5,
         kinds: Sequence[str] | None = None,
+        query: str | None = None,
+        hybrid_weights: tuple[float, float, float] | None = None,
     ) -> MemoryRecallResult:
-        """确定性召回：kind 过滤 + importance 降序 + top_k（时间倒序兜底），带来源引用。"""
+        """双模式召回：语义（query 非空且 embeddings 可用）或确定性。
+
+        WHY 双模式：语义列是增量能力，未配 embedding / 无 query 时必须保持 v2.0 行为（零回归）。
+        语义模式：asearch(query, limit=top_k*fetch_factor) 预取放大 → kind 组过滤 →
+        混合重排（score/importance/recency）→ top_k；确定性模式：limit=top_k*2 →
+        kind 过滤 → importance 降序 + 时间倒序兜底。
+        `hybrid_weights` 覆盖本次调用的混合权重：缺省用 `content_weights`；
+        偏好预加载等调用方传 `preference_weights` 以区分召回职责（确定性模式忽略）。
+        """
         namespace = (user_id, LONG_TERM_NAMESPACE)
-        hits = await self._store.asearch(namespace, limit=top_k * 2)
-        items: list[MemoryItem] = []
+        norm_query = (query or "").strip()
+        # store.embeddings 为 None 当且仅当装配时 EmbeddingsFactory 不可用
+        semantic = bool(norm_query) and store_has_embeddings(self._store)
+
+        if semantic:
+            limit = top_k * self._recall_config.recall_fetch_factor
+            hits = await self._store.asearch(namespace, query=norm_query, limit=limit)
+            weights = (
+                hybrid_weights
+                if hybrid_weights is not None
+                else self._recall_config.content_weights
+            )
+            ranked = self._hybrid_rerank(
+                self._filter_pairs_by_kinds(self._parse_hits(hits), kinds),
+                weights=weights,
+            )
+        else:
+            hits = await self._store.asearch(namespace, limit=top_k * 2)
+            ranked = self._deterministic_rank(
+                self._filter_pairs_by_kinds(self._parse_hits(hits), kinds)
+            )
+
+        items = [m for m, _score in ranked[:top_k]]
+        sources = [
+            Citation(source_id=m.id, source_title=m.kind, snippet=m.content, score=score)
+            for m, score in ranked[:top_k]
+        ]
+        return MemoryRecallResult(items=items, sources=sources)
+
+    def _parse_hits(self, hits: Sequence[SearchItem]) -> list[tuple[MemoryItem, float | None]]:
+        """把 asearch 结果解析为 (item, raw_score) 对；脏数据跳过记 warning（双模式共用）"""
+        pairs: list[tuple[MemoryItem, float | None]] = []
         for hit in hits:
             try:
-                items.append(MemoryItem.model_validate(hit.value))
+                pairs.append((MemoryItem.model_validate(hit.value), hit.score))
             except Exception:
                 # 脏数据（非法 value）跳过不中断召回，避免单条坏数据污染整轮。
                 logger.warning("跳过损坏的记忆条目 key=%s", hit.key, exc_info=True)
-        if kinds:
-            # 按「组」过滤：规范 kind 保持原样，未知 kind 统一归入 other 组
-            # （kinds 显式含 KIND_OTHER 时未知 kind 条目才被召回）。
-            allowed_groups = {_kind_group(k) for k in kinds}
-            items = [m for m in items if _kind_group(m.kind) in allowed_groups]
-        items.sort(key=lambda m: (m.importance, m.timestamp), reverse=True)
-        items = items[:top_k]
-        sources = [Citation(source_id=m.id, source_title=m.kind, snippet=m.content) for m in items]
-        return MemoryRecallResult(items=items, sources=sources)
+        return pairs
+
+    def _filter_pairs_by_kinds(
+        self,
+        pairs: Sequence[tuple[MemoryItem, float | None]],
+        kinds: Sequence[str] | None,
+    ) -> list[tuple[MemoryItem, float | None]]:
+        """按 kind「组」过滤（_kind_group 归组；kinds 为空时全量返回）。双模式共用，
+        语义模式在重排前过滤。
+
+        未知 kind 统一归入 other 组：kinds 显式含 KIND_OTHER 时未知 kind 条目才被召回。
+        """
+        if not kinds:
+            return list(pairs)
+        allowed_groups = {_kind_group(k) for k in kinds}
+        return [p for p in pairs if _kind_group(p[0].kind) in allowed_groups]
+
+    def _deterministic_rank(
+        self, pairs: Sequence[tuple[MemoryItem, float | None]]
+    ) -> list[tuple[MemoryItem, float | None]]:
+        """v2.0 确定性排序：importance 降序 + 时间倒序兜底（原实现迁移到 pair 结构，顺序不变）。
+
+        key 用 `_aware_utc` 归一，仅防御 naive/aware 混合比较崩溃；
+        全 aware 数据下顺序与 v2.0 完全一致。
+        """
+        pairs = list(pairs)
+        pairs.sort(
+            key=lambda p: (p[0].importance, _aware_utc(p[0].timestamp)),
+            reverse=True,
+        )
+        return pairs
+
+    def _hybrid_rerank(
+        self,
+        pairs: Sequence[tuple[MemoryItem, float | None]],
+        *,
+        weights: tuple[float, float, float],
+    ) -> list[tuple[MemoryItem, float | None]]:
+        """语义混合重排：hybrid = w_score*score + w_importance*importance + w_recency*recency，
+        按 hybrid 降序。
+
+        `weights` 由 `recall` 显式传入（content / preference 两套职责权重），
+        本方法不感知 kind 语义；`recency_half_life_days` 取自配置。
+        返回 `(item, raw_score)`——第二个元素是**原始语义分数**（供 Citation.score 回填），
+        不是 hybrid_score；排序才是 hybrid 结果。
+        tie-break：hybrid 相同 → importance 降序 → 时间倒序（与确定性模式一致的确定性次序）。
+        """
+        half_life = self._recall_config.recency_half_life_days
+        scored: list[tuple[MemoryItem, float, float | None]] = []
+        for item, raw in pairs:
+            score_sig, importance_sig, recency_sig = _rerank_signals(
+                item, raw, half_life_days=half_life
+            )
+            hybrid = weights[0] * score_sig + weights[1] * importance_sig + weights[2] * recency_sig
+            scored.append((item, hybrid, raw))
+        scored.sort(
+            key=lambda t: (t[1], t[0].importance, _aware_utc(t[0].timestamp)),
+            reverse=True,
+        )
+        return [(item, raw) for item, _hybrid, raw in scored]

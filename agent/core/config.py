@@ -14,6 +14,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr
 
+from agent.share.models import MemoryRecallConfig
 from shared.embeddings import EmbeddingConfig
 
 
@@ -171,6 +172,8 @@ class MemoryBehaviorConfig(BaseModel):
     preload_profile: bool = True  # load_context 预加载 preference 记忆
     # 语义召回开关/模型对齐。
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    # 语义召回混合重排参数（模型本体在 agent/share/models.py，core 与 memory 共用，防循环导入）。
+    recall: MemoryRecallConfig = Field(default_factory=MemoryRecallConfig)
 
 
 class SessionBehaviorConfig(BaseModel):
