@@ -16,6 +16,7 @@ dependencies = [
     "langgraph-prebuilt>=1.1.0",
     "psycopg[binary]>=3.3.4",
     "pydantic-settings>=2.14.2",
+    "rank-bm25>=0.2.2",
     "sqlalchemy[asyncio]>=2.0",
 ]
 
