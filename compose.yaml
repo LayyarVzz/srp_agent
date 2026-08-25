@@ -1,0 +1,89 @@
+# srp-agent 开发/测试服务编排
+#
+# 服务说明：
+#   - postgres  : 记忆后端（长期 Store + checkpointer + 会话 sessions 表共用此库）。
+#                 pgvector 镜像内置 vector 扩展，语义召回（EMBEDDING_ENABLED）必需。
+#   - tools_mcp : 工具服务，以 streamable-http 方式运行在 8100 端口。
+#   - qdrant    : RAG 向量库（Agent 主流程暂不使用，后续接 RAG 时取消注释即可）。
+#
+# 使用（仓库根目录）：
+#   docker compose up -d --build   # 首次：构建 tools_mcp 镜像并启动
+#   docker compose up -d           # 之后直接启动
+#   docker compose ps              # 查看状态
+#   docker compose logs -f tools_mcp
+#   docker compose down            # 停止（数据卷保留）
+#   docker compose down -v         # 停止并删除数据卷（彻底清理）
+#
+# 之后在 .env 里配：
+#   LLM_PROVIDER=deepseek
+#   LLM_API_KEY=sk-xxx
+#   DATABASE_URL=postgresql://postgres:postgres@localhost:5432/srp_agent
+#   MCP_TRANSPORT=streamable-http
+# 即可让Agent直连上面的 Postgres 与 tools_mcp。
+name: srp-agent
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: srp-agent-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: srp_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      # 与 .env.example 注释中的 docker run 命令保持一致的挂载点（pgvector 官方示例路径）
+      - srp_pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d srp_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  tools_mcp:
+    build:
+      context: .
+    image: srp-agent-tools-mcp:latest
+    container_name: srp-agent-tools-mcp
+    environment:
+      # streamable-http 运行方式（连字符，与 fastmcp 服务端传输值对齐）
+      MCP_TRANSPORT: streamable-http
+      # 容器内监听全部接口，经下方端口映射对外可达；MCP_HOST 只影响容器内监听
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8100
+      MCP_STREAMABLE_HTTP_PATH: /mcp
+      MCP_STATELESS_HTTP: "true"
+      LOG_LEVEL: INFO
+    ports:
+      - "8100:8100"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # —— 可选：Qdrant（RAG 向量库）。Agent 主流程不用，后续接 RAG 时再启用 ——
+  # 启用：取消下方注释 → docker compose up -d
+  # qdrant:
+  #   image: qdrant/qdrant:latest
+  #   container_name: srp-agent-qdrant
+  #   ports:
+  #     - "6333:6333"   # REST / Dashboard
+  #     - "6334:6334"   # gRPC
+  #   volumes:
+  #     - qdrant_data:/qdrant/storage
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   restart: unless-stopped
+
+volumes:
+  srp_pgdata:
+  qdrant_data:
