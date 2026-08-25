@@ -47,6 +47,13 @@ class RuntimeSettings(BaseSettings):
     mcp_streamable_http_path: str = "/mcp"  # 与 fastmcp 默认一致，客户端连接地址即该路径
     mcp_stateless_http: bool = True  # 工具纯函数无会话 → 默认无状态，支持水平扩展
 
+    # —— embedding（与 RAG 对齐；语义召回开关）——
+    embedding_enabled: bool = False  # 置 true 启用语义召回/去重
+    embedding_model: str = ""  # 与 RAG 同一模型名
+    embedding_dims: int = Field(default=0, ge=0)  # 与模型一致；enabled 时必须 > 0
+    embedding_base_url: str | None = None
+    embedding_api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
+
     # —— Postgres 记忆后端（生产持久化；缺省则不启用，回退 InMemoryStore + MemorySaver）——
     # checkpointer（会话/短期）与 Store（长期/会话元数据）共用此库，各自独立连接池与表。
     database_url: SecretStr | None = Field(
