@@ -14,6 +14,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr
 
+from shared.embeddings import EmbeddingConfig
+
 
 class LLMProvider(StrEnum):
     """LLM 提供方（provider 无关：任何 OpenAI 兼容端点均可用）。"""
@@ -167,16 +169,18 @@ class MemoryBehaviorConfig(BaseModel):
     store_type: Literal["in_memory", "postgres"] = "in_memory"
     max_recall_chars: int = Field(default=8000, ge=1)  # 单次召回内容长度上限
     preload_profile: bool = True  # load_context 预加载 preference 记忆
+    # 语义召回开关/模型对齐。
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
 
 
 class SessionBehaviorConfig(BaseModel):
     """会话元数据行为（消息本体由 checkpointer 承载，本配置只管元数据层）。
 
-    命名空间后缀不做运行时配置：`SESSIONS_NAMESPACE` 是模块级常量，运行时改后缀
-    会与既有数据的布局漂移，收益为零。
+    TTL 不做运行时命名空间约定：过期语义由 `sessions` 表（SQLAlchemy）的
+    `expires_at` 承载，读路径过滤过期行（见 agent/session/repository.py）。
     """
 
-    # TTL：dev InMemoryStore 不支持（supports_ttl=False）恒忽略；prod PostgresStore 生效。
+    # TTL：折算为 expires_at 落库；None 表示永不过期。SQLite/Postgres 两方言均生效。
     ttl_minutes: int | None = Field(default=None, ge=1)
 
 
