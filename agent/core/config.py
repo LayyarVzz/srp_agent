@@ -162,8 +162,21 @@ class MCPToolsConfig(BaseModel):
     mcp_max_content_chars: int = Field(default=10_000, ge=1)  # 工具返回内容长度上限
 
 
+class DedupConfig(BaseModel):
+    """带外保存去重（content-hash 精确层 + 语义近似层，D4）。
+
+    阈值默认取保守值：长记忆条目是个人事实
+    误并（把两条近似但不同的偏好合并）比漏并（重复存一条）代价更高；
+    `semantic_threshold` 只在 embeddings 可用时生效，未配 embedding 自动降级为
+    仅 content-hash 精确去重。
+    """
+
+    enabled: bool = True
+    semantic_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
+
+
 class MemoryBehaviorConfig(BaseModel):
-    """记忆行为（长期记忆抽取 / 召回参数）。"""
+    """记忆行为（长期记忆抽取 / 召回 / 保存去重参数）。"""
 
     top_k: int = Field(default=5, ge=1)
     # 长期记忆统一走 langgraph Store，dev=InMemoryStore / prod=PostgresStore。
@@ -174,6 +187,8 @@ class MemoryBehaviorConfig(BaseModel):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     # 语义召回混合重排参数（模型本体在 agent/share/models.py，core 与 memory 共用，防循环导入）。
     recall: MemoryRecallConfig = Field(default_factory=MemoryRecallConfig)
+    # 带外保存去重（保存端 L1 content-hash + L2 语义）。
+    dedup: DedupConfig = Field(default_factory=DedupConfig)
 
 
 class SessionBehaviorConfig(BaseModel):

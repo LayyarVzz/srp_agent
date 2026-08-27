@@ -16,11 +16,20 @@ from agent.memory.adapter import (
 )
 from agent.memory.extractor import MemoryExtractor
 from agent.memory.factory import MemoryBackends, build_memory_backends
+from agent.memory.judge import MemoryRelationJudge
 from agent.memory.models import (
+    MERGEABLE_RELATIONS,
+    RELATION_EXACT,
+    RELATION_NOT_DUPLICATE,
+    RELATION_OVERLAP,
+    CandidateVerdict,
     MemoryExtraction,
     MemoryExtractionResult,
     MemoryItem,
     MemoryRecallResult,
+    MergeDecisionResult,
+    SaveOutcome,
+    normalize_content_hash,
 )
 from agent.memory.persist import (
     PROVENANCE_CONVERSATION,
@@ -37,7 +46,12 @@ __all__ = [
     "KIND_PREFERENCE",
     "KNOWN_KINDS",
     "LONG_TERM_NAMESPACE",
+    "MERGEABLE_RELATIONS",
     "PROVENANCE_CONVERSATION",
+    "RELATION_EXACT",
+    "RELATION_NOT_DUPLICATE",
+    "RELATION_OVERLAP",
+    "CandidateVerdict",
     "MemoryBackends",
     "MemoryExtraction",
     "MemoryExtractionResult",
@@ -45,8 +59,12 @@ __all__ = [
     "MemoryItem",
     "MemoryRecallConfig",
     "MemoryRecallResult",
+    "MemoryRelationJudge",
     "MemoryStore",
+    "MergeDecisionResult",
+    "SaveOutcome",
     "build_memory_backends",
+    "normalize_content_hash",
     "save_conversation_memory",
     "store_has_embeddings",
     "submit_memory_save",

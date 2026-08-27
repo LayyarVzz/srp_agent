@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 
 from langgraph.store.base import BaseStore, SearchItem
 
-from agent.memory.models import MemoryItem, MemoryRecallResult
+from agent.memory.models import MemoryItem, MemoryRecallResult, SaveOutcome
 from agent.share.models import Citation, MemoryRecallConfig
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,11 @@ KIND_OTHER = "other"
 
 # 抽取器规范 kind 集合
 KNOWN_KINDS = frozenset({KIND_FACT, KIND_EPISODE, KIND_PREFERENCE})
+
+# 语义候选召回上限：同 kind 取 top-N 相似记忆交给判定器/阈值决策。
+# 仅作「候选召回」而非「合并决策」——有判定器时由判定器按事实三分类决定合并/新写，
+# 无判定器时退回语义阈值（upsert）
+DEDUP_SEMANTIC_FETCH_LIMIT = 5
 
 
 def _kind_group(kind: str) -> str:
@@ -91,6 +96,12 @@ class MemoryStore:
     """langgraph Store 适配：InMemoryStore(dev) / PostgresStore(prod) 均可。
 
     命名空间 `(user_id, "long_term")`、key=memory_id、value=`MemoryItem` 的 JSON dump。
+    `save` 无去重新写；`upsert` 带确定性两层去重：
+    L1 content-hash 精确层（零误并）→ L2 语义近似层（cosine ≥ 阈值，需 embeddings）→
+    未命中新写；L2 不可用时自动降级为仅 L1。
+    `find_dedup_candidates` 暴露去重候选（L1 精确命中 / L2 top-K），供上层判定器
+    （`MemoryRelationJudge`，见 persist._save_deduped）在阈值之外按事实三分类决策；
+    `merge` 是两条候选的合并原语（保留原 id）。
     `recall` 双模式：语义（query 非空且 store 配 embeddings）→ 混合重排
     （score/importance/recency）；
     确定性（无 query 或 embeddings 不可用）→ importance 降序（零回归）。
@@ -111,6 +122,83 @@ class MemoryStore:
         namespace = (item.user_id, LONG_TERM_NAMESPACE)
         # mode="json"：datetime → ISO 字符串，保证 InMemoryStore / PostgresStore 均可 JSON 序列化。
         await self._store.aput(namespace, item.id, item.model_dump(mode="json"))
+
+    async def find_dedup_candidates(
+        self, item: MemoryItem
+    ) -> tuple[MemoryItem | None, list[tuple[MemoryItem, float | None]]]:
+        """取去重候选：L1 content-hash 精确命中（零误并）或 L2 同 kind 语义 top-K。
+
+        返回 `(exact, semantic)`：L1 命中时 exact 为唯一条目、semantic 为空
+        （不经 LLM、不取 L2，省一次向量查询）；否则 exact=None，semantic 为
+        `asearch(query, filter={"kind"}, limit=DEDUP_SEMANTIC_FETCH_LIMIT)` 的解析结果
+        """
+        namespace = (item.user_id, LONG_TERM_NAMESPACE)
+        if item.content_hash:  # L1 精确层：内容指纹完全一致 → 同一事实
+            pairs = self._parse_hits(
+                await self._store.asearch(
+                    namespace, filter={"content_hash": item.content_hash}, limit=1
+                )
+            )
+            if pairs:
+                return pairs[0][0], []
+        if store_has_embeddings(self._store):  # L2 语义层（D3：未配 embeddings 自动跳过）
+            hits = await self._store.asearch(
+                namespace,
+                query=item.content,
+                filter={"kind": item.kind},
+                limit=DEDUP_SEMANTIC_FETCH_LIMIT,
+            )
+            return None, self._parse_hits(hits)
+        return None, []
+
+    async def upsert(self, item: MemoryItem, *, semantic_threshold: float) -> SaveOutcome:
+        """带去重的保存：L1 content-hash 精确 → L2 语义近似 → 未命中新写。
+
+        L1：归一化后 hash 精确命中同一条事实（零误并、零向量成本）→ 合并。
+        L2：embeddings 可用时同 kind 语义检索，最高 cosine ≥ `semantic_threshold`
+        视为「同事实不同表述」→ 合并；否则视为近似但不同的条目 → 新写。
+        本方法是**确定性阈值路径**（无判定器时的降级 / 直接调用默认）；
+        判定器路径（`MemoryRelationJudge`，见 persist._save_deduped）复用
+        `find_dedup_candidates` 取候选后按事实三分类决策。
+        合并保留原 memory_id（历史 citation 的 source_id 仍可命中），字段按 D4 合并规则。
+        `content_hash` 为空（旧数据/直接调用）时跳过 L1，语义可用仍走 L2。
+        """
+        exact, semantic = await self.find_dedup_candidates(item)
+        if exact is not None:  # L1 精确层
+            return await self.merge((item.user_id, LONG_TERM_NAMESPACE), exact, item)
+        scored = [p for p in semantic if p[1] is not None]  # L2 语义层（D3：无 embeddings 为空）
+        if scored and scored[0][1] >= semantic_threshold:  # asearch 已降序 → scored[0] 即最高分
+            return await self.merge((item.user_id, LONG_TERM_NAMESPACE), scored[0][0], item)
+        await self.save(item)  # 两层均未命中 → 新写一条
+        return SaveOutcome(action="inserted", item=item)
+
+    async def merge(
+        self,
+        namespace: tuple[str, ...],
+        existing: MemoryItem,
+        incoming: MemoryItem,
+    ) -> SaveOutcome:
+        """按 D4 合并规则把 incoming 并进 existing（保留原 id，落库并返回合并结果）。
+
+        内容取更完整版本（更长者），故近似合并也不丢失信息；
+        importance 取 max（事实重要性先验不退化）；timestamp 取新者刷新 recency；
+        provenance/session_id 记录最近来源。
+        """
+        use_incoming = len(incoming.content) >= len(existing.content)
+        merged = existing.model_copy(
+            update={
+                "content": incoming.content if use_incoming else existing.content,
+                # 与落库 content 对齐：谁的内容留下，谁的指纹留下；incoming 缺省时保旧。
+                "content_hash": incoming.content_hash or existing.content_hash,
+                "importance": max(existing.importance, incoming.importance),
+                # recency 刷新：比较用 `_aware_utc` 归一，防御 naive/aware 混合。
+                "timestamp": max(existing.timestamp, incoming.timestamp, key=_aware_utc),
+                "session_id": incoming.session_id,
+                "provenance": incoming.provenance,
+            }
+        )
+        await self._store.aput(namespace, existing.id, merged.model_dump(mode="json"))
+        return SaveOutcome(action="merged", item=merged)
 
     async def recall(
         self,
