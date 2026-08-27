@@ -99,6 +99,17 @@ async def save_conversation_memory(
             logger.warning("记忆带外保存失败（kind=%s）：%s", e.kind, exc)
 
 
+def _score_rank_key(pair: tuple[MemoryItem, float | None]) -> tuple[bool, float]:
+    """合并目标排序键：有真实分数者优先、分数降序，score=None 兜底条目排最后。
+
+    WHY 显式键：`exacts`/`mergeable` 的构建顺序来自模型 verdict 输出（可能乱序），
+    需按语义分数重排，保证 `[0]` 即最相似候选；None 分数（asearch 兜底条目）
+    视为「未知相似度」，排在有分者之后。
+    """
+    score = pair[1]
+    return (score is not None, score if score is not None else -1.0)
+
+
 async def _save_deduped(
     item: MemoryItem,
     *,
@@ -146,7 +157,12 @@ async def _save_deduped(
             mergeable.append(cand)
         elif v.relation == RELATION_OVERLAP:
             mergeable.append(cand)
-    if exacts:  # 确定性重复存在 → 合并进最高分 exact（semantic 已按分数降序）
+    # 合并目标按分数降序取最高分：exacts/mergeable 的构建顺序来自「模型 verdict 输出」
+    # （可能乱序 index），而非 semantic 的 asearch 降序——必须显式重排，
+    # 才能保证 [0] 即最相似候选（score=None 兜底条目排最后）。
+    exacts.sort(key=_score_rank_key, reverse=True)
+    mergeable.sort(key=_score_rank_key, reverse=True)
+    if exacts:  # 确定性重复存在 → 合并进最高分 exact（已按语义分数降序）
         logger.info(
             "存在 exact_duplicate → 合并进最高分 exact %s（%s）",
             exacts[0][0].id,
