@@ -147,6 +147,9 @@ class AgentGraphConfig(BaseModel):
     max_input_chars: int = Field(default=8000, ge=1)  # 输入长度上限
     trim_token_budget: int = Field(default=8000, ge=1)  # 短期上下文 token 预算
     trim_keep_recent_rounds: int = Field(default=10, ge=0)  # 裁剪保留最近 N 轮
+    # 短期上下文字符预算（无 tokenizer，用字符近似 token）：窗口内消息按旧→新累计长度，
+    # 超预算继续裁旧轮；是摘要预算之上的一次性上下文预算。
+    max_context_chars: int = Field(default=24000, ge=1)
 
 
 class MCPToolsConfig(BaseModel):
@@ -175,6 +178,27 @@ class DedupConfig(BaseModel):
     semantic_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
 
 
+class SummarizeConfig(BaseModel):
+    """滚动摘要行为（短期上下文管理）。
+
+    `enabled` 关闭时 `summarize_history` 恒 no-op（零回归）；`max_summary_chars` 是
+    摘要字符预算：提示词要求压缩到预算内，超限以硬截断兜底（滚动重写失败保底）。
+    """
+
+    enabled: bool = True
+    max_summary_chars: int = Field(default=1500, ge=1)
+
+
+class KeyFactsConfig(BaseModel):
+    """会话关键信息行为（短期上下文管理）。
+
+    `max_items` 是写入 state 的关键信息条数上限（超过按序截断，遗忘策略②的确定性兜底）。
+    """
+
+    enabled: bool = True
+    max_items: int = Field(default=8, ge=1)
+
+
 class MemoryBehaviorConfig(BaseModel):
     """记忆行为（长期记忆抽取 / 召回 / 保存去重参数）。"""
 
@@ -189,6 +213,10 @@ class MemoryBehaviorConfig(BaseModel):
     recall: MemoryRecallConfig = Field(default_factory=MemoryRecallConfig)
     # 带外保存去重（保存端 L1 content-hash + L2 语义）。
     dedup: DedupConfig = Field(default_factory=DedupConfig)
+
+    # 短期上下文管理：滚动摘要 + 会话关键信息。
+    summarize: SummarizeConfig = Field(default_factory=SummarizeConfig)
+    keyfacts: KeyFactsConfig = Field(default_factory=KeyFactsConfig)
 
 
 class SessionBehaviorConfig(BaseModel):

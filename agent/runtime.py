@@ -24,7 +24,7 @@ class AgentRuntime:
     graph: CompiledStateGraph
 
     @classmethod
-    async def create(cls) -> "AgentRuntime":
+    async def create(cls) -> AgentRuntime:
         """装配LLM、MCP Tools和Agent Graph，供后续复用。"""
         settings = get_settings()
         framework_config = AgentFrameworkConfig.get_default()
