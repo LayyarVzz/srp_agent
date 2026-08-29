@@ -12,9 +12,10 @@ from agent.memory.adapter import (
     KNOWN_KINDS,
     LONG_TERM_NAMESPACE,
     MemoryStore,
+    store_has_embeddings,
 )
 from agent.memory.extractor import MemoryExtractor
-from agent.memory.factory import build_store
+from agent.memory.factory import MemoryBackends, build_memory_backends
 from agent.memory.models import (
     MemoryExtraction,
     MemoryExtractionResult,
@@ -27,6 +28,7 @@ from agent.memory.persist import (
     submit_memory_save,
     wait_pending_saves,
 )
+from agent.share.models import MemoryRecallConfig
 
 __all__ = [
     "KIND_EPISODE",
@@ -36,14 +38,17 @@ __all__ = [
     "KNOWN_KINDS",
     "LONG_TERM_NAMESPACE",
     "PROVENANCE_CONVERSATION",
+    "MemoryBackends",
     "MemoryExtraction",
     "MemoryExtractionResult",
     "MemoryExtractor",
     "MemoryItem",
+    "MemoryRecallConfig",
     "MemoryRecallResult",
     "MemoryStore",
-    "build_store",
+    "build_memory_backends",
     "save_conversation_memory",
+    "store_has_embeddings",
     "submit_memory_save",
     "wait_pending_saves",
 ]
