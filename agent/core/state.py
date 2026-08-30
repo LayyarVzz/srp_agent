@@ -11,6 +11,7 @@ from typing import Annotated, TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
 
+from agent.core.context import SessionKeyFact
 from agent.errors import ErrorRecord
 from agent.intent.models import Intent, IntentResult
 from agent.memory.models import MemoryItem
@@ -22,6 +23,7 @@ from agent.tools.models import ToolCallRecord, ToolResult
 # —— 图节点名常量（节点名必须集中声明，禁止散落字符串字面量）——
 NODE_LOAD_CONTEXT = "load_context"
 NODE_TRIM_HISTORY = "trim_history"
+NODE_SUMMARIZE_HISTORY = "summarize_history"
 NODE_CLASSIFY_INTENT = "classify_intent"
 NODE_RECALL_MEMORY = "recall_memory"
 NODE_CALL_MODEL = "call_model"
@@ -58,6 +60,11 @@ class AgentState(TypedDict, total=False):
 
     # —— 记忆 ——
     memory_context: list[MemoryItem]  # 普通覆盖：load_context 重置、recall_memory 合并
+
+    # —— 短期上下文（滚动摘要 / 关键信息 / 被裁消息瞬态）——
+    short_term_summary: str  # 普通覆盖：裁剪时滚动重写；不放 messages（防 add_messages 累积）
+    session_keyfacts: list[SessionKeyFact]  # 普通覆盖：裁剪时重抽取（仅保留 active，写时过滤）
+    trimmed_messages: list[BaseMessage]  # 瞬态：trim_history 产出，summarize_history 消费后清空
 
     # —— 输出 ——
     final_answer: str | None
