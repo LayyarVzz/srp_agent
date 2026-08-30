@@ -19,6 +19,7 @@ class Status(StrEnum):
     RETRIEVING = "retrieving"  # 检索
     USING_TOOL = "using_tool"  # 调用工具
     SPEAKING = "speaking"  # 说话
+    PLANNING = "planning"  # 多步任务规划
     ERROR = "error"
 
 

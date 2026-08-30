@@ -23,12 +23,17 @@ DEFAULT_TOOL_KEYWORDS: frozenset[str] = frozenset(
 )
 
 # LLM 意图分类 few-shot 示例（稳定结构化输出的锚点）。
+# 复合任务（一句话含多个子任务/需多步编排）→ PLAN；
+# 注意 RuleFallbackClassifier 不产生 PLAN（保守兜底：复合任务特征不可靠，
+# 判成 TOOL_USE 走 ReAct 仍可用，判成 PLAN 若规划失败反而多一次开销）。
 _FEWSHOT_EXAMPLES: tuple[tuple[str, Intent], ...] = (
     ("你好，介绍一下你自己", Intent.CHAT),
     ("什么是虚拟数字人？", Intent.CHAT),
     ("帮我查一下昨天的新闻", Intent.TOOL_USE),
     ("计算 15 乘以 37 等于多少", Intent.TOOL_USE),
     ("现在几点了？", Intent.TOOL_USE),
+    ("把毕设资料找出来、总结成报告、翻译成英文", Intent.PLAN),
+    ("查一下今天的天气，然后把结果整理成英文摘要发给我", Intent.PLAN),
 )
 
 

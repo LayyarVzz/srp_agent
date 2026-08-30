@@ -12,6 +12,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
 
 from agent.core.context import SessionKeyFact
+from agent.core.models import PlanResult
 from agent.errors import ErrorRecord
 from agent.intent.models import Intent, IntentResult
 from agent.memory.models import MemoryItem
@@ -32,6 +33,10 @@ NODE_FALLBACK_CHAT = "fallback_chat"
 NODE_GENERATE_ANSWER = "generate_answer"
 NODE_VALIDATE_OUTPUT = "validate_output"
 NODE_FORMAT_RESPONSE = "format_response"
+NODE_PLAN_TASK = "plan_task"
+NODE_EXECUTE_STEP = "execute_step"
+NODE_PLAN_STEP_ADVANCE = "plan_step_advance"
+NODE_REPLAN_TASK = "replan_task"
 
 
 class AgentState(TypedDict, total=False):
@@ -57,6 +62,12 @@ class AgentState(TypedDict, total=False):
     tool_calls: Annotated[list[ToolCallRecord], operator.add]
     tool_result: ToolResult | None
     tool_iterations: int  # 普通覆盖字段：工具循环计数（上限语义）
+
+    # —— 多步任务编排（普通覆盖字段，load_context 每轮重置）——
+    plan: PlanResult | None  # 当前计划；None = 未规划/规划失败（回退 ReAct）
+    plan_step: int  # 步骤指针（0-based，当前计划内的执行进度）
+    plan_steps_done: int  # 跨重规划累计的成功步骤数（部分成功判定：≥1 即有产出）
+    replanned: bool  # 本轮是否已重规划过（防无限重规划，≤1 次）
 
     # —— 记忆 ——
     memory_context: list[MemoryItem]  # 普通覆盖：load_context 重置、recall_memory 合并

@@ -152,6 +152,21 @@ class AgentGraphConfig(BaseModel):
     max_context_chars: int = Field(default=24000, ge=1)
 
 
+class PlanConfig(BaseModel):
+    """多步任务编排行为（Plan-and-Solve）。
+
+    `max_plan_steps` 是主收敛约束（步骤数上限，规划期校验超限 → 回退 ReAct）；
+    `max_tool_calls_per_plan` 是 plan 模式下的工具迭代总预算（默认 = 6×2），
+    `tool_iterations` 跨步累计充当总预算；ReAct 模式的全局预算
+    （`AgentGraphConfig.max_tool_iterations`）不受影响（零回归）。
+    """
+
+    enabled: bool = True  # 关闭时 PLAN 意图回退 ReAct（call_model）
+    max_plan_steps: int = Field(default=6, ge=1, le=10)  # 步骤数上限（主收敛约束）
+    # plan 模式工具迭代上限（默认 = max_plan_steps×2）；tool_iterations 跨步累计充当总预算。
+    max_tool_calls_per_plan: int = Field(default=12, ge=1)
+
+
 class MCPToolsConfig(BaseModel):
     """MCP 工具接入护栏行为（MCP 服务地址属运行环境，见根 settings.py）。
 
@@ -234,6 +249,7 @@ class AgentFrameworkConfig(BaseModel):
     """Agent 框架行为配置聚合（纯代码默认值，供装配层读取）。"""
 
     graph: AgentGraphConfig = Field(default_factory=AgentGraphConfig)
+    plan: PlanConfig = Field(default_factory=PlanConfig)  # 多步任务编排
     llm_behavior: LLMBehaviorConfig = Field(default_factory=LLMBehaviorConfig)
     tools: MCPToolsConfig = Field(default_factory=MCPToolsConfig)
     memory: MemoryBehaviorConfig = Field(default_factory=MemoryBehaviorConfig)

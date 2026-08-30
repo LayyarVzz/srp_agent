@@ -16,6 +16,7 @@ FINISHED_REASON_COMPLETED = "completed"  # 正常完成
 FINISHED_REASON_TOOL_LIMIT = "tool_limit"  # 工具迭代达上限
 FINISHED_REASON_FALLBACK = "fallback"  # 走了降级/兜底路径
 FINISHED_REASON_ERROR = "error"  # 出错降级
+FINISHED_REASON_PARTIAL = "partial"  # 部分成功：多步任务有 ≥1 步产出、其余失败/中断
 
 
 class AgentResponse(BaseModel):
