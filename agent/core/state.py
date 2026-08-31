@@ -16,7 +16,7 @@ from agent.core.models import PlanResult
 from agent.errors import ErrorRecord
 from agent.intent.models import Intent, IntentResult
 from agent.memory.models import MemoryItem
-from agent.response.models import AgentResponse
+from agent.response.models import AgentResponse, Clarification
 from agent.response.status import Status, StatusEvent
 from agent.share.models import Citation
 from agent.tools.models import ToolCallRecord, ToolResult
@@ -37,6 +37,7 @@ NODE_PLAN_TASK = "plan_task"
 NODE_EXECUTE_STEP = "execute_step"
 NODE_PLAN_STEP_ADVANCE = "plan_step_advance"
 NODE_REPLAN_TASK = "replan_task"
+NODE_CLARIFY = "clarify"
 
 
 class AgentState(TypedDict, total=False):
@@ -68,6 +69,10 @@ class AgentState(TypedDict, total=False):
     plan_step: int  # 步骤指针（0-based，当前计划内的执行进度）
     plan_steps_done: int  # 跨重规划累计的成功步骤数（部分成功判定：≥1 即有产出）
     replanned: bool  # 本轮是否已重规划过（防无限重规划，≤1 次）
+
+    # —— 澄清式追问（普通覆盖字段，load_context 每轮重置）——
+    clarify_asked: bool  # 本轮是否已追问过（防澄清循环，≤ max_asks_per_turn）
+    clarification: Clarification | None  # 本轮澄清问题（响应契约）
 
     # —— 记忆 ——
     memory_context: list[MemoryItem]  # 普通覆盖：load_context 重置、recall_memory 合并

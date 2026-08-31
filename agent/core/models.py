@@ -19,7 +19,7 @@ class PlanStep(BaseModel):
 
     goal: str  # 步骤目标（自然语言，供执行与进度展示）
     tool: str | None = None  # 期望工具名；None = 纯 LLM 变换步
-    depends_on: list[int] = Field(default_factory=list)  # 本步需要的上游产出所对应的步骤索引（0-based，空 = 无依赖）
+    depends_on: list[int] = Field(default_factory=list)  # 上游步骤索引（0-based，空 = 无依赖）
     expected_output: str | None = None  # 步骤产出描述（供整合引用）
 
 

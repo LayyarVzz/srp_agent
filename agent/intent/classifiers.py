@@ -26,14 +26,20 @@ DEFAULT_TOOL_KEYWORDS: frozenset[str] = frozenset(
 # 复合任务（一句话含多个子任务/需多步编排）→ PLAN；
 # 注意 RuleFallbackClassifier 不产生 PLAN（保守兜底：复合任务特征不可靠，
 # 判成 TOOL_USE 走 ReAct 仍可用，判成 PLAN 若规划失败反而多一次开销）。
-_FEWSHOT_EXAMPLES: tuple[tuple[str, Intent], ...] = (
-    ("你好，介绍一下你自己", Intent.CHAT),
-    ("什么是虚拟数字人？", Intent.CHAT),
-    ("帮我查一下昨天的新闻", Intent.TOOL_USE),
-    ("计算 15 乘以 37 等于多少", Intent.TOOL_USE),
-    ("现在几点了？", Intent.TOOL_USE),
-    ("把毕设资料找出来、总结成报告、翻译成英文", Intent.PLAN),
-    ("查一下今天的天气，然后把结果整理成英文摘要发给我", Intent.PLAN),
+# 三元组 = (用户消息, 意图, 置信度)：明确请求给高置信（≥0.9）；
+# 模糊/信息不足/指代不清的请求必须给低置信（<0.5），供路由层触发澄清追问（T2）。
+_FEWSHOT_EXAMPLES: tuple[tuple[str, Intent, float], ...] = (
+    ("你好，介绍一下你自己", Intent.CHAT, 0.95),
+    ("什么是虚拟数字人？", Intent.CHAT, 0.95),
+    ("帮我查一下昨天的新闻", Intent.TOOL_USE, 0.95),
+    ("计算 15 乘以 37 等于多少", Intent.TOOL_USE, 0.95),
+    ("现在几点了？", Intent.TOOL_USE, 0.95),
+    ("把毕设资料找出来、总结成报告、翻译成英文", Intent.PLAN, 0.95),
+    ("查一下今天的天气，然后把结果整理成英文摘要发给我", Intent.PLAN, 0.95),
+    # 模糊请求 → 低置信度（意图可判但信息不足，须反问而非硬答）。
+    ("帮我算一下", Intent.TOOL_USE, 0.3),  # 工具意图明确但缺算式等关键参数
+    ("就是那个，你懂的", Intent.CHAT, 0.2),  # 指代不清，无法确定用户要什么
+    ("把那个整理一下发给我", Intent.PLAN, 0.35),  # 复合任务但对象/目标不明
 )
 
 
@@ -95,11 +101,16 @@ class LLMIntentClassifier:
     def _build_prompt(messages: Sequence[BaseMessage]) -> str:
         user_text = _latest_human_text(messages)
         examples = "\n".join(
-            f"- 用户：{text} → 意图：{intent.value}" for text, intent in _FEWSHOT_EXAMPLES
+            f"- 用户：{text} → 意图：{intent.value}（置信度 {confidence}）"
+            for text, intent, confidence in _FEWSHOT_EXAMPLES
         )
         allowed = ", ".join(intent.value for intent in Intent)
         return (
             "你是意图分类器。判断用户消息属于哪种意图，只输出对应 JSON 结构（由调用方解析）。\n"
+            "confidence 表示你对本次分类的信心（不是任务难度）：\n"
+            "- 请求明确、意图确定（含明确的工具/复合任务指令）→ 高置信度（≥0.9）；\n"
+            "- 请求模糊、信息不足、指代不清（缺关键对象/参数/方向）→ 低置信度（<0.5），"
+            "并在 reason 中说明模糊点——这类请求应被反问澄清，而不是自信地硬答或硬调用工具。\n"
             f"可选意图：{allowed}\n"
             f"示例：\n{examples}\n"
             f"用户消息：{user_text}"
