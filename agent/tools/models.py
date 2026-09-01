@@ -14,6 +14,7 @@ from agent.share.models import Citation
 # —— 工具错误码（tool_error.* 命名空间）——
 TOOL_ERROR_EXECUTION = "tool_error.execution"  # 工具执行失败（含参数校验/运行时异常）
 TOOL_ERROR_UNKNOWN_TOOL = "tool_error.unknown_tool"  # 模型幻觉出未注册工具名
+TOOL_ERROR_MISSING_ARGUMENT = "tool_error.missing_argument"  # 工具参数缺失（T2：澄清而非降级）
 
 
 class ToolError(BaseModel):

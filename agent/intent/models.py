@@ -19,8 +19,9 @@ class Intent(StrEnum):
 
     CHAT = "chat"  # 普通交流 / 常识问题：直接回答
     TOOL_USE = "tool_use"  # 需要外部工具
+    PLAN = "plan"  # 复合任务：需要显式多步规划
     # 扩展位：GREETING、MEMORY_RECALL、CHAINED_QUERY ...
-    # 新增意图 = 枚举加值 + 可选 few-shot 条目，无需改路由边（仅 TOOL_USE 被特判）。
+    # 新增意图 = 枚举加值 + 可选 few-shot 条目，无需改路由边（仅 TOOL_USE/PLAN 被特判）。
 
 
 class IntentResult(BaseModel):

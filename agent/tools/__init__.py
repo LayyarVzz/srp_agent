@@ -7,6 +7,7 @@
 from agent.tools.factory import build_tools_from_mcp
 from agent.tools.models import (
     TOOL_ERROR_EXECUTION,
+    TOOL_ERROR_MISSING_ARGUMENT,
     TOOL_ERROR_UNKNOWN_TOOL,
     ToolCallRecord,
     ToolError,
@@ -15,6 +16,7 @@ from agent.tools.models import (
 
 __all__ = [
     "TOOL_ERROR_EXECUTION",
+    "TOOL_ERROR_MISSING_ARGUMENT",
     "TOOL_ERROR_UNKNOWN_TOOL",
     "ToolCallRecord",
     "ToolError",

@@ -152,6 +152,37 @@ class AgentGraphConfig(BaseModel):
     max_context_chars: int = Field(default=24000, ge=1)
 
 
+class PlanConfig(BaseModel):
+    """多步任务编排行为（Plan-and-Solve）。
+
+    `max_plan_steps` 是主收敛约束（步骤数上限，规划期校验超限 → 回退 ReAct）；
+    `max_tool_calls_per_plan` 是 plan 模式下的工具迭代总预算（默认 = 6×2），
+    `tool_iterations` 跨步累计充当总预算；ReAct 模式的全局预算
+    （`AgentGraphConfig.max_tool_iterations`）不受影响（零回归）。
+    """
+
+    enabled: bool = True  # 关闭时 PLAN 意图回退 ReAct（call_model）
+    max_plan_steps: int = Field(default=6, ge=1, le=10)  # 步骤数上限（主收敛约束）
+    # plan 模式工具迭代上限（默认 = max_plan_steps×2）；tool_iterations 跨步累计充当总预算。
+    max_tool_calls_per_plan: int = Field(default=12, ge=1)
+
+
+class ClarifyConfig(BaseModel):
+    """澄清式追问行为。
+
+    触发源：
+    ① 意图置信度低：`route_intent` 前检查 `intent_meta.confidence < min_confidence`
+       （严格小于；规则兜底 CHAT=0.5 恰不触发）；
+    ② 工具参数缺失：`route_after_tool` 检查 `tool_error.missing_argument`
+       （plan 模式除外 → 走重规划）。
+    `max_asks_per_turn` 是防澄清循环的硬上限（`clarify_asked` 状态位，每轮重置）。
+    """
+
+    enabled: bool = True  # 关闭时两个触发源均不反问（零回归）
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)  # 意图置信度阈值（严格小于触发）
+    max_asks_per_turn: int = Field(default=1, ge=1)  # 每轮追问上限（防循环）
+
+
 class MCPToolsConfig(BaseModel):
     """MCP 工具接入护栏行为（MCP 服务地址属运行环境，见根 settings.py）。
 
@@ -234,6 +265,8 @@ class AgentFrameworkConfig(BaseModel):
     """Agent 框架行为配置聚合（纯代码默认值，供装配层读取）。"""
 
     graph: AgentGraphConfig = Field(default_factory=AgentGraphConfig)
+    plan: PlanConfig = Field(default_factory=PlanConfig)  # 多步任务编排
+    clarify: ClarifyConfig = Field(default_factory=ClarifyConfig)  # 澄清式追问
     llm_behavior: LLMBehaviorConfig = Field(default_factory=LLMBehaviorConfig)
     tools: MCPToolsConfig = Field(default_factory=MCPToolsConfig)
     memory: MemoryBehaviorConfig = Field(default_factory=MemoryBehaviorConfig)
