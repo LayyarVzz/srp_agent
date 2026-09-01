@@ -30,10 +30,12 @@ async def build_tools_from_mcp(
     """从 MCP 服务装配 LangChain 工具列表。
 
     超时：仅 streamable_http/sse 连接的 TypedDict 有 `timeout` 字段，注入
-    `mcp_timeout_s`；stdio 连接无 timeout
+    `mcp_timeout_s`；stdio 连接无 timeout。
 
     重试：adapters 无原生重试参数，`mcp_max_retries` 仅用于 `get_tools`
-    （连接/列表）阶段的有限重试；单次工具执行重试由 ToolNode/模型自纠错承担
+    （连接/列表）阶段的有限重试；单次工具执行重试由 ToolNode/模型自纠错承担。
+    重试耗尽后**降级为空工具集而非抛错**：工具为空时图内 call_model 无工具可选，
+    Agent 退化为纯文本回答（意图识别与降级路径仍可用），请求不失败。
     """
     tools_cfg = config.tools
     connections: dict[str, dict] = {}
@@ -48,6 +50,7 @@ async def build_tools_from_mcp(
     # 构造 MCP 多服务客户端
     client = MultiServerMCPClient(connections=connections, handle_tool_errors=True)
     last_exc: Exception | None = None
+    tools: list[BaseTool] = []
     for attempt in range(tools_cfg.mcp_max_retries + 1):
         try:
             tools = await client.get_tools()
@@ -63,10 +66,10 @@ async def build_tools_from_mcp(
                     exc,
                 )
     else:
-        if last_exc is None:  # pragma: no cover  # 防御：逻辑上不可达
-            raise RuntimeError("MCP 工具加载失败：未捕获到异常信息")
-        logger.error("MCP 工具加载失败，重试耗尽")
-        raise last_exc
+        # 重试耗尽：降级为空工具集而非整体崩溃（MCP 服务故障不应拖垮 Agent 进程）。
+        # WHY 可观测降级：空工具集下 Agent 仍可跑意图识别/纯文本回答/降级路径，
+        # 日志明确记录故障根因；MCP 服务恢复后重启进程（或热重载）即恢复工具能力。
+        logger.error("MCP 工具加载失败，重试耗尽，降级为空工具集：%s", last_exc)
 
     logger.info("已从 MCP 服务加载 %d 个工具", len(tools))
     yield tools

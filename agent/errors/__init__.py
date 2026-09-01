@@ -49,8 +49,10 @@ LLM_ERROR_INVALID_OUTPUT = "llm_error.invalid_output"
 SESSION_ERROR_NOT_FOUND = "session_error.not_found"  # resolve 未命中（含跨用户访问）
 SESSION_ERROR_INVALID_ID = "session_error.invalid_id"
 SESSION_ERROR_INVALID_STATE = "session_error.invalid_state"  # 元数据记录损坏
+AGENT_ERROR_INTERNAL = "agent_error.internal"  # 编排层内部错误（防御性：正常路径不可达）
 
 __all__ = [
+    "AGENT_ERROR_INTERNAL",
     "LLM_ERROR_AUTH",
     "LLM_ERROR_CONSTRUCTION",
     "LLM_ERROR_INVALID_OUTPUT",
