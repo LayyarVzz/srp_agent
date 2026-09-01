@@ -1,3 +1,8 @@
+"""讯飞语音听写（IAT）客户端：16kHz/16bit/单声道 PCM → 文本。
+
+凭据（APP_ID / API_KEY / API_SECRET）与端点统一由 `settings.py` 管理
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,7 +10,6 @@ import base64
 import hashlib
 import hmac
 import json
-import os
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from pathlib import Path
@@ -14,42 +18,41 @@ from urllib.parse import urlencode, urlparse
 import websockets
 from websockets.exceptions import InvalidStatus
 
-from .errors import InteractionError
+from app.errors import APIError
+from settings import get_settings
 
+# —— 错误码常量（asr.* 命名空间）——
+ASR_MISSING_CREDENTIALS = "asr.missing_credentials"  # 500：未配置讯飞凭据
+ASR_FILE_NOT_FOUND = "asr.file_not_found"  # 400：音频文件不存在
+ASR_EMPTY_AUDIO = "asr.empty_audio"  # 400：PCM 文件为空
+ASR_EMPTY_RESULT = "asr.empty_result"  # 502：听写未返回文本
+ASR_XFYUN_IAT_HANDSHAKE = "asr.xfyun_iat_handshake"  # 502：握手失败
+ASR_XFYUN_IAT_ERROR = "asr.xfyun_iat_error"  # 502：听写服务错误
 
-IAT_URL = "wss://iat-api.xfyun.cn/v2/iat"
 PCM_CHUNK_SIZE = 1280
 PCM_CHUNK_INTERVAL_SECONDS = 0.04
-
-
-def load_env_file(path: str | Path = ".env") -> None:
-    env_path = Path(path)
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def build_iat_url(
     *,
     api_key: str | None = None,
     api_secret: str | None = None,
-    host_url: str = IAT_URL,
+    host_url: str | None = None,
 ) -> str:
-    load_env_file()
-    api_key = api_key or os.getenv("XF_IAT_API_KEY")
-    api_secret = api_secret or os.getenv("XF_IAT_API_SECRET")
+    """构造讯飞 IAT 鉴权 URL（HMAC-SHA256 签名）。
+
+    凭据缺省时从 `get_settings()` 读取（.env 的 XF_IAT_*）；显式传入用于测试注入。
+    """
+    settings = get_settings()
+    api_key = api_key or settings.xf_iat_api_key.get_secret_value()
+    api_secret = api_secret or settings.xf_iat_api_secret.get_secret_value()
     if not api_key or not api_secret:
-        raise InteractionError(
-            code="asr.missing_credentials",
-            message="未配置 XF_IAT_API_KEY 或 XF_IAT_API_SECRET",
+        raise APIError(
+            ASR_MISSING_CREDENTIALS,
+            "未配置 XF_IAT_API_KEY 或 XF_IAT_API_SECRET",
             status_code=500,
         )
+    host_url = host_url or settings.xf_iat_url
 
     parsed = urlparse(host_url)
     date = format_datetime(datetime.now(UTC), usegmt=True)
@@ -77,22 +80,15 @@ def build_iat_url(
 
 
 async def transcribe_pcm_file(path: str | Path) -> str:
+    """识别 16kHz/16bit/单声道 PCM 文件，返回转写文本。"""
     pcm_path = Path(path)
     if not pcm_path.exists():
-        raise InteractionError(
-            code="asr.file_not_found",
-            message=f"音频文件不存在: {pcm_path}",
-            status_code=400,
-        )
+        raise APIError(ASR_FILE_NOT_FOUND, f"音频文件不存在: {pcm_path}", status_code=400)
 
-    load_env_file()
-    app_id = os.getenv("XF_IAT_APP_ID")
+    settings = get_settings()
+    app_id = settings.xf_iat_app_id.get_secret_value()
     if not app_id:
-        raise InteractionError(
-            code="asr.missing_credentials",
-            message="未配置 XF_IAT_APP_ID",
-            status_code=500,
-        )
+        raise APIError(ASR_MISSING_CREDENTIALS, "未配置 XF_IAT_APP_ID", status_code=500)
 
     results: list[str] = []
     try:
@@ -109,17 +105,18 @@ async def transcribe_pcm_file(path: str | Path) -> str:
     except InvalidStatus as exc:
         body = getattr(exc.response, "body", b"") if exc.response else b""
         detail = body.decode("utf-8", errors="ignore") if body else str(exc)
-        raise InteractionError(
-            code=f"asr.xfyun_iat_handshake.{exc.response.status_code if exc.response else 'unknown'}",
-            message=f"讯飞语音听写握手失败: {detail}",
+        status_code = exc.response.status_code if exc.response else "unknown"
+        raise APIError(
+            f"{ASR_XFYUN_IAT_HANDSHAKE}.{status_code}",
+            f"讯飞语音听写握手失败: {detail}",
             status_code=502,
         ) from exc
 
     text = "".join(results)
     if not text:
-        raise InteractionError(
-            code="asr.empty_result",
-            message="讯飞语音听写未返回识别文本，请检查音频格式是否为 16kHz/16bit/单声道 PCM",
+        raise APIError(
+            ASR_EMPTY_RESULT,
+            "讯飞语音听写未返回识别文本，请检查音频格式是否为 16kHz/16bit/单声道 PCM",
             status_code=502,
         )
     return text
@@ -134,11 +131,7 @@ async def _send_pcm_chunks(
     with pcm_path.open("rb") as audio_file:
         first_chunk = audio_file.read(PCM_CHUNK_SIZE)
         if not first_chunk:
-            raise InteractionError(
-                code="asr.empty_audio",
-                message="PCM 音频文件为空",
-                status_code=400,
-            )
+            raise APIError(ASR_EMPTY_AUDIO, "PCM 音频文件为空", status_code=400)
 
         await websocket.send(
             json.dumps(
@@ -198,9 +191,9 @@ async def _receive_results(
         message = json.loads(raw_message)
         code = int(message.get("code", 0))
         if code != 0:
-            raise InteractionError(
-                code=f"asr.xfyun_iat_error.{code}",
-                message=f"讯飞语音听写错误: {message.get('message') or raw_message}",
+            raise APIError(
+                f"{ASR_XFYUN_IAT_ERROR}.{code}",
+                f"讯飞语音听写错误: {message.get('message') or raw_message}",
                 status_code=502,
             )
 

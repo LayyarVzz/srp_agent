@@ -1,26 +1,18 @@
+"""ASR 转写入口：音频上传格式校验 + 转写（讯飞 IAT）。
+
+实现保持 feature/agent-voice-interaction 分支原码（格式校验内联于
+`transcribe_audio`）；仅错误类型统一为 `APIError`、配置统一由 settings 管理。
+流式接口的前置 415 校验由路由层承担（见 app/routes/chat.py）。
+"""
+
 from __future__ import annotations
 
-import os
 from pathlib import Path
-
 
 from fastapi import UploadFile
 
-from .errors import InteractionError
-from .xfyun_iat import transcribe_pcm_file
-
-
-def load_env_file(path: str | Path = ".env") -> None:
-    env_path = Path(path)
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+from app.errors import APIError
+from app.xfyun_iat import transcribe_pcm_file
 
 
 async def transcribe_audio(audio: UploadFile | None, transcript: str | None = None) -> str:
@@ -29,7 +21,7 @@ async def transcribe_audio(audio: UploadFile | None, transcript: str | None = No
     if transcript and transcript.strip():
         return transcript.strip()
     if audio is None:
-        raise InteractionError(
+        raise APIError(
             code="asr.audio_or_transcript_required",
             message="audio 和 transcript 至少需要提供一个",
             status_code=400,
@@ -49,7 +41,7 @@ async def transcribe_audio(audio: UploadFile | None, transcript: str | None = No
         finally:
             Path(temp_path).unlink(missing_ok=True)
 
-    raise InteractionError(
+    raise APIError(
         code="asr.unsupported_audio_format",
         message=(
             "当前语音接口支持 16kHz/16bit/单声道 PCM 文件；"
