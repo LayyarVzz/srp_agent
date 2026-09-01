@@ -23,11 +23,17 @@ def load_env_file(path: str | Path = ".env") -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-async def transcribe_audio(audio: UploadFile, transcript: str | None = None) -> str:
+async def transcribe_audio(audio: UploadFile | None, transcript: str | None = None) -> str:
     """识别上传音频，返回标准化文本。"""
 
     if transcript and transcript.strip():
         return transcript.strip()
+    if audio is None:
+        raise InteractionError(
+            code="asr.audio_or_transcript_required",
+            message="audio 和 transcript 至少需要提供一个",
+            status_code=400,
+        )
 
     filename = audio.filename or "audio"
     content_type = audio.content_type or "unknown"
