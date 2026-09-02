@@ -107,7 +107,9 @@ class AgentRuntime:
         )
         llm = LLMService(config=llm_config)
 
-        database_url = settings.database_url.get_secret_value() if settings.database_url else None
+        database_url = (
+            settings.database_url.get_secret_value() if settings.database_url else None
+        )
         # acquired 记录已获取资源的关闭函数；失败时逆序执行（先拿到的后关）。
         acquired: list[Callable[[], Awaitable[None]]] = []
         try:
@@ -192,26 +194,23 @@ class AgentRuntime:
         config = {"configurable": {"thread_id": session_id}}  # thread_id == session_id 契约
         response: AgentResponse | None = None
         try:
-            # stream_mode="updates" 产出 {节点名: 状态增量}（本版本 langgraph 的产出为
-            # dict 而非二元组）；空更新节点（trim_history 等）产出 {node: None}/{node: {}}，
-            # updates falsy 时跳过。
-            async for chunk in self.graph.astream(
+            async for node, chunk in self.graph.astream(
                 {"input": text, "session_id": session_id, "user_id": user_id},
                 config=config,
                 stream_mode="updates",
             ):
-                for node, updates in chunk.items():
-                    if not updates:  # 空更新节点（trim_history 等）产出 None/空 dict
+                for event in updates.get("status_events", []):
+                    logger.info(
+                        "  [%s] 状态=%s 工具=%s 消息=%s",
+                        node,
+                        event.status,
+                        event.tool_name,
+                        event.message,
+                    )
+                for updates in chunk.values():
+                    if not updates:  # 空更新节点（trim_history 等）产出 None
                         continue
                     for event in updates.get("status_events", []):
-                        # 节点级状态日志：放在 yield 之前，打印顺序即下发顺序（驱动动画的轨迹）。
-                        logger.info(
-                            "  [%s] 状态=%s 工具=%s 消息=%s",
-                            node,
-                            event.status,
-                            event.tool_name,
-                            event.message,
-                        )
                         yield ("status", event)
                     for record in updates.get("tool_calls", []):
                         yield ("tool", record)

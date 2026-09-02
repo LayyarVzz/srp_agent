@@ -40,9 +40,6 @@ class RuntimeSettings(BaseSettings):
     api_host: str = "0.0.0.0"  # noqa: S104  # 开发默认监听全部接口，部署时按需收紧
     api_port: int = 8000
 
-    # —— CORS（FastAPI 交互服务）：dev 默认前端 dev server 地址，部署时显式配置 ——
-    cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
-
     # —— tools_mcp 服务运行方式（stdio 默认；streamable-http 供端口/远程部署）——
     mcp_transport: MCPTransport = MCPTransport.STDIO
     mcp_host: str = "127.0.0.1"  # 云服务器/外部访问须设 0.0.0.0（默认回环更安全）
@@ -63,14 +60,6 @@ class RuntimeSettings(BaseSettings):
         default=None,
         description="postgresql://user:pass@host:port/db",
     )
-
-    # —— 讯飞语音听写（IAT）：语音链路配置统一由本模块管理，禁止在业务代码内嵌 / 手动读 .env ——
-    # 环境变量约定 XF_IAT_APP_ID / XF_IAT_API_KEY / XF_IAT_API_SECRET（pydantic-settings
-    # 大小写不敏感匹配）；未配置时语音接口返回 asr.missing_credentials，text 链路不受影响。
-    xf_iat_app_id: SecretStr = Field(default_factory=lambda: SecretStr(""))
-    xf_iat_api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
-    xf_iat_api_secret: SecretStr = Field(default_factory=lambda: SecretStr(""))
-    xf_iat_url: str = "wss://iat-api.xfyun.cn/v2/iat"  # 可覆盖默认端点
 
     # —— 日志（运行期级别）——
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"

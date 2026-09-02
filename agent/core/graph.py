@@ -585,7 +585,6 @@ def build_agent_graph(
         result = await intent_classifier.classify(state.get("messages") or [])
         updates["intent"] = result.intent
         updates["intent_meta"] = result
-        logger.info("置信度：%s", result.confidence)
         return updates
 
     # —— 长期记忆召回（P4-3）：fact/episode 注入 memory_context，闲聊/工具共同上游 ——

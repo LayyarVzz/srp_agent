@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.errors import APIError  # noqa: E402
+from app.errors import InteractionError  # noqa: E402
 from app.xfyun_iat import transcribe_pcm_file  # noqa: E402
 
 
@@ -19,7 +19,7 @@ async def main() -> None:
 
     try:
         text = await transcribe_pcm_file(args.audio)
-    except APIError as exc:
+    except InteractionError as exc:
         print(f"ASR failed: {exc.code} - {exc.message}")
         raise SystemExit(1) from exc
     print(text)
