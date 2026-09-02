@@ -97,6 +97,12 @@ services:
       EMBEDDING_DIMS: ${EMBEDDING_DIMS:-0}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      # —— 讯飞语音听写，
+      #    文本交互与 transcript 直传降级不受影响）——
+      XF_IAT_APP_ID: ${XF_IAT_APP_ID:-}
+      XF_IAT_API_KEY: ${XF_IAT_API_KEY:-}
+      XF_IAT_API_SECRET: ${XF_IAT_API_SECRET:-}
+      XF_IAT_URL: ${XF_IAT_URL:-wss://iat-api.xfyun.cn/v2/iat}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "8000:8000"
