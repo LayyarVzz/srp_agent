@@ -1,0 +1,35 @@
+# API 服务（FastAPI + Agent）镜像
+# Linux 容器内 uvicorn 默认 SelectorEventLoop，天然规避 Windows ProactorEventLoop
+# 问题（无需 run_api.py / app/uvicorn_loop.py；二者仅 Windows 本地开发使用）。
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    PYTHONPATH=/app
+
+# 安装 uv（官方 uv 镜像提供现成二进制）
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+# 先复制依赖清单并同步依赖（利用 Docker 层缓存：源码改动不触发重新解析依赖）
+# --no-install-project：只装依赖、不装本项目包（运行靠源码目录，见 CMD）
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# 复制全部源码（agent / app / services / shared / 根模块）
+COPY agent ./agent
+COPY app ./app
+COPY services/__init__.py ./services/__init__.py
+COPY services/tools_mcp ./services/tools_mcp
+COPY services/rag_mcp ./services/rag_mcp
+COPY shared ./shared
+COPY settings.py main.py ./
+
+# API 端口
+EXPOSE 8000
+
+# 裸 uvicorn（Linux 默认 Selector；单 worker：MVP 保守。Postgres + streamable-http
+# 后端已支持多 worker，需要时加 --workers N）
+CMD [".venv/bin/python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

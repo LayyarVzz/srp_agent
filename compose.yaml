@@ -46,6 +46,7 @@ services:
   tools_mcp:
     build:
       context: .
+      dockerfile: Dockerfile.tools_mcp
     image: srp-agent-tools-mcp:latest
     container_name: srp-agent-tools-mcp
     environment:
@@ -65,6 +66,51 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    restart: unless-stopped
+
+  api:
+    # FastAPI 交互服务（Agent 组合根 + 全部接口），Linux 容器内裸 uvicorn 即可
+    #（默认 SelectorEventLoop，无 Windows Proactor 问题）。
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: srp-agent-api:latest
+    container_name: srp-agent-api
+    environment:
+      # —— LLM（Agent 决策中枢；值从宿主 .env 注入，compose 自动做 ${VAR} 替换）——
+      LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      # —— 记忆后端：容器内连 Postgres（主机名用 compose 服务名 postgres，不能用 localhost）——
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/srp_agent
+      # —— MCP client：api 侧连接 tools_mcp 的地址（host 用 compose 服务名 tools_mcp）。
+      #    transport 必须 streamable-http：缺省 stdio 会在 api 容器内拉起子进程，连不到 tools_mcp。
+      #    （tools_mcp 服务端的 MCP_STATELESS_HTTP 等配置见该 service，api 不重复。）——
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: tools_mcp
+      MCP_PORT: 8100
+      MCP_STREAMABLE_HTTP_PATH: /mcp
+      # —— 语义召回（可选，默认关；与 .env 对齐）——
+      EMBEDDING_ENABLED: ${EMBEDDING_ENABLED:-false}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_DIMS: ${EMBEDDING_DIMS:-0}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tools_mcp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   # —— 可选：Qdrant（RAG 向量库）。Agent 主流程不用，后续接 RAG 时再启用 ——
