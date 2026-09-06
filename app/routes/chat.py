@@ -4,8 +4,10 @@
 对话编排全部委托 `AgentRuntime.chat/chat_stream`（组合根，app 层零业务逻辑）。
 
 SSE 事件协议（api.md §5.1）：`session` → `status`/`tool`（过程轨迹，按真实执行
-顺序）→ `done`（`InteractionResult`，含决策码 `phase`）；图运行中断才发 `error`
-帧（业务降级已在图内收敛为 `AgentResponse`，HTTP 仍 200）。
+顺序）→ `token`（回答节点 LLM 流式生成期间的增量预览）→ `done`
+（`InteractionResult`，含决策码 `phase`，回答全量权威）；图运行中断才发 `error`
+帧（业务降级已在图内收敛为 `AgentResponse`，HTTP 仍 200）。token 事件经
+`AgentRuntime.chat_stream` 透传，本层不做业务改写。
 """
 
 from __future__ import annotations

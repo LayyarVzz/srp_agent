@@ -30,7 +30,7 @@ from agent.memory import (
     submit_memory_save,
     wait_pending_saves,
 )
-from agent.response.models import AgentResponse
+from agent.response.models import AgentResponse, AnswerToken
 from agent.response.status import StatusEvent
 from agent.session import SessionBackend, SessionManager, build_session_backend
 from agent.tools import build_tools_from_mcp
@@ -51,9 +51,12 @@ from shared.embeddings import EmbeddingConfig
 logger = logging.getLogger(__name__)
 
 # 会话编排事件：chat_stream 产出的领域事件（app 层只做 SSE 编码，不做业务判断）。
+# token 事件 = 回答节点（generate_answer / fallback_chat）LLM 流式生成期间的
+# 增量预览，正常路径拼接 == done.answer；done 仍是唯一权威终态。
 ChatStreamEvent = (
     tuple[Literal["status"], StatusEvent]
     | tuple[Literal["tool"], ToolCallRecord]
+    | tuple[Literal["token"], AnswerToken]
     | tuple[Literal["done"], AgentResponse]
 )
 
@@ -184,26 +187,45 @@ class AgentRuntime:
     async def chat_stream(
         self, *, user_id: str, session_id: str, text: str
     ) -> AsyncIterator[ChatStreamEvent]:
-        """流式跑一轮对话：status/tool 实时下发，done 最后下发完整 AgentResponse。
+        """流式跑一轮对话：status/tool/token 实时下发，done 最后下发完整 AgentResponse。
 
-        内部负责：run 图（stream_mode="updates"）+ 结束后读最终 state 触发带外记忆保存。
+        内部负责：run 图（stream_mode=["updates","custom"]）+ 结束后读最终 state
+        触发带外记忆保存。updates 通道承载节点级状态/工具/响应轨迹；custom 通道由
+        回答节点运行中实时外发「speaking + 回答 token 增量」，其中与 updates 同值的
+        speaking 状态帧在此去重，保证事件序 speaking → token* → done。
         会话归属校验由入口层先行完成；本方法假定 session 已合法。
         """
         config = {"configurable": {"thread_id": session_id}}  # thread_id == session_id 契约
         response: AgentResponse | None = None
+        # 回答节点 live 外发过的状态帧（custom 通道），用于 updates 同值帧去重。
+        live_statuses: list[StatusEvent] = []
         try:
-            # stream_mode="updates" 产出 {节点名: 状态增量}（本版本 langgraph 的产出为
-            # dict 而非二元组）；空更新节点（trim_history 等）产出 {node: None}/{node: {}}，
-            # updates falsy 时跳过。
-            async for chunk in self.graph.astream(
+            # 多 stream_mode 时本版本 langgraph 的产出为 (mode, data) 二元组：
+            # - ("updates", {节点名: 状态增量})：节点完成后的状态轨迹（同单 mode 语义）；
+            # - ("custom", StatusEvent | AnswerToken)：回答节点运行中的实时事件。
+            async for mode, data in self.graph.astream(
                 {"input": text, "session_id": session_id, "user_id": user_id},
                 config=config,
-                stream_mode="updates",
+                stream_mode=["updates", "custom"],
             ):
-                for node, updates in chunk.items():
+                if mode == "custom":
+                    if isinstance(data, StatusEvent):
+                        live_statuses.append(data)
+                        yield ("status", data)
+                    elif isinstance(data, AnswerToken):
+                        yield ("token", data)
+                    else:
+                        logger.warning("忽略未知 custom 事件: %r", type(data).__name__)
+                    continue
+                if mode != "updates":
+                    continue
+                for node, updates in data.items():
                     if not updates:  # 空更新节点（trim_history 等）产出 None/空 dict
                         continue
                     for event in updates.get("status_events", []):
+                        if any(event == live for live in live_statuses):
+                            # 已被回答节点 live 外发（speaking 先于 token），防重复下发。
+                            continue
                         # 节点级状态日志：放在 yield 之前，打印顺序即下发顺序（驱动动画的轨迹）。
                         logger.info(
                             "  [%s] 状态=%s 工具=%s 消息=%s",

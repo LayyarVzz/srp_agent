@@ -38,6 +38,19 @@ class Clarification(BaseModel):
     options: list[str] = Field(default_factory=list)
 
 
+class AnswerToken(BaseModel):
+    """最终回答的 token 级增量（SSE `token` 帧载荷）。
+
+    与 `AgentResponse` 同域：正常路径（模型输出无首尾空白）下各帧 `delta`
+    拼接 == `reply`；回答节点对首尾空白的确定性裁剪、以及流式中途失败后的
+    降级，均以 `done`（AgentResponse.reply）为权威，token 帧仅作增量预览。
+    只在回答节点（generate_answer / fallback_chat）的 LLM 流式生成期间产生，
+    属过程事件，不进 AgentResponse / InteractionResult。
+    """
+
+    delta: str
+
+
 class AgentResponse(BaseModel):
     """Agent 统一响应：回答 + 引用 + 状态轨迹 + 工具轨迹 + 结束原因。"""
 

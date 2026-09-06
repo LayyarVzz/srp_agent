@@ -9,6 +9,7 @@ from typing import Any
 
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
     HumanMessage,
     RemoveMessage,
@@ -24,6 +25,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
+from langgraph.types import StreamWriter
 
 from agent.core.config import AgentFrameworkConfig
 from agent.core.context import SessionKeyFact, ShortTermContext
@@ -50,7 +52,7 @@ from agent.core.state import (
 from agent.errors import LLM_ERROR_REQUEST, ErrorRecord, LLMError
 from agent.intent.classifiers import LLMIntentClassifier, RuleFallbackClassifier
 from agent.intent.models import Intent
-from agent.llm import LLMService
+from agent.llm import LLMService, merge_ai_message_chunks
 from agent.memory import KIND_EPISODE, KIND_FACT, KIND_PREFERENCE, MemoryStore
 from agent.memory.models import MemoryItem
 from agent.response.models import (
@@ -61,6 +63,7 @@ from agent.response.models import (
     FINISHED_REASON_PARTIAL,
     FINISHED_REASON_TOOL_LIMIT,
     AgentResponse,
+    AnswerToken,
     Clarification,
     ClarifyResult,
 )
@@ -637,11 +640,28 @@ def build_agent_graph(
         parts.extend(state.get("messages") or [])
         return parts
 
-    async def call_model(state: AgentState) -> dict[str, Any]:
+    async def call_model(state: AgentState, *, writer: StreamWriter) -> dict[str, Any]:
         updates = set_status(Status.USING_TOOL, message="正在调用模型选择工具或作答")
         prompt = _build_prompt(state)
+        # 回答节点 live 事件：入口先
+        # live 推 using_tool（真实执行序），随后若模型直接作答（content-only = 本轮
+        # 最终回答），首个 content 增量再 live 推 speaking 并逐增量外发 token；
+        # updates 中的同值状态帧由 runtime 去重，保证不晚到倒灌动画。
+        # content 与 tool_calls 同现属异常：已外发的增量由「tool 事件重置预览」契约
+        # 兜底（见 AnswerToken / api.md §5.1）。
+        writer(StatusEvent(status=Status.USING_TOOL, message="正在调用模型选择工具或作答"))
         try:
-            resp = await llm.ainvoke_tools(tools, prompt)
+            chunks: list[AIMessageChunk] = []
+            answered = False
+            async for chunk in llm.astream_tools(tools, prompt):
+                chunks.append(chunk)
+                content = chunk.content
+                if isinstance(content, str) and content:
+                    if not answered:
+                        writer(StatusEvent(status=Status.SPEAKING, message="正在生成回答"))
+                        answered = True
+                    writer(AnswerToken(delta=content))
+            resp = merge_ai_message_chunks(chunks)
         except LLMError as exc:
             logger.warning("模型工具选择/作答失败（%s）", exc)
             updates["error"] = ErrorRecord(code=LLM_ERROR_REQUEST, message=f"模型调用失败: {exc}")
@@ -899,24 +919,33 @@ def build_agent_graph(
         return updates
 
     # —— 回答生成与降级 ——
-    async def fallback_chat(state: AgentState) -> dict[str, Any]:
+    async def fallback_chat(state: AgentState, *, writer: StreamWriter) -> dict[str, Any]:
         # 降级路径也发 SPEAKING，保证前端能感知「即将出话」。
         # 兜底优先用 LLM 自身知识作答（§3.2「道歉/知识回答/澄清提问」），
         # 系统统一追加免责声明；LLM 失败/空回复时回落到确定性话术，不比现状更差。
         updates = set_status(Status.SPEAKING, message="正在生成兜底回答")
         messages = state.get("messages") or []
+        # 回答节点 live 事件：speaking 先于 token 实时外发（writer 未启用 custom
+        # 通道时是 no-op，零回归）；updates 中的同值状态帧由 runtime 去重，
+        # 保证事件序 speaking → token* → done。
+        writer(StatusEvent(status=Status.SPEAKING, message="正在生成兜底回答"))
         try:
-            reply = await llm.ainvoke_text(
+            reply = ""
+            async for delta in llm.astream_text(
                 [SystemMessage(content=_FALLBACK_SYSTEM_PROMPT), *messages]
-            )
+            ):
+                writer(AnswerToken(delta=delta))
+                reply += delta
             reply = (reply or "").strip()
             if not reply:
                 # 空回复兜底：比依赖 validate_output 更早拦截、日志更清晰。
                 logger.warning("兜底回答为空，降级为固定话术")
                 reply = _degraded_fallback_text(state)
             else:
-                # 确定性追加免责声明（需求：需要自行甄别）。
+                # 确定性追加免责声明（需求：需要自行甄别）；作为末段增量外发，
+                # 保证 token 拼接与最终 reply 一致。
                 reply = f"{reply}{_FALLBACK_DISCLAIMER_TEXT}"
+                writer(AnswerToken(delta=_FALLBACK_DISCLAIMER_TEXT))
         except LLMError as exc:
             logger.warning("兜底回答生成失败（%s），降级为固定话术", exc)
             reply = _degraded_fallback_text(state)
@@ -925,7 +954,7 @@ def build_agent_graph(
         updates["messages"] = [AIMessage(content=reply, id=_new_message_id("a"))]
         return updates
 
-    async def generate_answer(state: AgentState) -> dict[str, Any]:
+    async def generate_answer(state: AgentState, *, writer: StreamWriter) -> dict[str, Any]:
         updates = set_status(Status.SPEAKING, message="正在生成回答")
         # 双模式：call_model 已直接产出文本（模型直接回答路径）→ 复用，不二次调用 LLM；
         # 否则（chat 直接路径 / tool_limit 收尾路径 / plan 整合路径）→ 调用 LLM 生成最终回答。
@@ -937,8 +966,17 @@ def build_agent_graph(
         # 统一 prompt 组装：plan 模式注入计划块（整合时展示各步状态），chat 直接路径
         # 也注入摘要/关键信息/预加载 preference。
         prompt = _build_prompt(state, include_plan=state.get("plan") is not None)
+        # 回答节点 live 事件：speaking 先于 token 实时外发（writer 未启用 custom
+        # 通道时是 no-op，零回归）；updates 中的同值状态帧由 runtime 去重，
+        # 保证事件序 speaking → token* → done。流式中途失败时已外发的增量不回滚，
+        # 由 done 全量权威兜底（见 AnswerToken 契约）。
+        writer(StatusEvent(status=Status.SPEAKING, message="正在生成回答"))
         try:
-            reply = (await llm.ainvoke_text(prompt) or "").strip()
+            reply = ""
+            async for delta in llm.astream_text(prompt):
+                writer(AnswerToken(delta=delta))
+                reply += delta
+            reply = (reply or "").strip()
         except LLMError as exc:
             logger.warning("回答生成失败（%s），降级话术", exc)
             reply = _FALLBACK_GENERIC_TEXT
