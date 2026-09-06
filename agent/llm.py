@@ -8,7 +8,7 @@ Provider 无关：经 langchain-openai 的 ChatOpenAI 包装任意 OpenAI 兼容
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Literal, TypeVar
 
 from langchain_core.language_models import BaseChatModel
@@ -133,11 +133,34 @@ class LLMService:
             logger.warning("结构化输出调用失败: %s", exc)
             raise LLMError(LLM_ERROR_REQUEST, f"LLM 结构化输出调用失败: {exc}") from exc
 
-    async def ainvoke_text(self, prompt: str | Sequence) -> str:
-        """普通文本补全便利方法（P1 generate_answer 复用）。"""
+    async def astream_text(self, prompt: str | Sequence) -> AsyncIterator[str]:
+        """流式文本补全：逐增量产出回答文本片段（provider 真流式）。
+
+        仅用于「最终回答」类文本生成：图内回答节点（generate_answer /
+        fallback_chat）边消费增量边累积完整回答，同时经 langgraph custom 通道
+        把增量实时外发为 SSE token 帧；错误统一归一为 LLMError(llm_error.request)。
+
+        WHY 必须对模型调用真正 astream()：`ainvoke` 走非流式端点，回调只会在
+        调用结束时补发整条消息，拿不到 token 级增量（langgraph messages/custom
+        通道均依赖真实流式事件）。
+        """
         try:
-            resp = await self.chat_model.ainvoke(prompt)
-            return str(resp.content or "")
+            async for chunk in self.chat_model.astream(prompt):
+                content = chunk.content
+                if isinstance(content, str) and content:
+                    yield content
         except Exception as exc:
             logger.warning("文本生成失败: %s", exc)
             raise LLMError(LLM_ERROR_REQUEST, f"LLM 文本生成失败: {exc}") from exc
+
+    async def ainvoke_text(self, prompt: str | Sequence) -> str:
+        """普通文本补全便利方法（聚合 astream_text 的完整文本）。
+
+        WHY 单一调用路径：ainvoke 与 astream 共用同一流式实现，避免两条
+        provider 路径行为分叉；P1 generate_answer / fallback_chat 已切到
+        astream_text，本方法供其余文本补全消费方使用。
+        """
+        parts: list[str] = []
+        async for part in self.astream_text(prompt):
+            parts.append(part)
+        return "".join(parts)
