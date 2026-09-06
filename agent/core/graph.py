@@ -9,6 +9,7 @@ from typing import Any
 
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
     HumanMessage,
     RemoveMessage,
@@ -51,7 +52,7 @@ from agent.core.state import (
 from agent.errors import LLM_ERROR_REQUEST, ErrorRecord, LLMError
 from agent.intent.classifiers import LLMIntentClassifier, RuleFallbackClassifier
 from agent.intent.models import Intent
-from agent.llm import LLMService
+from agent.llm import LLMService, merge_ai_message_chunks
 from agent.memory import KIND_EPISODE, KIND_FACT, KIND_PREFERENCE, MemoryStore
 from agent.memory.models import MemoryItem
 from agent.response.models import (
@@ -639,11 +640,28 @@ def build_agent_graph(
         parts.extend(state.get("messages") or [])
         return parts
 
-    async def call_model(state: AgentState) -> dict[str, Any]:
+    async def call_model(state: AgentState, *, writer: StreamWriter) -> dict[str, Any]:
         updates = set_status(Status.USING_TOOL, message="正在调用模型选择工具或作答")
         prompt = _build_prompt(state)
+        # 回答节点 live 事件：入口先
+        # live 推 using_tool（真实执行序），随后若模型直接作答（content-only = 本轮
+        # 最终回答），首个 content 增量再 live 推 speaking 并逐增量外发 token；
+        # updates 中的同值状态帧由 runtime 去重，保证不晚到倒灌动画。
+        # content 与 tool_calls 同现属异常：已外发的增量由「tool 事件重置预览」契约
+        # 兜底（见 AnswerToken / api.md §5.1）。
+        writer(StatusEvent(status=Status.USING_TOOL, message="正在调用模型选择工具或作答"))
         try:
-            resp = await llm.ainvoke_tools(tools, prompt)
+            chunks: list[AIMessageChunk] = []
+            answered = False
+            async for chunk in llm.astream_tools(tools, prompt):
+                chunks.append(chunk)
+                content = chunk.content
+                if isinstance(content, str) and content:
+                    if not answered:
+                        writer(StatusEvent(status=Status.SPEAKING, message="正在生成回答"))
+                        answered = True
+                    writer(AnswerToken(delta=content))
+            resp = merge_ai_message_chunks(chunks)
         except LLMError as exc:
             logger.warning("模型工具选择/作答失败（%s）", exc)
             updates["error"] = ErrorRecord(code=LLM_ERROR_REQUEST, message=f"模型调用失败: {exc}")

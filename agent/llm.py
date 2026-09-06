@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Literal, TypeVar
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
@@ -29,6 +29,28 @@ from agent.errors import (
 logger = logging.getLogger(__name__)
 
 _S = TypeVar("_S", bound=BaseModel)
+
+
+def merge_ai_message_chunks(chunks: Sequence[AIMessageChunk]) -> AIMessage:
+    """把 provider 流式的 AIMessageChunk 序列聚合成等价单条 AIMessage。
+
+    WHY 不能把 chunk 直接入图状态：路由/工具适配以 `isinstance(msg, AIMessage)`
+    与 `.tool_calls` 判定（AIMessageChunk 不是 AIMessage 子类），须还原成与
+    `ainvoke_tools` 返回同构的 AIMessage。content / tool_call 的跨块合并复用
+    langchain 的 AIMessageChunk `+` 语义（content 拼接、tool_call args JSON
+    片段按 index 合并）；空流防御性返回空 AIMessage。
+    """
+    if not chunks:
+        return AIMessage(content="")
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        merged += chunk
+    return AIMessage(
+        content=merged.content,
+        tool_calls=list(merged.tool_calls or []),
+        additional_kwargs=dict(merged.additional_kwargs or {}),
+        id=merged.id,
+    )
 
 
 class LLMService:
@@ -110,17 +132,38 @@ class LLMService:
         """
         return self.chat_model.bind_tools(tools)
 
+    async def astream_tools(
+        self, tools: Sequence[BaseTool], prompt: str | Sequence
+    ) -> AsyncIterator[AIMessageChunk]:
+        """带工具绑定的流式调用：逐块产出 AIMessageChunk（content / tool_call 增量）。
+
+        WHY 供 call_model 流式消费：工具循环里模型的 content-only 直答即本轮
+        最终回答，需在生成的同时把 content 增量实时外发（token 帧）；调用方以
+        `merge_ai_message_chunks` 还原等价 AIMessage 后沿用原路由判定。
+        """
+        try:
+            async for chunk in self.tool_model(tools).astream(prompt):
+                yield chunk
+        except Exception as exc:
+            logger.warning("工具选择流式调用失败: %s", exc)
+            raise LLMError(LLM_ERROR_REQUEST, f"LLM 工具选择调用失败: {exc}") from exc
+
     async def ainvoke_tools(self, tools: Sequence[BaseTool], prompt: str | Sequence) -> AIMessage:
         """一次工具选择/作答调用；任何失败归一化为 LLMError(llm_error.request)。
 
         返回带 `tool_calls`（模型选择工具）或不带 `tool_calls`（模型直接作答）的
         AIMessage，由图内 `route_tool_choice` 据此分流。
+
+        WHY 聚合 astream_tools：与 ainvoke_text/astream_text 同模式，工具选择
+        与作答共用同一条流式 provider 路径，避免两条实现行为分叉。
         """
+        chunks: list[AIMessageChunk] = []
         try:
-            resp = await self.tool_model(tools).ainvoke(prompt)
-        except Exception as exc:
-            logger.warning("工具选择调用失败: %s", exc)
-            raise LLMError(LLM_ERROR_REQUEST, f"LLM 工具选择调用失败: {exc}") from exc
+            async for chunk in self.astream_tools(tools, prompt):
+                chunks.append(chunk)
+        except LLMError:
+            raise
+        resp = merge_ai_message_chunks(chunks)
         if not isinstance(resp, AIMessage):
             raise LLMError(LLM_ERROR_REQUEST, "工具选择未返回 AIMessage")
         return resp
