@@ -39,6 +39,11 @@ from agent.response.status import StatusEvent
 from agent.session import SessionBackend, SessionManager, build_session_backend
 from agent.tools import build_tools_from_mcp
 from agent.tools.models import ToolCallRecord
+from services.a2a_mcp.client_config import (
+    A2A_MCP_SERVER_NAME,
+    build_a2a_mcp_http_connection,
+    build_a2a_mcp_stdio_connection,
+)
 from services.rag_mcp.client_config import (
     RAG_MCP_SERVER_NAME,
     build_rag_mcp_stdio_connection,
@@ -327,20 +332,31 @@ class AgentRuntime:
 
 
 def _build_mcp_servers(settings: RuntimeSettings) -> dict[str, dict]:
-    """统一登记全部 MCP 服务（rag_mcp + tools_mcp），连接配置由各服务侧导出。
+    """统一登记全部 MCP 服务（rag_mcp + tools_mcp + a2a_mcp），连接配置由各服务侧导出。
 
     rag_mcp 仅 stdio（见 services/rag_mcp/client_config.py）；tools_mcp 双传输：
     streamable-http 走远端地址，stdio 以子进程自动拉起（见 services/tools_mcp/client_config.py）。
+    a2a_mcp（T6 远端智能体协作工具）与 tools_mcp 同传输方式，但**配置+注册表双门控**：
+    仅当 a2a_mcp_enabled 且注册表非空才登记——无远端配置时工具集与既有完全一致（零回归）。
     """
     servers: dict[str, dict] = {RAG_MCP_SERVER_NAME: build_rag_mcp_stdio_connection()}
+    register_a2a = settings.a2a_mcp_enabled and bool(settings.a2a_mcp_agents)
     if settings.mcp_transport is MCPTransport.STREAMABLE_HTTP:
         servers[TOOLS_MCP_SERVER_NAME] = build_tools_mcp_http_connection(
             host=settings.mcp_host,
             port=settings.mcp_port,
             path=settings.mcp_streamable_http_path,
         )
+        if register_a2a:
+            servers[A2A_MCP_SERVER_NAME] = build_a2a_mcp_http_connection(
+                host=settings.a2a_mcp_host,
+                port=settings.a2a_mcp_port,
+                path=settings.mcp_streamable_http_path,
+            )
     else:
         servers[TOOLS_MCP_SERVER_NAME] = build_tools_mcp_stdio_connection()
+        if register_a2a:
+            servers[A2A_MCP_SERVER_NAME] = build_a2a_mcp_stdio_connection()
     return servers
 
 
