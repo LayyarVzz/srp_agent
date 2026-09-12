@@ -11,13 +11,17 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, cast
 
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
-from agent.core.config import AgentFrameworkConfig, LLMConfig
+from agent.a2a.mapper import peer_user_id, resolve_peer
+from agent.a2a.models import A2APeer
+from agent.a2a.protocol import A2A_ERROR_INVALID_REQUEST, JSONRPC_INVALID_REQUEST, A2AProtocolError
+from agent.a2a.registry import A2ATaskRegistry
+from agent.core.config import A2AConfig, AgentFrameworkConfig, LLMConfig
 from agent.core.graph import build_agent_graph
 from agent.errors import AGENT_ERROR_INTERNAL, AgentError
 from agent.llm import LLMService
@@ -60,6 +64,10 @@ ChatStreamEvent = (
     | tuple[Literal["done"], AgentResponse]
 )
 
+# A2A 入站任务事件：首事件 ("started", session_id) 供调用方建立 task↔session
+# 映射（task_id == session_id），后续事件与 chat_stream 完全同构。
+A2AStreamEvent = tuple[Literal["started"], str] | ChatStreamEvent
+
 
 @dataclass
 class AgentRuntime:
@@ -80,6 +88,8 @@ class AgentRuntime:
     _tools_cm: AbstractAsyncContextManager[list[BaseTool]] | None = None
     _memory_backends: MemoryBackends | None = None
     _session_backend: SessionBackend | None = None
+    # A2A 入站任务注册表（task↔session 一一对应；随进程生命周期，无持久化）。
+    a2a_tasks: A2ATaskRegistry = field(default_factory=A2ATaskRegistry)
 
     # —— 装配（生产入口）——
 
@@ -92,6 +102,11 @@ class AgentRuntime:
         """
         settings = settings or get_settings()
         cfg = AgentFrameworkConfig.get_default()
+        # A2A 入站 peer 注册表：settings 的 A2A_* 注入 cfg.a2a（未配置 → 空 peers，
+        # 所有远端 peer 被拒 → 零回归；AgentCard 发现不受影响）。
+        cfg.a2a = A2AConfig.from_runtime(
+            enabled=settings.a2a_enabled, peer_map=settings.a2a_peer_map
+        )
         # 语义召回底座：settings 的 EMBEDDING_* 注入 cfg.memory.embedding
         # （未配置时保持默认关闭 → build_memory_backends 传 index_config=None → 零回归）。
         cfg.memory.embedding = EmbeddingConfig.from_runtime(
@@ -271,6 +286,45 @@ class AgentRuntime:
         # 防御：chat_stream 必有 done；走到这里说明状态机异常。
         raise AgentError(AGENT_ERROR_INTERNAL, "Agent 图未产出 AgentResponse")
 
+    # —— A2A 入站编排（T5：peer 作为虚拟用户复用 chat_stream 内核，图零改动）——
+
+    def resolve_a2a_peer(self, peer_id: str) -> A2APeer:
+        """校验入站 peer：A2A 关闭 / 未登记 / 已禁用 → A2AProtocolError（a2a.invalid_request）。"""
+        if not self.cfg.a2a.enabled:
+            raise A2AProtocolError(
+                jsonrpc_code=JSONRPC_INVALID_REQUEST,
+                a2a_code=A2A_ERROR_INVALID_REQUEST,
+                message="A2A 入站未启用",
+            )
+        return resolve_peer(self.cfg.a2a.peers, peer_id)
+
+    async def run_a2a_task_stream(
+        self, *, peer_id: str, text: str
+    ) -> AsyncIterator[A2AStreamEvent]:
+        """流式执行一个 A2A 入站任务：peer 发号会话 → 复用 chat_stream 内核。
+
+        首事件 ("started", session_id) 承载 task↔session 映射（task_id ==
+        session_id）；peer 身份校验在首事件前完成（fail-fast，流开始后不再有 4xx
+        等价物）。会话归属 peer 命名空间（`sessions.create` 发号，与人类用户隔离）。
+        """
+        peer = self.resolve_a2a_peer(peer_id)
+        user_id = peer_user_id(peer)
+        ctx = await self.sessions.create(user_id=user_id)
+        session_id = ctx.session_id
+        yield ("started", session_id)
+        async for event, payload in self.chat_stream(
+            user_id=user_id, session_id=session_id, text=text
+        ):
+            yield (event, payload)
+
+    async def run_a2a_task(self, *, peer_id: str, text: str) -> AgentResponse:
+        """非流式执行 A2A 入站任务，返回最终 AgentResponse（session_id 即 task_id）。"""
+        async for event, payload in self.run_a2a_task_stream(peer_id=peer_id, text=text):
+            if event == "done":
+                return cast(AgentResponse, payload)
+        # 防御：run_a2a_task_stream 必有 done；走到这里说明状态机异常。
+        raise AgentError(AGENT_ERROR_INTERNAL, "A2A 任务未产出 AgentResponse")
+
 
 def _build_mcp_servers(settings: RuntimeSettings) -> dict[str, dict]:
     """统一登记全部 MCP 服务（rag_mcp + tools_mcp），连接配置由各服务侧导出。
@@ -290,4 +344,4 @@ def _build_mcp_servers(settings: RuntimeSettings) -> dict[str, dict]:
     return servers
 
 
-__all__ = ["AgentRuntime", "ChatStreamEvent"]
+__all__ = ["A2AStreamEvent", "AgentRuntime", "ChatStreamEvent"]
