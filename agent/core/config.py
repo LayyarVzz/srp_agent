@@ -261,6 +261,17 @@ class SessionBehaviorConfig(BaseModel):
     ttl_minutes: int | None = Field(default=None, ge=1)
 
 
+class LarkToolsConfig(BaseModel):
+    """飞书工具面行为（T4，dev-version5.0 §8.4）。
+
+    `enabled` 是代码级门控（与环境项 `LARK_CLI_ENABLED`、命令探测共同决定
+    lark_mcp 是否登记）；CLI 超时/输出截断等服务侧环境项见
+    services/lark_mcp/config.py。未登记时工具集与 v4.0 一致（零回归）。
+    """
+
+    enabled: bool = True
+
+
 class AgentFrameworkConfig(BaseModel):
     """Agent 框架行为配置聚合（纯代码默认值，供装配层读取）。"""
 
@@ -271,6 +282,7 @@ class AgentFrameworkConfig(BaseModel):
     tools: MCPToolsConfig = Field(default_factory=MCPToolsConfig)
     memory: MemoryBehaviorConfig = Field(default_factory=MemoryBehaviorConfig)
     session: SessionBehaviorConfig = Field(default_factory=SessionBehaviorConfig)
+    lark: LarkToolsConfig = Field(default_factory=LarkToolsConfig)  # 飞书工具面（T4）
 
     @classmethod
     def get_default(cls) -> AgentFrameworkConfig:

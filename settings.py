@@ -50,6 +50,11 @@ class RuntimeSettings(BaseSettings):
     mcp_streamable_http_path: str = "/mcp"  # 与 fastmcp 默认一致，客户端连接地址即该路径
     mcp_stateless_http: bool = True  # 工具纯函数无会话 → 默认无状态，支持水平扩展
 
+    # —— 飞书 lark-cli（T4）：环境门控 + 命令覆盖；CLI 超时/截断等服务侧项见
+    # services/lark_mcp/config.py。命令探测失败时 lark_mcp 不登记，Agent 照常服务（零回归）——
+    lark_cli_enabled: bool = True
+    lark_cli_command: str | None = None  # LARK_CLI_COMMAND 显式覆盖；空则探测 PATH
+
     # —— embedding（与 RAG 对齐；语义召回开关）——
     embedding_enabled: bool = False  # 置 true 启用语义召回/去重
     embedding_model: str = ""  # 与 RAG 同一模型名
