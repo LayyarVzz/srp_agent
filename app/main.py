@@ -19,6 +19,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from agent.memory import wait_pending_saves
 from agent.runtime import AgentRuntime
 from agent.share.eventloop import ensure_selector_event_loop
+from app.a2a import routes as a2a
 from app.errors import register_exception_handlers
 from app.routes import chat, health, sessions
 from settings import configure_logging, get_settings
@@ -61,6 +62,8 @@ def create_app(*, runtime: AgentRuntime | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(sessions.router, prefix="/api/v1")
     app.include_router(chat.router, prefix="/api/v1")
+    # A2A 端点挂根路径（/.well-known/agent.json 与 /a2a，协议约定的绝对路径）。
+    app.include_router(a2a.router)
     if runtime is not None:
         # 测试注入：ASGITransport 不触发 lifespan，直接预置 app.state.runtime。
         app.state.runtime = runtime

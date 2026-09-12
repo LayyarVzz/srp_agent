@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # —— AgentCard 常量（卡片内容静态声明；url 按请求 base_url 动态拼装）——
 A2A_AGENT_NAME = "srp-agent"
@@ -133,16 +133,23 @@ class AgentCard(BaseModel):
     capabilities 如实声明本版能力矩阵：streaming=True（SSE）、
     pushNotifications=False（无推送 webhook）、stateTransitionHistory=False
     （task 只暴露当前状态，不含历史迁移记录）。
+    wire 字段名对齐 A2A 规范（camelCase 别名，序列化经 by_alias=True）。
     """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     name: str = A2A_AGENT_NAME
     description: str = A2A_AGENT_DESCRIPTION
     url: str  # JSON-RPC 端点（<base>/a2a），由请求 base_url 动态拼装
     version: str = A2A_AGENT_VERSION
-    protocol_version: str = "0.3.0"  # 对齐 A2A 规范版本的子集声明
-    preferred_transport: str = "JSONRPC"
-    default_input_modes: list[str] = Field(default_factory=lambda: ["text/plain"])
-    default_output_modes: list[str] = Field(default_factory=lambda: ["text/plain"])
+    protocol_version: str = Field(default="0.3.0", alias="protocolVersion")
+    preferred_transport: str = Field(default="JSONRPC", alias="preferredTransport")
+    default_input_modes: list[str] = Field(
+        default_factory=lambda: ["text/plain"], alias="defaultInputModes"
+    )
+    default_output_modes: list[str] = Field(
+        default_factory=lambda: ["text/plain"], alias="defaultOutputModes"
+    )
     capabilities: dict[str, bool] = Field(
         default_factory=lambda: {
             "streaming": True,

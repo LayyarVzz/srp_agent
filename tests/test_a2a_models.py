@@ -53,5 +53,8 @@ def test_build_agent_card() -> None:
     }
     assert len(card.skills) == 1  # 单技能声明
     assert card.default_input_modes == ["text/plain"]
-    # 卡片可完整 round-trip（发现端点响应契约）
-    assert AgentCard.model_validate(card.model_dump(mode="json")) == card
+    # wire 字段名为 A2A 规范 camelCase（发现端点互操作契约），可完整 round-trip
+    data = card.model_dump(mode="json", by_alias=True)
+    assert data["protocolVersion"] == "0.3.0"
+    assert data["preferredTransport"] == "JSONRPC"
+    assert AgentCard.model_validate(data) == card

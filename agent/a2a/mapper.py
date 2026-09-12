@@ -138,6 +138,14 @@ def progress_frame(
     ).model_dump(mode="json")
 
 
+def accepted_frame(
+    request_id: str | int | None, *, task_id: str, session_id: str
+) -> dict[str, object]:
+    """受理帧（message/stream 首帧）：向调用方宣告 task_id，此后可 task/get / task/cancel。"""
+    update = status_update(task_id=task_id, session_id=session_id, message="任务已受理")
+    return result_response(request_id, update.model_dump(mode="json")).model_dump(mode="json")
+
+
 def task_frame(request_id: str | int | None, task: A2ATask) -> dict[str, object]:
     """终态 Task → JSON-RPC 响应帧（message/send 的响应体 / message/stream 的末帧）。"""
     return result_response(request_id, task.model_dump(mode="json")).model_dump(mode="json")
