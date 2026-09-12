@@ -40,10 +40,11 @@ def _get_settings() -> A2AMCPRuntimeSettings:
 
 
 def _build_client(settings: A2AMCPRuntimeSettings) -> A2AClient:
-    """构造 A2A 客户端（任务级总预算/轮询间隔来自配置；测试可替换注入离线 transport）。"""
+    """构造 A2A 客户端（peer 身份/任务级总预算/轮询间隔来自配置；测试可替换注入离线 transport）。"""
     return A2AClient(
         request_timeout_s=settings.a2a_request_timeout_s,
         poll_interval_s=settings.a2a_poll_interval_s,
+        peer_id=settings.a2a_mcp_peer_id,
     )
 
 

@@ -88,22 +88,29 @@ def _extract_result(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 class A2AClient:
-    """远端 A2A 智能体客户端（asyncio + httpx；transport 供测试注入离线传输）。"""
+    """远端 A2A 智能体客户端（asyncio + httpx；transport 供测试注入离线传输）。
+
+    `peer_id` 是本方对远端声明的调用方身份（`X-A2a-Peer-Id` 请求头，与
+    Server 侧 peer 注册表约定一致）：远端未登记该 peer → a2a.invalid_request。
+    """
 
     def __init__(
         self,
         *,
         request_timeout_s: float = 120.0,
         poll_interval_s: float = 1.0,
+        peer_id: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._request_timeout_s = request_timeout_s
         self._poll_interval_s = poll_interval_s
+        self._peer_id = peer_id
         self._transport = transport
 
     def _http_client(self) -> httpx.AsyncClient:
         timeout = httpx.Timeout(self._request_timeout_s)
-        return httpx.AsyncClient(timeout=timeout, transport=self._transport)
+        headers = {"X-A2a-Peer-Id": self._peer_id} if self._peer_id else None
+        return httpx.AsyncClient(timeout=timeout, headers=headers, transport=self._transport)
 
     async def get_agent_card(self, base_url: str) -> dict[str, Any]:
         """发现远端 AgentCard（`GET /.well-known/agent.json`），返回原始 dict。"""

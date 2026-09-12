@@ -47,8 +47,11 @@ def _error_payload(code: int, message: str, a2a_code: str) -> dict[str, Any]:
     }
 
 
-def build_fake_a2a_app(script: dict[str, Any]) -> FastAPI:
-    """按脚本行为的 fake A2A server：send 依次返回 / poll 依次返回 / 固定 error / SSE 帧。"""
+def build_fake_a2a_app(script: dict[str, Any], capture: dict[str, Any] | None = None) -> FastAPI:
+    """按脚本行为的 fake A2A server：send 依次返回 / poll 依次返回 / 固定 error / SSE 帧。
+
+    `capture` 非空时记录最近一次 /a2a 请求的 peer 身份头（供请求契约断言）。
+    """
     app = FastAPI()
     state = {"send_idx": 0, "poll_idx": 0}
 
@@ -58,6 +61,8 @@ def build_fake_a2a_app(script: dict[str, Any]) -> FastAPI:
 
     @app.post("/a2a")
     async def a2a(request: Request) -> Any:
+        if capture is not None:
+            capture["peer_id"] = request.headers.get("x-a2a-peer-id")
         body = await request.json()
         if script.get("error") is not None:
             return JSONResponse(script["error"])
@@ -125,6 +130,17 @@ async def test_call_agent_immediate_completed() -> None:
     assert result.task_id == "t1"
     assert result.state == "completed"
     assert result.reply == "远端回答"
+
+
+async def test_call_agent_sends_peer_header() -> None:
+    """peer 身份随请求头声明（远端按注册表校验调用方，缺头 → a2a.invalid_request）。"""
+    seen: dict[str, Any] = {}
+    app = build_fake_a2a_app({"send": [_task("completed", "ok")]}, capture=seen)
+    client = A2AClient(
+        transport=httpx.ASGITransport(app=app), request_timeout_s=5.0, peer_id="agent-a"
+    )
+    await client.call_agent(base_url=BASE_URL, agent_id="b", message="你好")
+    assert seen["peer_id"] == "agent-a"
 
 
 async def test_call_agent_polls_until_terminal() -> None:

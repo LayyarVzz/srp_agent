@@ -52,6 +52,8 @@ class A2AMCPRuntimeSettings(BaseSettings):
     mcp_stateless_http: bool = True
     # —— A2A 远端注册表与调用行为 ——
     a2a_mcp_agents: dict[str, str] = Field(default_factory=dict)  # {agent_id: base_url}
+    # 本服务调用远端时声明的 peer 身份（远端须已登记该 peer，否则 a2a.invalid_request）。
+    a2a_mcp_peer_id: str = "srp-agent"
     a2a_request_timeout_s: float = Field(default=120.0, ge=1)  # 单次任务总预算（远端执行可能较慢）
     a2a_poll_interval_s: float = Field(default=1.0, ge=0.05)  # task/get 轮询间隔
     a2a_output_max_chars: int = Field(default=10_000, ge=1)  # 工具输出长度上限（服务侧截断）
