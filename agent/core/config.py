@@ -14,6 +14,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr
 
+from agent.a2a.models import A2APeer
 from agent.share.models import MemoryRecallConfig
 from shared.embeddings import EmbeddingConfig
 
@@ -270,6 +271,22 @@ class LarkToolsConfig(BaseModel):
     """
 
     enabled: bool = True
+class A2AConfig(BaseModel):
+    """A2A 智能体互联行为（T5 Server：入站 peer 注册；环境项见根 settings.py）。
+
+    `peers` 是远端调用方注册表：未登记 / 已禁用 peer 一律拒绝
+    （a2a.invalid_request，防开放匿名滥用）；`user_id` 缺省落匿名命名空间
+    `a2a:<peer_id>`（记忆/会话按该虚拟用户隔离，不混入人类用户数据）。
+    """
+
+    enabled: bool = True  # 关闭时所有入站 A2A 请求拒绝（零回归）
+    peers: dict[str, A2APeer] = Field(default_factory=dict)
+
+    @classmethod
+    def from_runtime(cls, *, enabled: bool, peer_map: dict[str, str]) -> A2AConfig:
+        """由根 settings 的 A2A_* 环境项合并出配置（装配层调用）。"""
+        peers = {pid: A2APeer(id=pid, user_id=user_id) for pid, user_id in peer_map.items()}
+        return cls(enabled=enabled, peers=peers)
 
 
 class AgentFrameworkConfig(BaseModel):
@@ -283,6 +300,7 @@ class AgentFrameworkConfig(BaseModel):
     memory: MemoryBehaviorConfig = Field(default_factory=MemoryBehaviorConfig)
     session: SessionBehaviorConfig = Field(default_factory=SessionBehaviorConfig)
     lark: LarkToolsConfig = Field(default_factory=LarkToolsConfig)  # 飞书工具面（T4）
+    a2a: A2AConfig = Field(default_factory=A2AConfig)  # A2A 智能体互联（T5）
 
     @classmethod
     def get_default(cls) -> AgentFrameworkConfig:
