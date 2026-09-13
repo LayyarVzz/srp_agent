@@ -366,6 +366,8 @@ def _build_mcp_servers(settings: RuntimeSettings, cfg: AgentFrameworkConfig) -> 
             )
     else:
         servers[TOOLS_MCP_SERVER_NAME] = build_tools_mcp_stdio_connection()
+        if register_a2a:
+            servers[A2A_MCP_SERVER_NAME] = build_a2a_mcp_stdio_connection()
     if cfg.lark.enabled and settings.lark_cli_enabled:
         if resolve_lark_cli_command(settings.lark_cli_command):
             servers[LARK_MCP_SERVER_NAME] = build_lark_mcp_stdio_connection()
@@ -374,8 +376,6 @@ def _build_mcp_servers(settings: RuntimeSettings, cfg: AgentFrameworkConfig) -> 
                 "lark-cli 命令探测失败，跳过 lark_mcp 登记"
                 "（无 CLI 环境零回归；可配置 LARK_CLI_COMMAND 指向可执行文件）"
             )
-    if register_a2a:
-        servers[A2A_MCP_SERVER_NAME] = build_a2a_mcp_stdio_connection()
     return servers
 
 
