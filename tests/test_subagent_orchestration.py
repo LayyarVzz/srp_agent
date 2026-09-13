@@ -20,7 +20,7 @@ from langchain_core.messages import AIMessage
 from pydantic import SecretStr
 
 from agent.core.config import AgentFrameworkConfig, LLMConfig, PlanConfig, SubagentConfig
-from agent.core.graph import build_agent_graph
+from agent.core.graph import _SUBAGENT_RESULT_HEADER, build_agent_graph
 from agent.core.models import PlanResult, PlanStep, SubagentResult
 from agent.intent.models import Intent, IntentResult
 from agent.llm import LLMService
@@ -469,3 +469,138 @@ async def test_subagent_result_model_in_state() -> None:
     assert all(r.ok for r in results)
     assert all(r.summary for r in results)
     assert all(r.error is None for r in results)
+
+
+# —— T4：子任务产出的整合注入（_SUBAGENT_RESULT_HEADER 不可信声明块）——
+
+
+def _prompt_text(prompt: list) -> str:
+    """把一次 LLM 调用的 prompt 消息序列拼成文本（供注入断言）。"""
+    return "\n".join(str(getattr(m, "content", "")) for m in prompt)
+
+
+def _build_graph_with_service(
+    routes: list[tuple[str, list[AIMessage]]],
+    default: list[AIMessage],
+    *,
+    cfg: AgentFrameworkConfig | None = None,
+    tools: list | None = None,
+) -> tuple[Any, LLMService]:
+    """构建 routed fake 主图并返回 (graph, service)，供录制 prompt 断言。"""
+    service = _routed_llm(routes, default)
+    return build_agent_graph(service, cfg, tools=tools), service
+
+
+async def test_generate_answer_integrates_subagent_results() -> None:
+    """纯并行计划完成 → 整合 prompt 含子任务结果块（声明头 + 各步产出摘要）。"""
+    plan = PlanResult(
+        summary="两路查询",
+        steps=[
+            PlanStep(goal="查询甲数据", tool="fetch"),
+            PlanStep(goal="查询乙数据", tool="fetch"),
+        ],
+    )
+    graph, service = _build_graph_with_service(
+        [
+            (_M_PLAN, [fake_structured_message(plan)]),
+            (_M_SUB + "查询甲数据", [_tool_call_msg("fetch", "f1"), fake_text_message("甲数据")]),
+            (_M_SUB + "查询乙数据", [_tool_call_msg("fetch", "f2"), fake_text_message("乙数据")]),
+        ],
+        [_plan_intent(), fake_text_message("两路结果已整合")],
+        tools=[make_fake_tool("fetch", content="数据")],
+    )
+    response, _ = await _finish(graph, "两路查询")
+
+    assert response is not None
+    assert response.finished_reason == FINISHED_REASON_COMPLETED
+    # 整合 prompt（最后一次 LLM 调用）注入结果块：声明头恒保留 + 逐条产出。
+    text = _prompt_text(service.chat_model.prompts[-1])
+    assert _SUBAGENT_RESULT_HEADER in text
+    assert "步骤1「查询甲数据」：甲数据" in text
+    assert "步骤2「查询乙数据」：乙数据" in text
+
+
+async def test_serial_step_sees_upstream_subagent_results() -> None:
+    """并行批之后的串行步/依赖子代理都能从结果块获得上游产出（上下文不因并行而丢）。"""
+    plan = PlanResult(
+        summary="先查基准再并行分析",
+        steps=[
+            PlanStep(goal="查询基准数据", tool="fetch"),
+            PlanStep(goal="分析甲维度", tool="calc", depends_on=[0]),
+            PlanStep(goal="分析乙维度", tool="calc", depends_on=[0]),
+        ],
+    )
+    graph, service = _build_graph_with_service(
+        [
+            (_M_PLAN, [fake_structured_message(plan)]),
+            (_M_SERIAL + " 1/3 步", [_tool_call_msg("fetch", "f1")]),
+            (
+                _M_SUB + "分析甲维度",
+                [_tool_call_msg("calc", "c1"), fake_text_message("甲分析完成")],
+            ),
+            (
+                _M_SUB + "分析乙维度",
+                [_tool_call_msg("calc", "c2"), fake_text_message("乙分析完成")],
+            ),
+        ],
+        [_plan_intent(), fake_text_message("最终整合回答")],
+        tools=[
+            make_fake_tool("fetch", content="基准数据"),
+            make_fake_tool("calc", content="分析ok"),
+        ],
+    )
+    response, _ = await _finish(graph, "查基准并分析甲乙")
+
+    assert response is not None
+    assert response.finished_reason == FINISHED_REASON_COMPLETED
+    # 依赖子代理（分析甲维度）的 prompt 注入上游结果块：串行步合成的 fetch 产出。
+    sub_prompt = next(
+        p for p in service.chat_model.prompts if _M_SUB + "分析甲维度" in _prompt_text(p)
+    )
+    text = _prompt_text(sub_prompt)
+    assert _SUBAGENT_RESULT_HEADER in text
+    assert "基准数据" in text
+    # 串行首步执行时还没有任何子任务结果 → 其 prompt 无结果块。
+    serial_prompt = next(
+        p for p in service.chat_model.prompts if _M_SERIAL + " 1/3 步" in _prompt_text(p)
+    )
+    assert _SUBAGENT_RESULT_HEADER not in _prompt_text(serial_prompt)
+
+
+async def test_integration_reports_current_failed_step_only() -> None:
+    """重规划后 partial 整合：结果块只含当前计划的失败步（重规划前结果由 base 隔离）。"""
+    plan = PlanResult(
+        summary="两步",
+        steps=[PlanStep(goal="查询数据", tool="fetch"), PlanStep(goal="汇总数据", tool="bad1")],
+    )
+    new_plan = PlanResult(
+        summary="重规划",
+        steps=[PlanStep(goal="再查询", tool="fetch"), PlanStep(goal="再汇总", tool="bad2")],
+    )
+    graph, service = _build_graph_with_service(
+        [
+            (_M_PLAN, [fake_structured_message(plan)]),
+            (_M_SUB + "查询数据", [_tool_call_msg("fetch", "f1"), fake_text_message("数据")]),
+            (_M_SUB + "汇总数据", [_tool_call_msg("bad1", "b1")]),
+            (_M_REPLAN, [fake_structured_message(new_plan)]),
+            (_M_SUB + "再查询", [_tool_call_msg("fetch", "f2"), fake_text_message("再查询数据")]),
+            (_M_SUB + "再汇总", [_tool_call_msg("bad2", "b2")]),
+        ],
+        [_plan_intent(), fake_text_message("部分成功回答")],
+        tools=[
+            make_fake_tool("fetch", content="数据"),
+            make_fake_tool("bad1", fail_with=RuntimeError("失败甲号")),
+            make_fake_tool("bad2", fail_with=RuntimeError("失败乙号")),
+        ],
+    )
+    response, values = await _finish(graph, "查询并汇总")
+
+    assert response is not None
+    assert response.finished_reason == FINISHED_REASON_PARTIAL
+    assert values.get("plan_steps_done") == 2  # 两批各有 1 步成功（跨计划累计）
+    text = _prompt_text(service.chat_model.prompts[-1])
+    # 当前计划批：成功步 + 当前失败步（失败乙号）都进入整合块。
+    assert "步骤1「再查询」：再查询数据" in text
+    assert "执行失败" in text and "失败乙号" in text
+    # 重规划前的失败步（失败甲号）被 base 隔离，不再进入整合块。
+    assert "失败甲号" not in text

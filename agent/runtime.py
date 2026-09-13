@@ -39,15 +39,15 @@ from agent.response.status import StatusEvent
 from agent.session import SessionBackend, SessionManager, build_session_backend
 from agent.tools import build_tools_from_mcp
 from agent.tools.models import ToolCallRecord
-from services.lark_mcp.cli import resolve_lark_cli_command
-from services.lark_mcp.client_config import (
-    LARK_MCP_SERVER_NAME,
-    build_lark_mcp_stdio_connection,
-)
 from services.a2a_mcp.client_config import (
     A2A_MCP_SERVER_NAME,
     build_a2a_mcp_http_connection,
     build_a2a_mcp_stdio_connection,
+)
+from services.lark_mcp.cli import resolve_lark_cli_command
+from services.lark_mcp.client_config import (
+    LARK_MCP_SERVER_NAME,
+    build_lark_mcp_stdio_connection,
 )
 from services.rag_mcp.client_config import (
     RAG_MCP_SERVER_NAME,

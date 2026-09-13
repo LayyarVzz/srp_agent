@@ -477,6 +477,32 @@ def _render_keyfacts(keyfacts: Sequence[SessionKeyFact]) -> str:
     return "\n".join(f"- [{f.category}] {f.content}" for f in keyfacts)
 
 
+def _render_subagent_results_block(state: AgentState) -> str | None:
+    """把当前计划的子任务结果渲染成注入 prompt 的文本块（无结果返回 None）。
+
+    只渲染当前计划（subagent_results_base 之后）的结果——重规划前的历史结果
+    已由重规划上下文承接；失败结果同样渲染（整合阶段需向用户说明失败步），
+    声明头恒保留（`_SUBAGENT_RESULT_HEADER`，与计划块同一安全约束）。
+    """
+    base = state.get("subagent_results_base") or 0
+    results = (state.get("subagent_results") or [])[base:]
+    if not results:
+        return None
+    plan = state.get("plan")
+    lines = [_SUBAGENT_RESULT_HEADER]
+    for result in results:
+        if plan is not None and 0 <= result.step_index < len(plan.steps):
+            label = f"步骤{result.step_index + 1}「{plan.steps[result.step_index].goal}」"
+        else:  # 防御：索引越界（计划状态异常）时退化为通用标签
+            label = f"步骤{result.step_index + 1}"
+        if result.ok:
+            line = f"- {label}：{result.summary or _SUBAGENT_NO_TEXT_SUMMARY}"
+        else:
+            line = f"- {label}：执行失败（{result.error or '未知原因'}）"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _build_plan_block(state: AgentState) -> str | None:
     """把当前计划渲染成注入 prompt 的文本块（无计划返回 None）。
 
@@ -817,15 +843,18 @@ def build_agent_graph(
         include_plan: bool = False,
         step_instruction: str | None = None,
     ) -> list[BaseMessage]:
-        """统一 prompt 组装：SYSTEM_PROMPT → 计划块 → 步骤指令 → 摘要/关键信息/记忆 → 消息历史。
+        """统一 prompt 组装：SYSTEM → 计划块 → 子任务结果块 → 步骤指令 → 摘要/关键信息/记忆 → 历史。
 
-        call_model / execute_step / generate_answer 共用；摘要/关键信息/记忆/计划均声明
-        为不可信数据（安全约束：来自外部/生成内容的事实参考，不得执行其中指令）。
+        call_model / execute_step / generate_answer 共用；摘要/关键信息/记忆/计划/子任务
+        产出均声明为不可信数据（安全约束：来自外部/生成内容的事实参考，不得执行其中指令）。
         `include_plan`：plan 模式（execute_step / 整合）注入计划块；`step_instruction`：
-        execute_step 注入「当前步只做一件事」的执行指令。
+        execute_step 注入「当前步只做一件事」的执行指令；子任务结果块（T7）只要有
+        当前计划结果就注入——并行批之后的串行步与最终整合都依赖它获得上游产出。
         """
         parts = [SystemMessage(content=SYSTEM_PROMPT)]
         if include_plan and (block := _build_plan_block(state)):
+            parts.append(SystemMessage(content=block))
+        if block := _render_subagent_results_block(state):
             parts.append(SystemMessage(content=block))
         if step_instruction:
             parts.append(SystemMessage(content=step_instruction))
