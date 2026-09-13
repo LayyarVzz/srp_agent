@@ -10,6 +10,9 @@ wheels/
 .venv
 logs/
 
+# 项目级本地工具（lark-cli 等，不入库：卸载 = 删目录）
+.tools/
+
 # claude code & codex
 .codex
 .claude

@@ -39,6 +39,10 @@ from agent.response.status import StatusEvent
 from agent.session import SessionBackend, SessionManager, build_session_backend
 from agent.tools import build_tools_from_mcp
 from agent.tools.models import ToolCallRecord
+from services.lark_mcp.cli import resolve_lark_cli_command
+from services.lark_mcp.client_config import (
+    LARK_MCP_SERVER_NAME,
+    build_lark_mcp_stdio_connection,
 from services.a2a_mcp.client_config import (
     A2A_MCP_SERVER_NAME,
     build_a2a_mcp_http_connection,
@@ -143,8 +147,9 @@ class AgentRuntime:
             extractor = MemoryExtractor(llm, max_input_chars=cfg.graph.max_input_chars)
             judge = MemoryRelationJudge(llm)
             # 工具生命周期：context 句柄持有到 aclose()（修复「async with 提前关闭」问题）。
-            # servers 统一登记全部 MCP 服务：rag_mcp（stdio，原有支持）+ tools_mcp（按配置传输）。
-            servers = _build_mcp_servers(settings)
+            # servers 统一登记全部 MCP 服务：rag_mcp（stdio）+ tools_mcp（按配置传输）
+            # + lark_mcp（T4，配置 + 命令探测门控，未登记零回归）。
+            servers = _build_mcp_servers(settings, cfg)
             logger.info("注册 MCP 服务：%s", ", ".join(sorted(servers)))
             tools_cm = build_tools_from_mcp(cfg, servers=servers)
             tools = await tools_cm.__aenter__()
@@ -331,11 +336,16 @@ class AgentRuntime:
         raise AgentError(AGENT_ERROR_INTERNAL, "A2A 任务未产出 AgentResponse")
 
 
-def _build_mcp_servers(settings: RuntimeSettings) -> dict[str, dict]:
-    """统一登记全部 MCP 服务（rag_mcp + tools_mcp + a2a_mcp），连接配置由各服务侧导出。
+def _build_mcp_servers(settings: RuntimeSettings, cfg: AgentFrameworkConfig) -> dict[str, dict]:
+    """统一登记全部 MCP 服务（rag_mcp + tools_mcp + lark_mcp），连接配置由各服务侧导出。
 
     rag_mcp 仅 stdio（见 services/rag_mcp/client_config.py）；tools_mcp 双传输：
     streamable-http 走远端地址，stdio 以子进程自动拉起（见 services/tools_mcp/client_config.py）。
+
+    lark_mcp（T4）门控装配（dev-version5.0 §3.1）：仅当「框架配置启用（cfg.lark.enabled）
+    且环境启用（LARK_CLI_ENABLED）且 lark-cli 命令探测成功」才登记；任一不满足则跳过并记
+    日志——无 CLI 环境下 Agent 以既有工具集照常服务（零回归，与 MCP 连接失败降级同语义）。
+    
     a2a_mcp（T6 远端智能体协作工具）与 tools_mcp 同传输方式，但**配置+注册表双门控**：
     仅当 a2a_mcp_enabled 且注册表非空才登记——无远端配置时工具集与既有完全一致（零回归）。
     """
@@ -355,8 +365,16 @@ def _build_mcp_servers(settings: RuntimeSettings) -> dict[str, dict]:
             )
     else:
         servers[TOOLS_MCP_SERVER_NAME] = build_tools_mcp_stdio_connection()
-        if register_a2a:
-            servers[A2A_MCP_SERVER_NAME] = build_a2a_mcp_stdio_connection()
+    if cfg.lark.enabled and settings.lark_cli_enabled:
+        if resolve_lark_cli_command(settings.lark_cli_command):
+            servers[LARK_MCP_SERVER_NAME] = build_lark_mcp_stdio_connection()
+        else:
+            logger.warning(
+                "lark-cli 命令探测失败，跳过 lark_mcp 登记"
+                "（无 CLI 环境零回归；可配置 LARK_CLI_COMMAND 指向可执行文件）"
+            )
+    if register_a2a:
+        servers[A2A_MCP_SERVER_NAME] = build_a2a_mcp_stdio_connection()
     return servers
 
 

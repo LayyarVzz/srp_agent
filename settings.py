@@ -50,6 +50,10 @@ class RuntimeSettings(BaseSettings):
     mcp_streamable_http_path: str = "/mcp"  # 与 fastmcp 默认一致，客户端连接地址即该路径
     mcp_stateless_http: bool = True  # 工具纯函数无会话 → 默认无状态，支持水平扩展
 
+    # —— 飞书 lark-cli（T4）：环境门控 + 命令覆盖；CLI 超时/截断等服务侧项见
+    # services/lark_mcp/config.py。命令探测失败时 lark_mcp 不登记，Agent 照常服务（零回归）——
+    lark_cli_enabled: bool = True
+    lark_cli_command: str | None = None  # LARK_CLI_COMMAND 显式覆盖；空则探测 PATH
     # —— A2A 智能体互联（T5 Server 入站；T6 Client 环境项见下）——
     # 环境变量约定 A2A_ENABLED / A2A_PEER_MAP（pydantic-settings 大小写不敏感匹配）。
     a2a_enabled: bool = True  # 关闭时所有入站 A2A 请求拒绝（AgentCard 发现不受影响）
