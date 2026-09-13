@@ -28,3 +28,18 @@ class PlanResult(BaseModel):
 
     summary: str = ""  # 整体计划概述（供 StatusEvent 展示）
     steps: list[PlanStep] = Field(default_factory=list)  # 1..max_plan_steps（校验在规划节点）
+
+
+class SubagentResult(BaseModel):
+    """单个子代理步骤的执行结果（T7 并行子代理，dev-version5.0.md §9）。
+
+    子图状态独立于主图，只把本结果经 `subagent_results`（operator.add）回填主图，
+    按 `step_index` 定位所属计划步骤；`summary` 是子代理对本步产出的自然语言摘要
+    （属不可信数据，注入整合 prompt 时须带声明头）。
+    """
+
+    step_index: int  # 所属计划步骤索引（0-based；重规划后由 plan_steps_completed 区分计划代）
+    ok: bool  # 该步是否成功（子代理内工具失败 / LLM 失败 → False，触发重规划语义）
+    summary: str = ""  # 本步产出摘要（供最终整合引用）
+    error: str | None = None  # 失败原因（ok=False 时非空）
+    tool_summary: str = ""  # 本步工具调用摘要（如 "calc(ok)"；无工具调用为空）

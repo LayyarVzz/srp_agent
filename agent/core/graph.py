@@ -457,6 +457,11 @@ def build_agent_graph(
         updates["plan_step"] = 0
         updates["plan_steps_done"] = 0
         updates["replanned"] = False
+        # 并行子代理状态每轮重置（subagent_results 为 operator.add 累积字段，
+        # 不重置会跨轮无限累积；批序号/完成索引防跨计划残留）。
+        updates["subagent_results"] = []
+        updates["dispatch_round"] = 0
+        updates["plan_steps_completed"] = []
         # 澄清式追问状态每轮重置（普通覆盖，防跨轮残留；追问上限按轮次计）。
         updates["clarify_asked"] = False
         updates["clarification"] = None

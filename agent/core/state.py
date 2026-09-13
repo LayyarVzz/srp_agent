@@ -12,7 +12,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
 
 from agent.core.context import SessionKeyFact
-from agent.core.models import PlanResult
+from agent.core.models import PlanResult, SubagentResult
 from agent.errors import ErrorRecord
 from agent.intent.models import Intent, IntentResult
 from agent.memory.models import MemoryItem
@@ -38,6 +38,10 @@ NODE_EXECUTE_STEP = "execute_step"
 NODE_PLAN_STEP_ADVANCE = "plan_step_advance"
 NODE_REPLAN_TASK = "replan_task"
 NODE_CLARIFY = "clarify"
+# 并行子代理（T7）：扇出节点 / 子代理执行节点（Send 多实例并行）/ join 回填节点。
+NODE_DISPATCH_SUBAGENTS = "dispatch_subagents"
+NODE_RUN_SUBAGENT = "run_subagent"
+NODE_JOIN_SUBAGENTS = "join_subagents"
 
 
 class AgentState(TypedDict, total=False):
@@ -69,6 +73,12 @@ class AgentState(TypedDict, total=False):
     plan_step: int  # 步骤指针（0-based，当前计划内的执行进度）
     plan_steps_done: int  # 跨重规划累计的成功步骤数（部分成功判定：≥1 即有产出）
     replanned: bool  # 本轮是否已重规划过（防无限重规划，≤1 次）
+
+    # —— 并行子代理（T7；subagent_results 由 operator.add 累积，其余普通覆盖）——
+    # join 回填子代理批结果（按 step_index 定位）。
+    subagent_results: Annotated[list[SubagentResult], operator.add]
+    dispatch_round: int  # 扇出批序号（防死循环上限 = 计划步数；重规划时清零）
+    plan_steps_completed: list[int]  # 当前计划已完成步骤索引（join 维护；重规划清零防旧索引跳步）
 
     # —— 澄清式追问（普通覆盖字段，load_context 每轮重置）——
     clarify_asked: bool  # 本轮是否已追问过（防澄清循环，≤ max_asks_per_turn）
