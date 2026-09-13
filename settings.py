@@ -50,6 +50,20 @@ class RuntimeSettings(BaseSettings):
     mcp_streamable_http_path: str = "/mcp"  # 与 fastmcp 默认一致，客户端连接地址即该路径
     mcp_stateless_http: bool = True  # 工具纯函数无会话 → 默认无状态，支持水平扩展
 
+    # —— A2A 智能体互联（T5 Server 入站；T6 Client 环境项见下）——
+    # 环境变量约定 A2A_ENABLED / A2A_PEER_MAP（pydantic-settings 大小写不敏感匹配）。
+    a2a_enabled: bool = True  # 关闭时所有入站 A2A 请求拒绝（AgentCard 发现不受影响）
+    # peer 注册表：JSON 对象 {"<peer_id>": "<user_id|null>"}；user_id 缺省落匿名命名空间。
+    a2a_peer_map: dict[str, str] = Field(default_factory=dict)
+
+    # —— A2A Client（T6：a2a_mcp 服务装配；注册表非空才登记，空表零回归）——
+    a2a_mcp_enabled: bool = True  # 总开关；与注册表非空同时满足才登记 a2a_mcp 服务
+    # 远端智能体注册表：env A2A_MCP_AGENTS（JSON {"<agent_id>": "<base_url>"}），
+    # 服务侧（services/a2a_mcp/config.py）读同名 env，两边约定同名、代码解耦。
+    a2a_mcp_agents: dict[str, str] = Field(default_factory=dict)
+    a2a_mcp_host: str = "127.0.0.1"  # streamable-http 形态的 a2a_mcp 地址（容器部署 = 服务名）
+    a2a_mcp_port: int = 8102  # 避开 API_PORT=8000 / tools_mcp 8100 / lark_mcp 8101
+
     # —— embedding（与 RAG 对齐；语义召回开关）——
     embedding_enabled: bool = False  # 置 true 启用语义召回/去重
     embedding_model: str = ""  # 与 RAG 同一模型名
