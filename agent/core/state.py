@@ -12,7 +12,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
 
 from agent.core.context import SessionKeyFact
-from agent.core.models import PlanResult
+from agent.core.models import PlanResult, SubagentResult
 from agent.errors import ErrorRecord
 from agent.intent.models import Intent, IntentResult
 from agent.memory.models import MemoryItem
@@ -38,6 +38,10 @@ NODE_EXECUTE_STEP = "execute_step"
 NODE_PLAN_STEP_ADVANCE = "plan_step_advance"
 NODE_REPLAN_TASK = "replan_task"
 NODE_CLARIFY = "clarify"
+# 并行子代理（T7）：扇出节点 / 子代理执行节点（Send 多实例并行）/ join 回填节点。
+NODE_DISPATCH_SUBAGENTS = "dispatch_subagents"
+NODE_RUN_SUBAGENT = "run_subagent"
+NODE_JOIN_SUBAGENTS = "join_subagents"
 
 
 class AgentState(TypedDict, total=False):
@@ -69,6 +73,21 @@ class AgentState(TypedDict, total=False):
     plan_step: int  # 步骤指针（0-based，当前计划内的执行进度）
     plan_steps_done: int  # 跨重规划累计的成功步骤数（部分成功判定：≥1 即有产出）
     replanned: bool  # 本轮是否已重规划过（防无限重规划，≤1 次）
+
+    # —— 并行子代理（T7；subagent_results 由 operator.add 累积，其余普通覆盖）——
+    # join 回填子代理批结果（按 step_index 定位）。与 tool_calls/citations 同一跨轮累积
+    # 口径：operator.add 通道不可清零，计划级隔离由 subagent_results_base 偏移承担。
+    subagent_results: Annotated[list[SubagentResult], operator.add]
+    # 当前计划结果在 subagent_results 中的起始偏移（plan_task/重规划时推进到当期长度）：
+    # join 只记账 results[base:]，历史计划结果仅保留供最终整合，不参与记账/失败判定。
+    subagent_results_base: int
+    dispatch_round: int  # 扇出批序号（防死循环上限 = 计划步数；重规划时清零）
+    plan_steps_completed: list[
+        int
+    ]  # 当前计划已完成步骤索引（join/推进维护；重规划清零防旧索引跳步）
+    # 扇出批次在 tool_calls 中的起始偏移（dispatch 节点记录）：join 据此精确取本批
+    # 工具记录数累加进 tool_iterations（子代理调用计入 plan 总预算），跨轮/跨批不重复计。
+    dispatch_tool_calls_base: int
 
     # —— 澄清式追问（普通覆盖字段，load_context 每轮重置）——
     clarify_asked: bool  # 本轮是否已追问过（防澄清循环，≤ max_asks_per_turn）

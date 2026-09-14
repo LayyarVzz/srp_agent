@@ -12,6 +12,7 @@ import pytest
 
 from agent.a2a.models import A2APeer
 from agent.a2a.protocol import A2A_ERROR_INVALID_REQUEST, A2AProtocolError
+from agent.core.config import AgentFrameworkConfig
 from agent.intent.models import Intent
 from agent.runtime import AgentRuntime, _build_mcp_servers
 from services.tools_mcp.config import MCPTransport
@@ -145,7 +146,7 @@ async def test_registry_is_per_runtime(api_runtime_factory: Any) -> None:
 def test_build_mcp_servers_skips_a2a_when_registry_empty() -> None:
     """注册表为空 → a2a_mcp 不登记，其余服务不受影响（工具集与既有完全一致）。"""
     settings = RuntimeSettings(mcp_transport=MCPTransport.STDIO, a2a_mcp_agents={})
-    servers = _build_mcp_servers(settings)
+    servers = _build_mcp_servers(settings, AgentFrameworkConfig.get_default())
     assert "a2a_mcp" not in servers
     assert "tools_mcp" in servers and "rag" in servers
 
@@ -157,7 +158,7 @@ def test_build_mcp_servers_disabled_flag_blocks_a2a() -> None:
         a2a_mcp_enabled=False,
         a2a_mcp_agents={"b": "http://127.0.0.1:8002"},
     )
-    assert "a2a_mcp" not in _build_mcp_servers(settings)
+    assert "a2a_mcp" not in _build_mcp_servers(settings, AgentFrameworkConfig.get_default())
 
 
 def test_build_mcp_servers_registers_a2a_stdio() -> None:
@@ -166,7 +167,7 @@ def test_build_mcp_servers_registers_a2a_stdio() -> None:
         mcp_transport=MCPTransport.STDIO,
         a2a_mcp_agents={"b": "http://127.0.0.1:8002"},
     )
-    conn = _build_mcp_servers(settings)["a2a_mcp"]
+    conn = _build_mcp_servers(settings, AgentFrameworkConfig.get_default())["a2a_mcp"]
     assert conn["transport"] == "stdio"
 
 
@@ -178,5 +179,5 @@ def test_build_mcp_servers_registers_a2a_http() -> None:
         a2a_mcp_host="a2a_mcp",
         a2a_mcp_port=8102,
     )
-    conn = _build_mcp_servers(settings)["a2a_mcp"]
+    conn = _build_mcp_servers(settings, AgentFrameworkConfig.get_default())["a2a_mcp"]
     assert conn == {"transport": "streamable_http", "url": "http://a2a_mcp:8102/mcp"}

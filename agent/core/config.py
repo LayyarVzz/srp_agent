@@ -168,6 +168,20 @@ class PlanConfig(BaseModel):
     max_tool_calls_per_plan: int = Field(default=12, ge=1)
 
 
+class SubagentConfig(BaseModel):
+    """内部并发子代理行为（T7，dev-version5.0.md §8.4）。
+
+    `enabled` / `max_parallel<=1` 时整轮计划回退 v4.0 顺序执行路径（零回归）；
+    `max_parallel` 是批内并行上限（就绪步骤多于上限时按拓扑分批推进）；
+    `per_subagent_max_tool_calls` 是单子代理的工具迭代上限（子图内收敛护栏）；
+    子代理工具调用同时计入 `plan.max_tool_calls_per_plan` 总预算。
+    """
+
+    enabled: bool = True
+    max_parallel: int = Field(default=3, ge=1, le=6)  # 批内并行上限
+    per_subagent_max_tool_calls: int = Field(default=3, ge=1)  # 单子代理工具迭代上限
+
+
 class ClarifyConfig(BaseModel):
     """澄清式追问行为。
 
@@ -294,6 +308,7 @@ class AgentFrameworkConfig(BaseModel):
 
     graph: AgentGraphConfig = Field(default_factory=AgentGraphConfig)
     plan: PlanConfig = Field(default_factory=PlanConfig)  # 多步任务编排
+    subagents: SubagentConfig = Field(default_factory=SubagentConfig)  # 内部并发子代理（T7）
     clarify: ClarifyConfig = Field(default_factory=ClarifyConfig)  # 澄清式追问
     llm_behavior: LLMBehaviorConfig = Field(default_factory=LLMBehaviorConfig)
     tools: MCPToolsConfig = Field(default_factory=MCPToolsConfig)

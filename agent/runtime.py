@@ -39,14 +39,15 @@ from agent.response.status import StatusEvent
 from agent.session import SessionBackend, SessionManager, build_session_backend
 from agent.tools import build_tools_from_mcp
 from agent.tools.models import ToolCallRecord
-from services.lark_mcp.cli import resolve_lark_cli_command
-from services.lark_mcp.client_config import (
-    LARK_MCP_SERVER_NAME,
-    build_lark_mcp_stdio_connection,
 from services.a2a_mcp.client_config import (
     A2A_MCP_SERVER_NAME,
     build_a2a_mcp_http_connection,
     build_a2a_mcp_stdio_connection,
+)
+from services.lark_mcp.cli import resolve_lark_cli_command
+from services.lark_mcp.client_config import (
+    LARK_MCP_SERVER_NAME,
+    build_lark_mcp_stdio_connection,
 )
 from services.rag_mcp.client_config import (
     RAG_MCP_SERVER_NAME,
@@ -365,6 +366,8 @@ def _build_mcp_servers(settings: RuntimeSettings, cfg: AgentFrameworkConfig) -> 
             )
     else:
         servers[TOOLS_MCP_SERVER_NAME] = build_tools_mcp_stdio_connection()
+        if register_a2a:
+            servers[A2A_MCP_SERVER_NAME] = build_a2a_mcp_stdio_connection()
     if cfg.lark.enabled and settings.lark_cli_enabled:
         if resolve_lark_cli_command(settings.lark_cli_command):
             servers[LARK_MCP_SERVER_NAME] = build_lark_mcp_stdio_connection()
@@ -373,8 +376,6 @@ def _build_mcp_servers(settings: RuntimeSettings, cfg: AgentFrameworkConfig) -> 
                 "lark-cli 命令探测失败，跳过 lark_mcp 登记"
                 "（无 CLI 环境零回归；可配置 LARK_CLI_COMMAND 指向可执行文件）"
             )
-    if register_a2a:
-        servers[A2A_MCP_SERVER_NAME] = build_a2a_mcp_stdio_connection()
     return servers
 
 
