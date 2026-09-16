@@ -45,7 +45,9 @@ select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "RUF"]
 extend-ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]
+# 测试用例必然出现假凭据/占位密钥（S105 硬编码口令 / S106 口令关键字参数），
+# 与 S101 同理属测试豁免；真实密钥一律经 SecretStr 注入，不落测试源码。
+"tests/**" = ["S101", "S105", "S106"]
 "scripts/**" = ["S101"]
 
 [tool.ruff.format]

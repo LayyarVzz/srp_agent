@@ -24,3 +24,9 @@ logs/
 .env.*
 !.env.example
 
+# 飞书验证测试产物（含真实 UAT / refresh_token，绝不入库）
+.lark_uat_token*.json
+
+# 本地测试临时目录（受限沙箱下 pytest basetemp 的落点）
+.testtmp/
+
