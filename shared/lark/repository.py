@@ -60,9 +60,22 @@ DEFAULT_REFRESH_TTL_S = 604800
 # access_token 兜底寿命（实测 7200s）；响应缺 expires_in 时按此兜底。
 DEFAULT_ACCESS_TTL_S = 7200
 
+# 刷新函数签名：`async (refresh_token) -> LarkTokenSet`。
+# WHY 在 Protocol 之前定义：契约里引用它作参数类型，且在 `from __future__ import
+# annotations` 之外仍需是可求值的模块级名字（运行期不要靠字符串前向引用）。
+RefreshFn = Callable[[str], Awaitable[LarkTokenSet]]
+
 
 class LarkBindingRepository(Protocol):
-    """绑定存储契约（结构型协议；测试可注入假实现）。"""
+    """绑定存储契约（结构型协议；测试可注入假实现）。
+
+    契约覆盖**消费方真正用到的全部方法**（而非最小子集）：绑定工具需要
+    `peek_device_flow` / `decrypt_access_token` / `delete_binding`，
+    凭据解析需要 `resolve_access_token` —— 缺一条就得在消费侧写 `type: ignore`，
+    等于把契约漏洞藏进调用点。
+    """
+
+    enabled: bool
 
     async def setup(self) -> None:
         """幂等建表（装配期调用一次）。"""
@@ -78,6 +91,14 @@ class LarkBindingRepository(Protocol):
 
     async def get_device_flow(self, *, user_id: str, device_code: str) -> LarkDeviceFlow | None:
         """取待定态（排除已过期）；未命中/过期返回 None。"""
+
+    async def peek_device_flow(self, user_id: str) -> LarkDeviceFlow | None:
+        """取该用户当前待定态（无需 device_code；排除已过期）。
+
+        WHY 与 `get_device_flow` 并存：「完成绑定」的调用方只知道 user_id
+        （设备码在服务端留存），而「换码」必须校验 device_code 匹配以防串码。
+        """
+        ...
 
     async def drop_device_flow(self, *, user_id: str) -> None:
         """清除该用户的待定态（换码成功或重新发起时）。"""
@@ -95,6 +116,19 @@ class LarkBindingRepository(Protocol):
 
     async def delete_binding(self, user_id: str) -> bool:
         """删除绑定，返回是否真的删掉了（解绑）。"""
+
+    async def resolve_access_token(
+        self,
+        user_id: str,
+        *,
+        refresh: RefreshFn,
+        now: datetime | None = None,
+    ) -> str:
+        """取该用户当前可用的 UAT（临近过期则按乐观锁语义刷新）。"""
+
+    async def decrypt_access_token(self, binding: LarkBinding) -> str:
+        """解密某条绑定的 UAT（仅供解绑时的远端撤销使用；不参与取用路径）。"""
+        ...
 
 
 class _Base(DeclarativeBase):
@@ -208,6 +242,15 @@ class SQLAlchemyLarkBindingRepository:
             )
             await session.commit()
 
+    async def peek_device_flow(self, user_id: str) -> LarkDeviceFlow | None:
+        """取该用户当前待定态（无需 device_code；已过期视同不存在）。"""
+        self._require_enabled()
+        async with self._session_factory() as session:
+            row = await session.get(LarkDeviceFlowRow, user_id)
+        if row is None or _expired(row.expires_at):
+            return None
+        return _flow_from_row(row)
+
     # —— 绑定读写 ——
 
     async def get_binding(self, user_id: str) -> LarkBinding | None:
@@ -265,6 +308,15 @@ class SQLAlchemyLarkBindingRepository:
             await session.delete(row)
             await session.commit()
             return True
+
+    async def decrypt_access_token(self, binding: LarkBinding) -> str:
+        """解密某条绑定的 UAT。
+
+        WHY 独立成公开方法而非暴露 `_decrypt`：解绑需要用它调远端撤销，
+        而消费侧访问私有成员会把「加密边界」变成隐式约定（分层与可测性都受损）。
+        """
+        self._require_enabled()
+        return self._decrypt(binding.access_token_ciphertext)
 
     # —— 令牌取用（含并发安全刷新，§7 六步）——
 
@@ -416,8 +468,7 @@ class SQLAlchemyLarkBindingRepository:
             raise LarkBoundError(BINDING_DISABLED_REASON)
 
 
-# 刷新函数签名：`async (refresh_token) -> LarkTokenSet`。
-RefreshFn = Callable[[str], Awaitable[LarkTokenSet]]
+# 刷新函数签名：`async (refresh_token) -> LarkTokenSet`（定义在文件上部，此处不再重复）。
 
 
 def _binding_to_row(binding: LarkBinding) -> LarkBindingRow:
