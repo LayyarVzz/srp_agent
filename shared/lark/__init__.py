@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 from shared.lark.errors import (
+    BINDING_DISABLED_REASON,
+    LARK_UNBOUND_GUIDE,
     LARK_UNBOUND_PREFIX,
     TOOL_ERROR_LARK_UNBOUND,
     LarkBoundError,
@@ -16,17 +18,52 @@ from shared.lark.errors import (
     LarkUnboundError,
     unbound_message,
 )
+from shared.lark.models import (
+    BINDING_STATUS_ACTIVE,
+    BINDING_STATUS_INVALID,
+    LarkBinding,
+    LarkDeviceFlow,
+    LarkTokenSet,
+    LarkUserInfo,
+)
+from shared.lark.oauth import LARK_MINIMAL_SCOPES, LarkOAuthClient
+from shared.lark.repository import (
+    LarkBindingRepository,
+    SQLAlchemyLarkBindingRepository,
+    build_lark_binding_repository,
+)
+from shared.lark.token_cipher import (
+    FernetTokenCipher,
+    LarkTokenCipher,
+    build_token_cipher,
+)
 
 # MCP 服务名常量（单一来源）：agent 侧拦截器据此判定「是否飞书工具」
 # （agent 不 import services，故常量落在共享层；services/lark_mcp/client_config.py 复用之）。
 LARK_MCP_SERVER_NAME = "lark_mcp"
 
 __all__ = [
+    "BINDING_DISABLED_REASON",
+    "BINDING_STATUS_ACTIVE",
+    "BINDING_STATUS_INVALID",
     "LARK_MCP_SERVER_NAME",
+    "LARK_MINIMAL_SCOPES",
+    "LARK_UNBOUND_GUIDE",
     "LARK_UNBOUND_PREFIX",
     "TOOL_ERROR_LARK_UNBOUND",
+    "FernetTokenCipher",
+    "LarkBinding",
+    "LarkBindingRepository",
     "LarkBoundError",
     "LarkCliError",
+    "LarkDeviceFlow",
+    "LarkOAuthClient",
+    "LarkTokenCipher",
+    "LarkTokenSet",
     "LarkUnboundError",
+    "LarkUserInfo",
+    "SQLAlchemyLarkBindingRepository",
+    "build_lark_binding_repository",
+    "build_token_cipher",
     "unbound_message",
 ]

@@ -21,6 +21,10 @@ LARK_UNBOUND_GUIDE = (
     "在浏览器里打开并扫码确认即可；绑定后每个人的飞书操作都只作用于自己的账号。"
 )
 
+# fail-closed 关闭原因（未配置 lark_token_key）：绑定功能整体不可用（§7「加密」）。
+# WHY 用常量：该文案会同时出现在日志与工具错误里，集中声明保证口径一致、可被测试断言。
+BINDING_DISABLED_REASON = "飞书绑定功能未启用（服务端未配置 lark_token_key，已按 fail-closed 关闭）"
+
 
 class LarkCliError(RuntimeError):
     """lark-cli 调用失败（非零退出 / 输出解析失败 / 超时 / ok=false）。
@@ -47,11 +51,22 @@ class LarkUnboundError(LarkBoundError):
 
     `verification_uri_complete` 非空时随异常上抛给用户（绑定入口）：由
     服务侧在「未绑定时需要发起绑定」的场景填入（`lark_bind_status` 等）。
+
+    `detail` 可选补充「为什么未绑定」的可读原因（如「绑定已失效」/「刷新凭证已失效」）
+    —— 缺省时按 user_id 生成兜底文案；`detail` 只影响人类可读文本，
+    **不影响**前缀锚点（agent 侧识别仍只依赖 `LARK_UNBOUND_PREFIX`）。
     """
 
-    def __init__(self, message: str, *, verification_uri_complete: str | None = None) -> None:
-        super().__init__(unbound_message(message, verification_uri_complete))
-        self.detail = message
+    def __init__(
+        self,
+        message: str,
+        *,
+        detail: str | None = None,
+        verification_uri_complete: str | None = None,
+    ) -> None:
+        text = f"{message}（{detail}）" if detail else message
+        super().__init__(unbound_message(text, verification_uri_complete))
+        self.detail = text
         self.verification_uri_complete = verification_uri_complete
 
 
@@ -68,6 +83,7 @@ def unbound_message(detail: str, verification_uri_complete: str | None = None) -
 
 
 __all__ = [
+    "BINDING_DISABLED_REASON",
     "LARK_UNBOUND_GUIDE",
     "LARK_UNBOUND_PREFIX",
     "TOOL_ERROR_LARK_UNBOUND",
