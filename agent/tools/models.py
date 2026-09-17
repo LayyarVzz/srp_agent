@@ -10,11 +10,14 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from agent.share.models import Citation
+from shared.lark.errors import TOOL_ERROR_LARK_UNBOUND
 
 # —— 工具错误码（tool_error.* 命名空间）——
 TOOL_ERROR_EXECUTION = "tool_error.execution"  # 工具执行失败（含参数校验/运行时异常）
 TOOL_ERROR_UNKNOWN_TOOL = "tool_error.unknown_tool"  # 模型幻觉出未注册工具名
 TOOL_ERROR_MISSING_ARGUMENT = "tool_error.missing_argument"  # 工具参数缺失（T2：澄清而非降级）
+# 飞书未绑定（v5.1，dev-version5.1.md §6.3）：语义 = 绑定引导而非 fallback_chat。
+# 常量体在 shared/lark（服务侧产出该码、agent 侧消费），此处以别名进 tool_error 族。
 
 
 class ToolError(BaseModel):
@@ -47,3 +50,14 @@ class ToolCallRecord(BaseModel):
     arguments: dict[str, object]
     status: str  # ok / error
     result: ToolResult | None = None
+
+
+__all__ = [
+    "TOOL_ERROR_EXECUTION",
+    "TOOL_ERROR_LARK_UNBOUND",
+    "TOOL_ERROR_MISSING_ARGUMENT",
+    "TOOL_ERROR_UNKNOWN_TOOL",
+    "ToolCallRecord",
+    "ToolError",
+    "ToolResult",
+]

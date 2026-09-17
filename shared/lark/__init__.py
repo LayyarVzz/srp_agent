@@ -17,7 +17,12 @@ from shared.lark.errors import (
     unbound_message,
 )
 
+# MCP 服务名常量（单一来源）：agent 侧拦截器据此判定「是否飞书工具」
+# （agent 不 import services，故常量落在共享层；services/lark_mcp/client_config.py 复用之）。
+LARK_MCP_SERVER_NAME = "lark_mcp"
+
 __all__ = [
+    "LARK_MCP_SERVER_NAME",
     "LARK_UNBOUND_PREFIX",
     "TOOL_ERROR_LARK_UNBOUND",
     "LarkBoundError",

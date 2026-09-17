@@ -13,7 +13,8 @@ from pathlib import Path
 
 from langchain_mcp_adapters.sessions import StdioConnection
 
-LARK_MCP_SERVER_NAME = "lark_mcp"
+# 服务名常量单一来源在 shared/lark（agent 侧拦截器据此识别飞书工具，且 agent 不 import
+# services）；本模块只保留「模块名」常量，避免两处同名字符串各自漂移。
 LARK_MCP_SERVER_MODULE = "services.lark_mcp"
 
 

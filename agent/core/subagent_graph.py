@@ -26,6 +26,7 @@ from langgraph.prebuilt import ToolNode
 from agent.core.config import SubagentConfig
 from agent.errors import LLMError
 from agent.llm import LLMService
+from agent.tools.lark_scope import visible_tools
 
 # 子图节点名常量（与主图节点名一样集中声明，禁止散落字符串字面量）。
 SUB_NODE_CALL_MODEL = "sub_call_model"
@@ -38,6 +39,9 @@ class SubagentState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     tool_iterations: int  # 工具迭代计数（上限 = SubagentConfig.per_subagent_max_tool_calls）
     error: str | None  # LLM 失败信息（瞬态；主图包装节点据此判定步骤失败）
+    # v5.1：调用方用户身份随子图输入透传 —— 传给 ToolNode 后进入 `ToolRuntime.state`，
+    # 供飞书工具作用域拦截器注入 `_lark_scope`（子代理也必须以该用户身份调飞书工具）。
+    user_id: str | None
 
 
 def build_subagent_graph(
@@ -52,6 +56,8 @@ def build_subagent_graph(
     未执行的 tool_calls 不再派发（收敛护栏，防单子代理失控）。
     """
     tool_node = ToolNode(tools, handle_tool_errors=True)
+    # 模型可见视图（飞书工具剥离 `_lark_scope`）；执行侧仍用原 `tools`。
+    tools_for_model = visible_tools(tools)
 
     async def sub_call_model(state: SubagentState) -> dict[str, Any]:
         """子代理模型节点：以当前消息轨迹调用 LLM（不流式外发——并行分支的
@@ -59,7 +65,7 @@ def build_subagent_graph(
         """
         prompt = state.get("messages") or []
         try:
-            resp = await llm.ainvoke_tools(tools, prompt)
+            resp = await llm.ainvoke_tools(tools_for_model, prompt)
         except LLMError as exc:
             # 失败不追加消息 → route_sub_model 见非 AIMessage 收尾；
             # error 经子图终态回传包装节点 → 步骤失败 → 主图重规划语义。
@@ -67,8 +73,14 @@ def build_subagent_graph(
         return {"messages": [resp], "error": None}
 
     async def sub_dispatch_tool(state: SubagentState) -> dict[str, Any]:
-        """子代理工具节点：复用 ToolNode 并行执行末条 AIMessage 的全部 tool_calls。"""
-        result = await tool_node.ainvoke({"messages": state.get("messages") or []})
+        """子代理工具节点：复用 ToolNode 并行执行末条 AIMessage 的全部 tool_calls。
+
+        v5.1：随输入带 `user_id`（透传为主图调用方身份）→ 作用域拦截器据此注入
+        `_lark_scope`，子代理的工具调用与主图同口径按用户隔离。
+        """
+        result = await tool_node.ainvoke(
+            {"messages": state.get("messages") or [], "user_id": state.get("user_id")}
+        )
         return {
             "messages": result["messages"],
             "tool_iterations": (state.get("tool_iterations") or 0) + 1,

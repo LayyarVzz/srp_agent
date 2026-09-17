@@ -45,10 +45,7 @@ from services.a2a_mcp.client_config import (
     build_a2a_mcp_stdio_connection,
 )
 from services.lark_mcp.cli import resolve_lark_cli_command
-from services.lark_mcp.client_config import (
-    LARK_MCP_SERVER_NAME,
-    build_lark_mcp_stdio_connection,
-)
+from services.lark_mcp.client_config import build_lark_mcp_stdio_connection
 from services.rag_mcp.client_config import (
     RAG_MCP_SERVER_NAME,
     build_rag_mcp_stdio_connection,
@@ -61,6 +58,7 @@ from services.tools_mcp.client_config import (
 from services.tools_mcp.config import MCPTransport
 from settings import RuntimeSettings, get_settings
 from shared.embeddings import EmbeddingConfig
+from shared.lark import LARK_MCP_SERVER_NAME
 
 logger = logging.getLogger(__name__)
 

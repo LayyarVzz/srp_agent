@@ -73,8 +73,10 @@ from agent.response.models import (
 )
 from agent.response.status import Status, StatusEvent
 from agent.share.models import Citation
+from agent.tools.lark_scope import is_lark_unbound_message, visible_tools
 from agent.tools.models import (
     TOOL_ERROR_EXECUTION,
+    TOOL_ERROR_LARK_UNBOUND,
     TOOL_ERROR_MISSING_ARGUMENT,
     TOOL_ERROR_UNKNOWN_TOOL,
     ToolCallRecord,
@@ -287,8 +289,9 @@ def _records_from_tool_calls(
 ) -> tuple[list[ToolCallRecord], ToolError | None]:
     """把 AIMessage.tool_calls × ToolMessage 配对成 ToolCallRecord（主图/子代理共用口径）。
 
-    错误细分：工具名不在目录（幻觉）→ unknown_tool；参数校验失败
-    （ToolNode 的 ToolInvocationError）→ missing_argument；其余 → execution。
+    错误细分：工具名不在目录（幻觉）→ unknown_tool；飞书未绑定
+    （服务侧 `tool_error.lark_unbound` 前缀）→ lark_unbound（引导绑定而非降级）；
+    参数校验失败（ToolNode 的 ToolInvocationError）→ missing_argument；其余 → execution。
     返回 (记录列表, 首个错误)——首个错误为 None 即全部成功。
     """
     records: list[ToolCallRecord] = []
@@ -298,16 +301,19 @@ def _records_from_tool_calls(
         name = call["name"]
         args = dict(call.get("args") or {})
         if tm is not None and tm.status == "error":
+            content = str(tm.content or "")
             if name not in known_tools:
                 code = TOOL_ERROR_UNKNOWN_TOOL
-            elif _is_tool_invocation_error(str(tm.content or "")):
+            elif is_lark_unbound_message(content):
+                code = TOOL_ERROR_LARK_UNBOUND
+            elif _is_tool_invocation_error(content):
                 code = TOOL_ERROR_MISSING_ARGUMENT
             else:
                 code = TOOL_ERROR_EXECUTION
             terr = ToolError(
                 code=code,
                 # 轨迹内截断内容（mcp_max_content_chars 护栏），不动 ToolMessage 本体。
-                message=str(tm.content or "")[:max_content_chars],
+                message=content[:max_content_chars],
             )
             records.append(
                 ToolCallRecord(
@@ -380,7 +386,11 @@ def _serial_tool_summary(state: AgentState) -> str:
 
 
 def _subagent_payload(state: AgentState, step_index: int) -> dict[str, Any]:
-    """构造 Send 扇出载荷：目标步骤描述 + 已完成上游产出（供子代理子图上下文）。"""
+    """构造 Send 扇出载荷：目标步骤描述 + 已完成上游产出（供子代理子图上下文）。
+
+    v5.1：额外携带 `user_id`（调用方身份）—— 子代理也要以该用户身份调飞书工具，
+    否则并行分支的飞书调用会落到「未知作用域」而判未绑定。
+    """
     plan = state.get("plan")
     if plan is None or not (0 <= step_index < len(plan.steps)):
         # 扇出路由已保证计划与索引合法；异常状态（图状态损坏）时退化为空载荷描述。
@@ -396,6 +406,7 @@ def _subagent_payload(state: AgentState, step_index: int) -> dict[str, Any]:
             "plan_summary": "",
             "total_steps": 0,
             "input": state.get("input") or "",
+            "user_id": state.get("user_id"),
         }
     step = plan.steps[step_index]
     ok_results = {r.step_index: r for r in (state.get("subagent_results") or []) if r.ok}
@@ -413,6 +424,7 @@ def _subagent_payload(state: AgentState, step_index: int) -> dict[str, Any]:
         "plan_summary": plan.summary,
         "total_steps": len(plan.steps),
         "input": state.get("input") or "",
+        "user_id": state.get("user_id"),
     }
 
 
@@ -655,6 +667,9 @@ def build_agent_graph(
     # 并行子代理子图（T7）：主图装配时编译一次，由 run_subagent 节点按 Send 分支复用
     # （共享同一批 BaseTool/LLMService 实例；子图无 checkpointer，瞬态执行不持久化）。
     subgraph = build_subagent_graph(llm, tools, cfg.subagents)
+    # 「模型可见」工具视图：飞书工具剥离内部参数 `_lark_scope`（LLM 不可见、不可填，
+    # v5.1 §5.4-2）。执行侧仍用原 `tools`（ToolNode/子图），两侧互不影响。
+    tools_for_model = visible_tools(tools)
     intent_classifier = LLMIntentClassifier(llm, fallback=RuleFallbackClassifier())
 
     # —— 会话与上下文 ——
@@ -882,7 +897,7 @@ def build_agent_graph(
         try:
             chunks: list[AIMessageChunk] = []
             answered = False
-            async for chunk in llm.astream_tools(tools, prompt):
+            async for chunk in llm.astream_tools(tools_for_model, prompt):
                 chunks.append(chunk)
                 content = chunk.content
                 if isinstance(content, str) and content:
@@ -913,7 +928,10 @@ def build_agent_graph(
         tool_names = ", ".join(c["name"] for c in calls) or None
         updates = set_status(Status.USING_TOOL, message="正在执行工具", tool_name=tool_names)
         # ToolNode 并行执行尾部 AIMessage 的全部 tool_calls，返回 {"messages": [ToolMessage...]}。
-        result = await tool_node.ainvoke({"messages": messages})
+        # WHY 随输入带 user_id：ToolNode 对普通 dict 输入原样透传（`_extract_state` 对
+        # dict 直接 return input），故额外键会存进 `ToolRuntime.state` —— 飞书工具作用域
+        # 拦截器（LarkScopeInterceptor）据此把「谁在调用」注入 MCP 实参（v5.1 §5）。
+        result = await tool_node.ainvoke({"messages": messages, "user_id": state.get("user_id")})
         new_messages = result["messages"]
         tool_msgs = {tm.tool_call_id: tm for tm in new_messages}
         records, first_error = _records_from_tool_calls(
@@ -1025,7 +1043,7 @@ def build_agent_graph(
         )
         prompt = _build_prompt(state, include_plan=True, step_instruction=instruction)
         try:
-            resp = await llm.ainvoke_tools(tools, prompt)
+            resp = await llm.ainvoke_tools(tools_for_model, prompt)
         except LLMError as exc:
             # 单步 LLM 失败 → 与工具失败同语义（route_step_choice 据此走重规划/降级）。
             logger.warning("步骤执行失败（%s）", exc)
@@ -1141,8 +1159,14 @@ def build_agent_graph(
 
         子图自有 messages 轨迹；本节点把子图终态转成 `SubagentResult`（含工具记录，
         经 tool_calls reducer 透出为并行 tool 事件）后合并回主图。
+
+        v5.1：子图输入同样携带 `user_id`（子代理也要带用户身份调飞书工具 —— 否则
+        并行分支的工具调用会落到「未知作用域」而被判未绑定）。
         """
-        sub_input = {"messages": [SystemMessage(content=_subagent_prompt(payload))]}
+        sub_input = {
+            "messages": [SystemMessage(content=_subagent_prompt(payload))],
+            "user_id": payload.get("user_id"),
+        }
         sub_out = await subgraph.ainvoke(sub_input, config=config)
         messages = sub_out.get("messages") or []
         calls = [
