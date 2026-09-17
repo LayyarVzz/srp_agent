@@ -297,7 +297,10 @@ async def test_unbound_user_never_borrows_another_users_token(patch_exec: ProcRe
 
         with pytest.raises(Exception) as excinfo:
             await _call("lark_calendar_get_agenda", {LARK_SCOPE_ARG: USER_B})
-        assert LARK_UNBOUND_PREFIX in str(excinfo.value)
+        message = str(excinfo.value)
+        assert LARK_UNBOUND_PREFIX in message
+        # 未绑定文案会进模型上下文并呈现给用户 → 内部 user_id 绝不出现（信息泄露）。
+        assert USER_B not in message, f"未绑定消息泄露了内部 user_id：{message[:120]}"
         # B 的失败没有产生任何子进程（A 的 token 没被借用）
         assert patch_exec.envs == []
 

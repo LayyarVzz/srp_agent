@@ -337,9 +337,9 @@ class SQLAlchemyLarkBindingRepository:
         moment = now or datetime.now(UTC)
         binding = await self.get_binding(user_id)
         if binding is None:
-            raise LarkUnboundError(user_id)
+            raise LarkUnboundError(user_id=user_id)
         if not binding.is_active():
-            raise LarkUnboundError(user_id, detail="绑定已失效")
+            raise LarkUnboundError("绑定已失效", user_id=user_id)
 
         # ② 未临近过期 → 直接用现有的（不刷新，省一次网络往返与轮换风险）。
         if not self._needs_refresh(binding, moment):
@@ -377,16 +377,16 @@ class SQLAlchemyLarkBindingRepository:
                 return self._decrypt(fresh.access_token_ciphertext)
         # 行未变化（或仍未临近过期判定不成立）→ 判定绑定失效，引导重新绑定。
         await self._mark_invalid(user_id)
-        raise LarkUnboundError(user_id, detail="刷新凭证已失效")
+        raise LarkUnboundError("刷新凭证已失效", user_id=user_id)
 
     async def _read_fresh_token(self, user_id: str, now: datetime) -> str:
         """竞态失败方重读：若新值仍临近过期（极端时序），视为失效要求重绑。"""
         fresh = await self.get_binding(user_id)
         if fresh is None or not fresh.is_active():
-            raise LarkUnboundError(user_id)
+            raise LarkUnboundError(user_id=user_id)
         if self._needs_refresh(fresh, now):
             # 重读到的仍是临过期值：说明并发方刷新的结果也没落地，放弃本轮。
-            raise LarkUnboundError(user_id, detail="令牌刷新未生效")
+            raise LarkUnboundError("令牌刷新未生效", user_id=user_id)
         return self._decrypt(fresh.access_token_ciphertext)
 
     async def _conditional_update(

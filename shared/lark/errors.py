@@ -56,21 +56,27 @@ class LarkUnboundError(LarkBoundError):
     `verification_uri_complete` 非空时随异常上抛给用户（绑定入口）：由
     服务侧在「未绑定时需要发起绑定」的场景填入（`lark_bind_status` 等）。
 
-    `detail` 可选补充「为什么未绑定」的可读原因（如「绑定已失效」/「刷新凭证已失效」）
-    —— 缺省时按 user_id 生成兜底文案；`detail` 只影响人类可读文本，
-    **不影响**前缀锚点（agent 侧识别仍只依赖 `LARK_UNBOUND_PREFIX`）。
+    `user_id` **只用于日志观测，绝不进消息文本** —— 该消息会经 ToolMessage
+    进入模型上下文并最终呈现给用户，暴露内部标识符既无意义也是信息泄露。
+    需要「为什么未绑定」的可读原因时用 `detail`（如「绑定已失效」）。
+
+    参数兼容：`reason` 位置参数按 `detail` 处理（历史调用形如
+    `LarkUnboundError("绑定已失效")` 语义就是补充原因），保持语义单一。
     """
 
     def __init__(
         self,
-        message: str,
+        reason: str | None = None,
         *,
         detail: str | None = None,
+        user_id: str | None = None,
         verification_uri_complete: str | None = None,
     ) -> None:
-        text = f"{message}（{detail}）" if detail else message
+        text = reason or detail or "尚未绑定飞书账号"
         super().__init__(unbound_message(text, verification_uri_complete))
         self.detail = text
+        # 仅供日志：不参与消息构造（见类 docstring）。
+        self.user_id = user_id
         self.verification_uri_complete = verification_uri_complete
 
 
