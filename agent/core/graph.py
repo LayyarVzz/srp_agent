@@ -41,6 +41,7 @@ from agent.core.state import (
     NODE_FORMAT_RESPONSE,
     NODE_GENERATE_ANSWER,
     NODE_JOIN_SUBAGENTS,
+    NODE_LARK_BIND_GUIDE,
     NODE_LOAD_CONTEXT,
     NODE_PLAN_STEP_ADVANCE,
     NODE_PLAN_TASK,
@@ -83,6 +84,7 @@ from agent.tools.models import (
     ToolError,
     ToolResult,
 )
+from shared.lark.errors import LARK_UNBOUND_GUIDE, extract_binding_link
 
 logger = logging.getLogger(__name__)
 
@@ -638,6 +640,32 @@ def _new_message_id(prefix: str) -> str:
     消息不保证自动分配 id，显式 id 让裁剪始终可定位。
     """
     return f"{prefix}-{uuid.uuid4().hex}"
+
+
+def _binding_link_from_messages(messages: list[BaseMessage]) -> str | None:
+    """从最近一条飞书未绑定的 ToolMessage 中提取绑定入口链接（无则 None）。
+
+    WHY 从消息里捞而不是另建状态通道：绑定入口由**服务侧**在未绑定消息尾部生成
+    （服务侧才知道 device_code / flow_id），跨 MCP 线后它就是 ToolMessage 文本的一部分；
+    再建一条并行状态通道只会引入「两处状态不同步」的新故障面。
+    """
+    for message in reversed(messages):
+        if isinstance(message, ToolMessage) and is_lark_unbound_message(str(message.content or "")):
+            return extract_binding_link(str(message.content or ""))
+    return None
+
+
+def _is_lark_unbound_result(state: AgentState) -> bool:
+    """本轮工具失败是否属「飞书未绑定」语义（据此路由到绑定引导而非降级）。
+
+    WHY 以 `tool_result.error.code` 判定而非再扫一遍消息：错误码已经在
+    `_records_from_tool_calls` 里按前缀归一过了（单一判定点），路由只需读结果 ——
+    再扫消息等于把「未绑定识别」实现两遍，改一处忘一处就会路由错。
+    """
+    result = state.get("tool_result")
+    if result is None or result.error is None:
+        return False
+    return result.error.code == TOOL_ERROR_LARK_UNBOUND
 
 
 def build_agent_graph(
@@ -1307,6 +1335,35 @@ def build_agent_graph(
         updates["messages"] = [AIMessage(content=question, id=_new_message_id("a"))]
         return updates
 
+    # —— 飞书绑定引导（v5.1 §6.3）——
+    async def lark_bind_guide(state: AgentState) -> dict[str, Any]:
+        """飞书未绑定的确定性引导节点：**不经 LLM**，直接下发绑定话术。
+
+        WHY 独立节点而非复用 `clarify`：`clarify` 用 LLM 生成追问（措辞可变、可能失败），
+        而「你还没绑定飞书」需要**确定性**、可复现、且必须带上绑定入口；
+        把部署/授权状态交给模型措辞既可能答偏，也会把明确的产品动作说模糊。
+
+        走「澄清原语」语义（§6.3）：`finished_reason=needs_clarification`
+        —— 这不是失败，而是需要用户先完成一个动作。**绝不能**走 `fallback_chat`
+        （把「你没绑定」说成「我答不上来」是错误降级）。
+
+        绑定入口链接从 ToolMessage 中提取：服务侧在未绑定消息尾部拼了
+        `绑定入口：<url>`（若有进行中的授权流程）。
+        """
+        updates = set_status(Status.CLARIFYING, message="正在准备绑定引导")
+        link = _binding_link_from_messages(state.get("messages") or [])
+        text = LARK_UNBOUND_GUIDE
+        if link:
+            text = f"{text}\n绑定入口：{link}"
+        question = text.strip()
+        updates["clarification"] = Clarification(question=question)
+        updates["final_answer"] = question
+        updates["finished_reason"] = FINISHED_REASON_NEEDS_CLARIFICATION
+        # WHY 不置 clarify_asked：绑定引导与「澄清追问次数」是两套语义，
+        # 占用该标志会让后续真实澄清被误判为「已追问过」而跳过。
+        updates["messages"] = [AIMessage(content=question, id=_new_message_id("a"))]
+        return updates
+
     # —— 回答生成与降级 ——
     async def fallback_chat(state: AgentState, *, writer: StreamWriter) -> dict[str, Any]:
         # 降级路径也发 SPEAKING，保证前端能感知「即将出话」。
@@ -1420,10 +1477,14 @@ def build_agent_graph(
     def _plan_failure_target(state: AgentState) -> str:
         """plan 模式下「单步失败」（工具或 LLM）的统一出口（§3.4 失败语义）。
 
+        - 飞书未绑定 → **确定性绑定引导**（§6.3；先于重规划，因为重规划也解决不了
+          「用户没授权」这个事实，只会白烧一轮预算）；
         - 未重规划过 → 重规划补救；
         - 已重规划过且已有 ≥1 步成功产出（plan_steps_done 跨计划累计）→ 部分成功整合；
         - 已重规划过且 0 步成功 → 确定性降级 fallback。
         """
+        if _is_lark_unbound_result(state):
+            return NODE_LARK_BIND_GUIDE
         if not state.get("replanned"):
             return NODE_REPLAN_TASK
         if (state.get("plan_steps_done") or 0) >= 1:
@@ -1492,10 +1553,17 @@ def build_agent_graph(
         return NODE_PLAN_STEP_ADVANCE
 
     def route_after_tool(state: AgentState) -> str:
-        # 本轮任一 ToolMessage 失败（tool_result.ok=False）→ fallback_chat 确定性降级；
+        # 本轮失败 → 未绑定走确定性绑定引导（§6.3，澄清原语语义）；
+        # 其余失败走既有语义：ReAct 侧 fallback_chat 降级、plan 侧重规划/部分成功/降级。
         # 成功且达迭代上限 → generate_answer 收尾；否则回 call_model 继续工具循环。
         result = state.get("tool_result")
         plan = state.get("plan")
+        if result is None or not result.ok:
+            # WHY 未绑定判定放在最前（含 plan 模式）：它既不是参数问题（澄清无用），
+            # 也不是可重规划的问题（重规划解决不了「用户没授权」）——唯一正确的
+            # 出口是让用户先完成绑定动作。
+            if _is_lark_unbound_result(state):
+                return NODE_LARK_BIND_GUIDE
         if plan is None:
             # 既有三分支（v3.0 零回归：plan 为空时行为完全一致）+ 触发源②（v4.0）：
             # 参数缺失（missing_argument）且本轮未追问过 → 澄清追问而非降级（§4.1/§4.3）。
@@ -1547,6 +1615,8 @@ def build_agent_graph(
     builder.add_node(NODE_JOIN_SUBAGENTS, join_subagents)
     # 澄清式追问节点（v4.0 T2）。
     builder.add_node(NODE_CLARIFY, clarify)
+    # 飞书绑定引导节点（v5.1 §6.3）：未绑定的确定性出口（不经 LLM）。
+    builder.add_node(NODE_LARK_BIND_GUIDE, lark_bind_guide)
 
     builder.set_entry_point(NODE_LOAD_CONTEXT)
     builder.add_edge(NODE_LOAD_CONTEXT, NODE_TRIM_HISTORY)
@@ -1583,6 +1653,7 @@ def build_agent_graph(
             NODE_REPLAN_TASK: NODE_REPLAN_TASK,
             NODE_PLAN_STEP_ADVANCE: NODE_PLAN_STEP_ADVANCE,
             NODE_CLARIFY: NODE_CLARIFY,
+            NODE_LARK_BIND_GUIDE: NODE_LARK_BIND_GUIDE,
         },
     )
     # 规划/重规划/推进共用 route_plan_step（规划失败回退 ReAct；就绪批 ≥2 扇出并行）。
@@ -1609,6 +1680,7 @@ def build_agent_graph(
             NODE_GENERATE_ANSWER: NODE_GENERATE_ANSWER,
             NODE_REPLAN_TASK: NODE_REPLAN_TASK,
             NODE_FALLBACK_CHAT: NODE_FALLBACK_CHAT,
+            NODE_LARK_BIND_GUIDE: NODE_LARK_BIND_GUIDE,
         },
     )
     builder.add_conditional_edges(
@@ -1620,10 +1692,13 @@ def build_agent_graph(
             NODE_REPLAN_TASK: NODE_REPLAN_TASK,
             NODE_FALLBACK_CHAT: NODE_FALLBACK_CHAT,
             NODE_GENERATE_ANSWER: NODE_GENERATE_ANSWER,
+            NODE_LARK_BIND_GUIDE: NODE_LARK_BIND_GUIDE,
         },
     )
     builder.add_edge(NODE_GENERATE_ANSWER, NODE_VALIDATE_OUTPUT)
     builder.add_edge(NODE_FALLBACK_CHAT, NODE_VALIDATE_OUTPUT)
+    # 绑定引导出口：确定性话术直接进输出校验（不经 LLM，也不必回工具循环）。
+    builder.add_edge(NODE_LARK_BIND_GUIDE, NODE_VALIDATE_OUTPUT)
     # 澄清出口：成功 → 正常下发；失败 → fallback_chat 确定性兜底（§4.2）。
     builder.add_conditional_edges(
         NODE_CLARIFY,

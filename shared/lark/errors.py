@@ -25,6 +25,10 @@ LARK_UNBOUND_GUIDE = (
 # WHY 用常量：该文案会同时出现在日志与工具错误里，集中声明保证口径一致、可被测试断言。
 BINDING_DISABLED_REASON = "飞书绑定功能未启用（服务端未配置 lark_token_key，已按 fail-closed 关闭）"
 
+# 绑定入口链接在未绑定消息中的**标签**：产出方（服务侧拼消息）与消费方（图侧提取
+# 链接拼进引导话术）共用同一常量 —— 两侧各写一份字面量必然漂移（提取静默失败）。
+LARK_UNBOUND_LINK_LABEL = "绑定入口："
+
 
 class LarkCliError(RuntimeError):
     """lark-cli 调用失败（非零退出 / 输出解析失败 / 超时 / ok=false）。
@@ -78,17 +82,34 @@ def unbound_message(detail: str, verification_uri_complete: str | None = None) -
     """
     text = f"{LARK_UNBOUND_PREFIX}{detail} {LARK_UNBOUND_GUIDE}"
     if verification_uri_complete:
-        text = f"{text} 绑定入口：{verification_uri_complete}"
+        text = f"{text} {LARK_UNBOUND_LINK_LABEL}{verification_uri_complete}"
     return text
+
+
+def extract_binding_link(text: str) -> str | None:
+    """从工具消息里提取绑定入口链接；没有则 None。
+
+    与 `unbound_message` 用同一标签常量配对，避免「产出用 A 标签、提取找 B 标签」
+    导致引导话术静默丢链接（用户拿不到入口就等于引导失败）。
+    只取标签后到空白/换行前的一段，避免把后续文字当成 URL。
+    """
+    marker = text.find(LARK_UNBOUND_LINK_LABEL)
+    if marker < 0:
+        return None
+    tail = text[marker + len(LARK_UNBOUND_LINK_LABEL) :]
+    link = tail.split(maxsplit=1)[0].strip() if tail.strip() else ""
+    return link or None
 
 
 __all__ = [
     "BINDING_DISABLED_REASON",
     "LARK_UNBOUND_GUIDE",
+    "LARK_UNBOUND_LINK_LABEL",
     "LARK_UNBOUND_PREFIX",
     "TOOL_ERROR_LARK_UNBOUND",
     "LarkBoundError",
     "LarkCliError",
     "LarkUnboundError",
+    "extract_binding_link",
     "unbound_message",
 ]
