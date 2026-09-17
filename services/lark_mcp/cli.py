@@ -29,7 +29,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from services.lark_mcp.models import LarkCliCredentials
 from shared.lark.errors import LarkCliError, LarkUnboundError
@@ -74,18 +74,6 @@ ENV_DEFAULT_AS = "LARKSUITE_CLI_DEFAULT_AS"
 # CLI 侧身份策略（§4.4）：只允许 user 身份、默认 user —— 部署期固化，随容器重建保持。
 STRICT_MODE_USER = "user"
 DEFAULT_AS_USER = "user"
-
-
-class LarkCredentialProvider(Protocol):
-    """作用域 → 凭据的解析契约（服务侧可注入实现；测试注入 fake）。
-
-    实现负责：按 `scope`（调用方 `user_id`）查绑定、必要时刷新并落库；
-    未绑定 / 刷新失败一律抛 `LarkUnboundError`（§6.3 最小阻断判据）。
-    """
-
-    async def resolve(self, scope: str) -> LarkCliCredentials:
-        """解析该作用域的可用凭据；未绑定 → `LarkUnboundError`。"""
-        ...
 
 
 def _get_repo_root() -> Path:
@@ -270,7 +258,6 @@ __all__ = [
     "STRICT_MODE_USER",
     "LarkCliError",
     "LarkCliRunner",
-    "LarkCredentialProvider",
     "LarkUnboundError",
     "build_lark_cli_env",
     "resolve_lark_cli_command",
