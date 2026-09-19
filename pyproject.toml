@@ -5,8 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=50.0.0",
     "fastapi[standard]>=0.140.13",
     "fastmcp>=3.4.5",
+    "httpx>=0.28.1",
     "langchain>=1.3.14",
     "langchain-core>=1.5.3",
     "langchain-mcp-adapters>=0.3.1",
@@ -45,8 +47,18 @@ select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "RUF"]
 extend-ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]
+# 测试用例必然出现假凭据/占位密钥（S105 硬编码口令 / S106 口令关键字参数），
+# 与 S101 同理属测试豁免；真实密钥一律经 SecretStr 注入，不落测试源码。
+"tests/**" = ["S101", "S105", "S106"]
 "scripts/**" = ["S101"]
+# 验收演示脚本（demo_lark_binding）：离线模式需要**公开的假凭据**当打桩值
+# （假 UAT / 演示用 Fernet 派生源 / 假应用密钥），S105/S106 在此为误报；
+# 脚本的真实模式一律从环境读取 LARK_APP_SECRET / LARK_TOKEN_KEY，不硬编码。
+"scripts/demo_lark_binding.py" = ["S105", "S106"]
+# S105 在本文件为误报：飞书 OAuth 端点 path 常量字面量含 "token"（`/oauth/token`）
+# 被判为「硬编码口令」。该值是公开的接口路径、非机密；真实机密只有从配置读取的
+# app_secret / lark_token_key（均经 SecretStr，绝不硬编码）。
+"shared/lark/oauth.py" = ["S105"]
 
 [tool.ruff.format]
 quote-style = "double"

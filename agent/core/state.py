@@ -38,6 +38,8 @@ NODE_EXECUTE_STEP = "execute_step"
 NODE_PLAN_STEP_ADVANCE = "plan_step_advance"
 NODE_REPLAN_TASK = "replan_task"
 NODE_CLARIFY = "clarify"
+# 飞书绑定引导（v5.1 §6.3）：工具返回 `tool_error.lark_unbound` 时的确定性引导出口。
+NODE_LARK_BIND_GUIDE = "lark_bind_guide"
 # 并行子代理（T7）：扇出节点 / 子代理执行节点（Send 多实例并行）/ join 回填节点。
 NODE_DISPATCH_SUBAGENTS = "dispatch_subagents"
 NODE_RUN_SUBAGENT = "run_subagent"

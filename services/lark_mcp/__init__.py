@@ -12,10 +12,10 @@ from services.lark_mcp.cli import (
 )
 from services.lark_mcp.client_config import (
     LARK_MCP_SERVER_MODULE,
-    LARK_MCP_SERVER_NAME,
     build_lark_mcp_stdio_connection,
 )
 from services.lark_mcp.server import mcp
+from shared.lark import LARK_MCP_SERVER_NAME
 
 __all__ = [
     "LARK_MCP_SERVER_MODULE",

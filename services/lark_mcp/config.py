@@ -16,7 +16,7 @@ import logging
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -57,6 +57,46 @@ class LarkMCPRuntimeSettings(BaseSettings):
     lark_cli_command: str | None = None  # LARK_CLI_COMMAND 显式覆盖；空则按 PATH 探测
     lark_cli_timeout_s: float = Field(default=30.0, ge=1.0)  # 单次 CLI 调用超时（网络 IO）
     lark_output_max_chars: int = Field(default=10_000, ge=1)  # 工具输出长度上限（护栏）
+
+    # —— 飞书共享应用与绑定链路（v5.1，dev-version5.1.md §9）——
+    # 应用**仅作 OAuth 客户端**（无 bot 身份）：app_id/secret 只用于设备码授权、
+    # 换码与刷新；工具调用恒为 user 身份，身份来自各自绑定的 UAT。
+    lark_app_id: str | None = None
+    lark_app_secret: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    # 令牌加密密钥（Fernet 派生）：未配置 → 绑定功能 fail-closed 关闭，绝不落明文 token。
+    lark_token_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    # 绑定记录 / 设备码待定态所在库（镜像 sessions 表裁决：无 DSN → SQLite memory）。
+    database_url: SecretStr | None = None
+    # 绑定域专用 DSN（**优先于 `database_url`**）。
+    #
+    # WHY 需要独立项：根 `DATABASE_URL` 是**全局裁决**（同时驱动 memory / checkpointer /
+    # sessions），而绑定域的约束与之并不一致 ——
+    #   - api 侧用 `DATABASE_URL` 时必须连 Postgres（langgraph 无 SQLite Store）；
+    #   - 绑定域只需「跨进程稳定」的库，本机无 Postgres 时**文件型 SQLite**即可跑通。
+    # 不拆分则本地联调只能二选一：要么为绑定域单独起 Postgres，要么接受 api 启动失败。
+    # ⚠️ 必须指向**文件型**（`sqlite+aiosqlite:///...`）：绑定域的状态要跨**多次 MCP
+    # 工具调用**共享（每次调用是一个新子进程），`:memory:` 会让待定态在调用间蒸发。
+    lark_database_url: SecretStr | None = None
+    # 认证族域名（默认飞书；Lark 品牌 = accounts.larksuite.com / open.larksuite.com）。
+    lark_accounts_base_url: str = "https://accounts.feishu.cn"
+    lark_open_base_url: str = "https://open.feishu.cn"
+    # 配置态单用户凭据（仅无绑定功能的本地/单机形态使用，见 credentials.py）。
+    lark_user_access_token: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    lark_binding_enabled: bool = True  # 绑定总开关；密钥缺省时仍自动关闭（fail-closed）
+    lark_token_refresh_skew_s: int = Field(default=300, ge=0)  # 提前刷新窗口
+    lark_oauth_timeout_s: float = Field(default=15.0, ge=1.0)  # OAuth HTTP 调用超时
+    lark_device_flow_poll_max_s: float = Field(default=600.0, ge=1.0)  # 设备码轮询总上限
+
+    @property
+    def binding_database_url(self) -> str | None:
+        """绑定域实际使用的 DSN：`LARK_DATABASE_URL` 优先，缺省回退 `DATABASE_URL`。
+
+        WHY 收敛成单点属性而非在装配处写 `or`：DSN 裁决属「存储语义」的一部分
+        （与 §7 的加密 / 乐观锁同级），必须一处声明 —— 消费方（server 装配）只取值，
+        不重复判别，否则后续再加一个 DSN 来源就会漏改调用点。
+        """
+        preferred = self.lark_database_url or self.database_url
+        return preferred.get_secret_value() if preferred else None
 
 
 def build_run_params(settings: LarkMCPRuntimeSettings) -> dict[str, Any]:

@@ -6,9 +6,9 @@ import sys
 
 from services.lark_mcp.client_config import (
     LARK_MCP_SERVER_MODULE,
-    LARK_MCP_SERVER_NAME,
     build_lark_mcp_stdio_connection,
 )
+from shared.lark import LARK_MCP_SERVER_NAME
 
 
 def test_stdio_connection_forces_stdio_transport(monkeypatch) -> None:

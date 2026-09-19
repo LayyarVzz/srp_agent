@@ -3,6 +3,9 @@
 工具一律经 MCP 客户端接入。
 本工厂承载「构造客户端 → get_tools → yield → 结束」生命周期，返回的 `list[BaseTool]`
 供图内 `ToolNode` 统一执行。
+
+v5.1：客户端挂载 `LarkScopeInterceptor`（把图状态 `user_id` 注入 lark 工具实参，
+见 agent/tools/lark_scope.py）；`get_tools()` 后统一剥离 `_lark_scope` 使 LLM 不可见。
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from contextlib import asynccontextmanager
 from langchain_core.tools import BaseTool
 
 from agent.core.config import AgentFrameworkConfig
+from agent.tools.lark_scope import LarkScopeInterceptor
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,11 @@ async def build_tools_from_mcp(
     servers: dict[str, dict],
 ) -> AsyncIterator[list[BaseTool]]:
     """从 MCP 服务装配 LangChain 工具列表。
+
+    返回的工具对象同时承担两个职责：`bind_tools`（模型可见声明）与 `ToolNode`
+    （执行实体）。飞书工具的 `_lark_scope` 需「执行侧可见、模型侧不可见」，
+    故绑定处一律经 `LarkScopeInterceptor` + 图内 `visible_tools()` 分流
+    （见 agent/tools/lark_scope.py），本工厂不做 schema 改写。
 
     超时：仅 streamable_http/sse 连接的 TypedDict 有 `timeout` 字段，注入
     `mcp_timeout_s`；stdio 连接无 timeout。
@@ -47,8 +56,12 @@ async def build_tools_from_mcp(
 
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    # 构造 MCP 多服务客户端
-    client = MultiServerMCPClient(connections=connections, handle_tool_errors=True)
+    # 构造 MCP 多服务客户端；拦截器按 server_name 自行放行非飞书服务（零影响）。
+    client = MultiServerMCPClient(
+        connections=connections,
+        handle_tool_errors=True,
+        tool_interceptors=[LarkScopeInterceptor()],
+    )
     last_exc: Exception | None = None
     tools: list[BaseTool] = []
     for attempt in range(tools_cfg.mcp_max_retries + 1):
