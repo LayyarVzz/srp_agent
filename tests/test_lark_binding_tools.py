@@ -38,6 +38,7 @@ from shared.lark import (
     build_token_cipher,
 )
 from shared.lark.oauth import (
+    DEVICE_CODE_GRANT_TYPE,
     ERR_AUTHORIZATION_PENDING,
     PATH_DEVICE_AUTHORIZATION,
     PATH_TOKEN_ENDPOINT,
@@ -145,6 +146,11 @@ async def test_bind_complete_pending_then_success_persists_encrypted_binding() -
             return httpx.Response(200, json=_device_auth_payload())
         if request.url.path == PATH_TOKEN_ENDPOINT:
             calls["n"] += 1
+            # 换码请求形态回归闸门：必须走设备码模式 grant_type（授权码模式会被飞书
+            # 判 invalid_grant，与真过期同码 → 用户刚扫码就被说成「链接已过期」）。
+            body = json.loads(request.content)
+            assert body["grant_type"] == DEVICE_CODE_GRANT_TYPE
+            assert body["device_code"] == "d" * 100
             if calls["n"] == 1:
                 return httpx.Response(
                     400, json={"code": ERR_AUTHORIZATION_PENDING, "error": "authorization_pending"}
@@ -222,6 +228,54 @@ async def test_bind_complete_expired_device_code_asks_restart() -> None:
         assert "重新发起" in text
         # 过期待定态应被清理，避免用户反复触发同一个失效码。
         assert await repository.peek_device_flow("user-a") is None
+    finally:
+        await repository.aclose()
+
+
+async def test_bind_complete_user_denied_is_not_reported_as_expired() -> None:
+    """用户在授权页拒绝（access_denied）→ 说「取消了授权」，且清理待定态。
+
+    WHY 必须与「过期」分开：把用户的动作说成「链接已失效」会误导用户重试同一个
+    已作废的设备码，且掩盖真实原因。
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == PATH_TOKEN_ENDPOINT:
+            return httpx.Response(
+                400, json={"error": "access_denied", "error_description": "denied by user"}
+            )
+        return httpx.Response(200, json=_device_auth_payload())
+
+    repository = await _install_binding_service(handler)
+    try:
+        await _call_tool("lark_bind_start", {"_lark_scope": "user-a"})
+        text = await _call_tool("lark_bind_complete", {"_lark_scope": "user-a"})
+        assert "取消" in text
+        assert "已失效" not in text
+        # 用户拒绝后同一设备码不可再用 → 待定态清理。
+        assert await repository.peek_device_flow("user-a") is None
+    finally:
+        await repository.aclose()
+
+
+async def test_bind_complete_unrecognized_error_keeps_pending_flow() -> None:
+    """未识别错误 → 工具报错，但**保留**待定态（用户仍能用原链接重试）。
+
+    WHY 这是线上故障的修复点：旧实现把未识别错误当「过期」并删掉待定态，
+    用户手里的有效链接被彻底作废、连重试机会都没有。
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == PATH_TOKEN_ENDPOINT:
+            return httpx.Response(400, json={"code": 20064, "error": "unexpected_error"})
+        return httpx.Response(200, json=_device_auth_payload())
+
+    repository = await _install_binding_service(handler)
+    try:
+        await _call_tool("lark_bind_start", {"_lark_scope": "user-a"})
+        with pytest.raises(Exception, match="未识别错误"):
+            await _call_tool("lark_bind_complete", {"_lark_scope": "user-a"})
+        assert await repository.peek_device_flow("user-a") is not None
     finally:
         await repository.aclose()
 

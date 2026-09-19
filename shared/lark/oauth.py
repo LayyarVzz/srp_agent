@@ -17,9 +17,16 @@ v1 的 `/open-apis/authen/v1/...` 只认 `code`（走不了 device flow）；`ac
 等高危权限）；不传 `offline_access` → 响应**不含 refresh_token**，UAT 2h 后强制重绑。
 故 `LARK_MINIMAL_SCOPES` 显式列出「5 个工具所需 + offline_access」。
 
-**轮询语义**（RFC 8628 + 实测错误码）：`authorization_pending`(20094) 继续、
-`slow_down`(20095) 降频、`expired_token`/`invalid_grant` 需重新发起、成功一次性拿齐
+**轮询语义**（RFC 8628 + 实测错误码）：换码必须用**设备码模式**的 grant_type
+（`urn:ietf:params:oauth:grant-type:device_code` + `device_code=`），响应按协议级
+`error` 字符串分支：`authorization_pending`(20094) 继续、`slow_down`(20095) 降频、
+`access_denied` 用户拒绝、`expired_token`/`invalid_grant` 需重新发起、成功一次性拿齐
 `access_token` + `refresh_token` + `expires_in`。
+
+⚠️ **不要用授权码模式的 `authorization_code` + `code=`**：飞书对**有效且未过期**的
+设备码也返回 `invalid_grant`(20003)（与真过期同码同语义）—— 实测复现：用户刚拿到
+链接、20 秒内完成扫码，仍被判成「链接已过期」。设备码模式的 grant_type 才返回
+`authorization_pending`，这正是「用户还没扫码」的唯一可靠信号。
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ import httpx
 
 from shared.lark.errors import LarkCliError
 from shared.lark.models import (
+    DEVICE_FLOW_DENIED,
     DEVICE_FLOW_DONE,
     DEVICE_FLOW_EXPIRED,
     DEVICE_FLOW_PENDING,
@@ -64,8 +72,18 @@ LARK_MINIMAL_SCOPES: tuple[str, ...] = (
 )
 
 # 实测错误码：授权待定 / 降频（§7 表格）。
+# WHY 只保留这两个数字码：仅它们有实测稳定值；`access_denied` / `expired_token` 等
+# 一律以协议级 `error` 字符串判定（飞书官方 CLI `internal/auth/device_flow.go` 同口径）。
 ERR_AUTHORIZATION_PENDING = 20094
 ERR_SLOW_DOWN = 20095
+
+# —— 设备码换码的协议常量（RFC 8628；飞书官方 CLI 实测同值）——
+DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+ERR_STR_AUTHORIZATION_PENDING = "authorization_pending"
+ERR_STR_SLOW_DOWN = "slow_down"
+ERR_STR_ACCESS_DENIED = "access_denied"
+# expired_token（RFC 标准值）+ invalid_grant（飞书同义返回）。
+ERR_STR_EXPIRED: tuple[str, ...] = ("expired_token", "invalid_grant")
 
 # 轮询间隔的上下界（响应 interval 实测默认 5s；slow_down 后按 RFC 8628 每次 +5s）。
 _DEFAULT_INTERVAL_S = 5.0
@@ -159,33 +177,46 @@ class LarkOAuthClient:
     # —— 换码 / 刷新 ——
 
     async def exchange_device_code(self, flow: LarkDeviceFlow) -> tuple[str, LarkTokenSet] | None:
-        """轮询一次换码。
+        """轮询一次换码（设备码模式）。
 
-        返回 `(处置码, 令牌集合)`：处置码为 `done`/`pending`/`slow_down`/`expired`
-        （集中常量，见 `shared.lark.models`）；`done` 时令牌集合非空，其余为 None。
+        返回 `(处置码, 令牌集合)`：处置码为
+        `done`/`pending`/`slow_down`/`denied`/`expired`（集中常量，见 `shared.lark.models`）；
+        `done` 时令牌集合非空，其余为 None。
 
         WHY 返回处置码而非抛错：轮询是**正常控制流**（用户还没点授权），
-        以异常表达会让调用方靠 except 做流程分支，且掩盖真正的失败。
+        以异常表达会让调用方靠 except 做流程分支，且掩盖真正的失败；
+        而**未识别错误**属真失败 —— 抛 `LarkCliError` 让调用方明确感知，
+        绝不降级成「过期」（那会既谎报原因，又诱导调用方丢弃待定态、断掉重试路径）。
+
+        请求体用 `DEVICE_CODE_GRANT_TYPE` + `device_code`（实测固化，见模块 docstring）。
         """
         data = await self._post(
             f"{self._open_base}{PATH_TOKEN_ENDPOINT}",
             {
-                "grant_type": "authorization_code",
+                "grant_type": DEVICE_CODE_GRANT_TYPE,
                 "client_id": self._app_id,
                 "client_secret": self._app_secret,
-                "code": flow.device_code,
+                "device_code": flow.device_code,
             },
             allow_error_body=True,
         )
+        error = _error_string(data)
         code = _error_code(data)
-        if code in (ERR_AUTHORIZATION_PENDING,):
+        if error == ERR_STR_AUTHORIZATION_PENDING or code == ERR_AUTHORIZATION_PENDING:
             return DEVICE_FLOW_PENDING, None
-        if code in (ERR_SLOW_DOWN,):
+        if error == ERR_STR_SLOW_DOWN or code == ERR_SLOW_DOWN:
             return DEVICE_FLOW_SLOW_DOWN, None
-        if code is not None:
-            # expired_token / invalid_grant 等 → 必须重新发起（§7）。
-            logger.info("飞书设备码换码未成功（code=%s），需重新发起绑定", code)
+        if error == ERR_STR_ACCESS_DENIED:
+            logger.info("飞书设备码授权被用户拒绝，需重新发起绑定")
+            return DEVICE_FLOW_DENIED, None
+        if error in ERR_STR_EXPIRED:
+            logger.info("飞书设备码已失效（error=%s），需重新发起绑定", error)
             return DEVICE_FLOW_EXPIRED, None
+        if error or code is not None:
+            # 未识别错误：不确定语义时不得猜「过期」（旧实现即栽在这里：把 payload
+            # 错误导致的 invalid_grant 一律说成过期，并删掉待定态）。
+            logger.warning("飞书设备码换码返回未识别错误（error=%s code=%s）", error, code)
+            raise LarkCliError(f"飞书设备码换码失败（未识别错误：error={error or code}）")
         return DEVICE_FLOW_DONE, _token_set(data)
 
     async def refresh(self, refresh_token: str) -> LarkTokenSet:
@@ -299,24 +330,28 @@ class LarkOAuthClient:
         return min(current_s + _SLOW_DOWN_STEP_S, _MAX_INTERVAL_S)
 
 
-def _error_code(data: dict[str, Any]) -> int | None:
-    """提取业务错误码；无错误返回 None。
+def _error_string(data: dict[str, Any]) -> str:
+    """提取协议级 `error` 字符串（RFC 8628 标准字段）；无则空串。
 
-    v2 token 端点成功时无 `code`；失败时为 `{"code": 20094, "error": "...", ...}`。
-    兼容 `error` 字符串形态（RFC 8628 标准字段）。
+    WHY 与数字码并存：数字码只在 `authorization_pending`/`slow_down` 上有实测稳定值，
+    `access_denied`/`expired_token` 等语义只能靠 `error` 串可靠区分。
+    """
+    raw = data.get("error")
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+def _error_code(data: dict[str, Any]) -> int | None:
+    """提取业务**数字**错误码；无错误返回 None。
+
+    WHY 删除旧实现的 `error` 字符串映射：`mapping.get(串)` 对未知串返回 None，
+    会被上层误读成「响应无错误」→ 去解析令牌 → 报出「缺少 access_token」这种
+    与真因无关的错误。字符串语义统一由 `_error_string` 表达。
     """
     raw = data.get("code")
     if isinstance(raw, int) and raw != 0:
         return raw
     if isinstance(raw, str) and raw.isdigit() and int(raw) != 0:
         return int(raw)
-    if isinstance(data.get("error"), str) and data["error"]:
-        # 标准形态 `{"error":"authorization_pending"}` → 映射到实测数字码口径。
-        mapping = {
-            "authorization_pending": ERR_AUTHORIZATION_PENDING,
-            "slow_down": ERR_SLOW_DOWN,
-        }
-        return mapping.get(str(data["error"]))
     return None
 
 
@@ -370,8 +405,13 @@ def _query_value(url: str, key: str) -> str:
 
 
 __all__ = [
+    "DEVICE_CODE_GRANT_TYPE",
     "ERR_AUTHORIZATION_PENDING",
     "ERR_SLOW_DOWN",
+    "ERR_STR_ACCESS_DENIED",
+    "ERR_STR_AUTHORIZATION_PENDING",
+    "ERR_STR_EXPIRED",
+    "ERR_STR_SLOW_DOWN",
     "LARK_MINIMAL_SCOPES",
     "PATH_DEVICE_AUTHORIZATION",
     "PATH_DEVICE_VERIFY",

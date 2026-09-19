@@ -30,6 +30,9 @@ BINDING_STATUS_INVALID = "invalid"
 DEVICE_FLOW_PENDING = "pending"  # authorization_pending(20094)：继续轮询
 DEVICE_FLOW_SLOW_DOWN = "slow_down"  # slow_down(20095)：降频后继续
 DEVICE_FLOW_EXPIRED = "expired"  # expired_token/invalid_grant：需重新发起
+# 用户在授权页主动拒绝（access_denied）：与「过期」区分 —— 话术不同（不是链接失效，
+# 是用户没同意），但处置一致（都需重新发起）。
+DEVICE_FLOW_DENIED = "denied"
 DEVICE_FLOW_DONE = "done"  # 成功换码
 
 # 实测设备码寿命 600s（§7：`expires_in` 实测 600s = 10 分钟）。
@@ -109,6 +112,7 @@ class LarkUserInfo(BaseModel):
 __all__ = [
     "BINDING_STATUS_ACTIVE",
     "BINDING_STATUS_INVALID",
+    "DEVICE_FLOW_DENIED",
     "DEVICE_FLOW_DONE",
     "DEVICE_FLOW_EXPIRED",
     "DEVICE_FLOW_PENDING",

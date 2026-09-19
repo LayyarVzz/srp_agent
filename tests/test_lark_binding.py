@@ -4,6 +4,9 @@
 
 覆盖 dev-version5.1.md 的关键验收点：
 - **V51-M3**：设备码闭环（发起 → pending → slow_down → 成功换码）；
+- **换码请求形态（实测回归闸门）**：必须走设备码模式 grant_type（用授权码模式时
+  飞书对有效设备码也返回 invalid_grant，会被误判成「链接已过期」）；未识别错误抛错
+  而非谎报过期；`access_denied` 与「过期」必须区分；
 - **§7 最小 scope**：必须显式声明且含 `offline_access`（否则无 refresh_token）；
 - **§4.3 端点**：认证族 `accounts.*` 发起、业务族 `open.*` 换码/刷新（域名不可混用）；
 - **§7 并发刷新六步**：乐观锁抢更新 / 竞态重读 / `invalid_grant` 两种含义的区分；
@@ -35,12 +38,14 @@ from shared.lark import (
     build_token_cipher,
 )
 from shared.lark.models import (
+    DEVICE_FLOW_DENIED,
     DEVICE_FLOW_DONE,
     DEVICE_FLOW_EXPIRED,
     DEVICE_FLOW_PENDING,
     DEVICE_FLOW_SLOW_DOWN,
 )
 from shared.lark.oauth import (
+    DEVICE_CODE_GRANT_TYPE,
     ERR_AUTHORIZATION_PENDING,
     ERR_SLOW_DOWN,
     PATH_DEVICE_AUTHORIZATION,
@@ -67,6 +72,22 @@ def _client(handler: Any) -> LarkOAuthClient:
 
 def _json_response(payload: dict[str, Any], status: int = 200) -> httpx.Response:
     return httpx.Response(status, json=payload)
+
+
+def _flow(device_code: str = "d" * 100) -> LarkDeviceFlow:
+    """构造待定态（换码协议断言用；有效期给足，避免本地 TTL 干扰）。"""
+    now = datetime.now(UTC)
+    return LarkDeviceFlow(
+        user_id="user-a",
+        device_code=device_code,
+        user_code="KR2E-FZQP",
+        verification_uri="https://accounts.feishu.cn/oauth/v1/device/verify",
+        verification_uri_complete="https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=f",
+        flow_id="f",
+        expires_at=now + timedelta(seconds=600),
+        interval_s=5.0,
+        created_at=now,
+    )
 
 
 # —— 设备码发起 ——
@@ -167,14 +188,22 @@ async def test_start_device_flow_reads_flow_id_from_verify_url() -> None:
 
 
 async def test_exchange_pending_then_slow_down_then_success() -> None:
-    """换码状态机：authorization_pending → slow_down → 成功（实测错误码 20094/20095）。"""
+    """换码状态机：authorization_pending → slow_down → 成功（实测错误码 20094/20095）。
+
+    **同时钉死请求形态（回归闸门）**：换码必须走设备码模式的 grant_type。实测反例：
+    用授权码模式的 `authorization_code` + `code` 时，飞书对**有效未过期**的设备码
+    也返回 `invalid_grant`(20003) —— 与真过期同码，导致「用户刚拿到链接就被告知
+    链接已过期」，且待定态被删、无法重试。线上即由此复现。
+    """
     calls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == PATH_TOKEN_ENDPOINT
         body = json.loads(request.content)
-        assert body["grant_type"] == "authorization_code"
-        calls.append(body["code"])
+        assert body["grant_type"] == DEVICE_CODE_GRANT_TYPE
+        assert body["device_code"] == "d" * 100
+        assert "code" not in body  # 授权码模式的参数名不得出现
+        calls.append(body["device_code"])
         if len(calls) == 1:
             return _json_response(
                 {"code": ERR_AUTHORIZATION_PENDING, "error": "authorization_pending"}
@@ -236,6 +265,48 @@ async def test_exchange_expired_or_invalid_grant_requires_restart() -> None:
     state, tokens = await _client(handler).exchange_device_code(flow)
     assert state == DEVICE_FLOW_EXPIRED
     assert tokens is None
+
+
+async def test_exchange_pending_recognized_from_error_string_alone() -> None:
+    """仅有 `error` 字符串（无数字码）的 pending 也必须识别。
+
+    WHY：`error` 是 RFC 8628 的协议级字段，数字码只是飞书的附带信息；
+    旧实现把「未知字符串 → None」当「无错误」，会让纯字符串形态误入令牌解析路径。
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"error": "authorization_pending"}, status=400)
+
+    state, tokens = await _client(handler).exchange_device_code(_flow())
+    assert (state, tokens) == (DEVICE_FLOW_PENDING, None)
+
+
+async def test_exchange_access_denied_is_distinct_from_expired() -> None:
+    """用户拒绝（access_denied）→ DENIED：不得说成「链接已过期」（把用户动作说成系统故障）。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(
+            {"error": "access_denied", "error_description": "Authorization denied by user"},
+            status=400,
+        )
+
+    state, tokens = await _client(handler).exchange_device_code(_flow())
+    assert (state, tokens) == (DEVICE_FLOW_DENIED, None)
+
+
+async def test_exchange_unrecognized_error_raises_instead_of_faking_expiry() -> None:
+    """未识别错误 → `LarkCliError`，**绝不**降级成「过期」。
+
+    WHY 关键：谎报过期会诱导调用方 `drop_device_flow`（待定态被删 → 用户手里的链接
+    彻底作废、连重试都没机会）。线上故障正是「payload 错误 → invalid_grant → 被说成
+    过期 → 待定态被删」这条链。
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"code": 20064, "error": "unexpected_error"}, status=400)
+
+    with pytest.raises(LarkCliError, match="未识别错误"):
+        await _client(handler).exchange_device_code(_flow())
 
 
 async def test_refresh_requires_rotated_refresh_token() -> None:

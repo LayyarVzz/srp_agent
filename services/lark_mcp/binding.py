@@ -31,6 +31,7 @@ from shared.lark.errors import (
     LarkCliError,
 )
 from shared.lark.models import (
+    DEVICE_FLOW_DENIED,
     DEVICE_FLOW_EXPIRED,
     DEVICE_FLOW_PENDING,
     DEVICE_FLOW_SLOW_DOWN,
@@ -47,6 +48,11 @@ _PENDING_HINT = (
     "然后告诉我「我已完成授权」，我会继续完成绑定。"
 )
 _EXPIRED_HINT = "授权链接已失效（有效期为 10 分钟），请重新发起绑定：对我说「帮我绑定飞书」。"
+# 用户主动拒绝（access_denied）：不是链接失效，话术必须区分（否则等于把用户的动作说成系统故障）。
+_DENIED_HINT = (
+    "你在授权页取消了授权（或未确认），本次绑定未完成。"
+    "需要时对我说「帮我绑定飞书」，我会重新生成授权链接。"
+)
 
 
 class LarkBindingService:
@@ -96,7 +102,13 @@ class LarkBindingService:
                 # 降频：实测按 client 维度限频，故每用户独立退避；对用户仍表现为「待授权」。
                 logger.info("飞书设备码轮询触发 slow_down user=%s，本次间隔上调", user_id)
             return _PENDING_HINT
+        if state == DEVICE_FLOW_DENIED:
+            # 用户拒绝 ≠ 过期：待定态同样作废（同一设备码不能再换码），但话术不同。
+            await self._repository.drop_device_flow(user_id=user_id)
+            return _DENIED_HINT
         if state == DEVICE_FLOW_EXPIRED or tokens is None:
+            # 仅在**确认过期**时丢弃待定态；未识别错误由 exchange 抛 LarkCliError 上抛
+            # （不在此处吞成「过期」），保证用户仍可用原链接重试（见 oauth.exchange_device_code）。
             await self._repository.drop_device_flow(user_id=user_id)
             return _EXPIRED_HINT
 
