@@ -4,6 +4,7 @@ from agent.intent.classifiers import (
     LLMIntentClassifier,
     RuleFallbackClassifier,
     render_intent_context,
+    render_intent_context_block,
 )
 from agent.intent.models import Intent, IntentClassifier, IntentContext, IntentResult
 
@@ -15,4 +16,5 @@ __all__ = [
     "LLMIntentClassifier",
     "RuleFallbackClassifier",
     "render_intent_context",
+    "render_intent_context_block",
 ]

@@ -138,6 +138,18 @@ def render_intent_context(
     return body
 
 
+def render_intent_context_block(
+    messages: Sequence[BaseMessage],
+    context: IntentContext | None = None,
+) -> str:
+    """带不可信声明的完整上下文块（块头 + 正文）。
+
+    WHY 单独暴露：澄清追问（agent/core/graph.py 的 clarify 节点）与意图分类必须用
+    **同一份**块头声明——安全声明复制成两份，改一处忘一处就会让另一条 prompt 失去声明。
+    """
+    return f"{_CONTEXT_HEADER}\n{render_intent_context(messages, context)}"
+
+
 class RuleFallbackClassifier:
     """确定性兜底：关键词启发式，无命中默认 CHAT。
 
