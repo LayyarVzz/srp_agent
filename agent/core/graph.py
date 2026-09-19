@@ -56,7 +56,7 @@ from agent.core.state import (
 from agent.core.subagent_graph import build_subagent_graph
 from agent.errors import LLM_ERROR_REQUEST, ErrorRecord, LLMError
 from agent.intent.classifiers import LLMIntentClassifier, RuleFallbackClassifier
-from agent.intent.models import Intent
+from agent.intent.models import Intent, IntentContext
 from agent.llm import LLMService, merge_ai_message_chunks
 from agent.memory import KIND_EPISODE, KIND_FACT, KIND_PREFERENCE, MemoryStore
 from agent.memory.models import MemoryItem
@@ -854,7 +854,19 @@ def build_agent_graph(
     # —— 意图 ——
     async def classify_intent(state: AgentState) -> dict[str, Any]:
         updates = set_status(Status.THINKING, message="正在识别意图")
-        result = await intent_classifier.classify(state.get("messages") or [])
+        # 上下文注入（v5.2）：分类不能只看最后一句——用户对上一轮追问/要求的回应
+        # （「好了」「我已完成授权」，措辞不可控）天然简短且上下文依赖，脱上下文必被
+        # 判模糊而误触发澄清（表现为「助理自己提了要求、用户照做、助理却反问用户想干什么」）。
+        # 摘要/关键信息由上游 trim_history + summarize_history 产出（同在本节点之前）。
+        result = await intent_classifier.classify(
+            state.get("messages") or [],
+            IntentContext(
+                summary=state.get("short_term_summary") or "",
+                keyfacts=[
+                    fact.content for fact in (state.get("session_keyfacts") or []) if fact.active
+                ],
+            ),
+        )
         updates["intent"] = result.intent
         updates["intent_meta"] = result
         logger.info("置信度：%s", result.confidence)
