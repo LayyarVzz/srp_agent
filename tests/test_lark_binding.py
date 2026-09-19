@@ -104,6 +104,11 @@ async def test_start_device_flow_declares_minimal_scope_with_offline_access() ->
     assert seen["host"] == "accounts.feishu.cn"
     assert seen["path"] == PATH_DEVICE_AUTHORIZATION
     assert seen["body"]["client_id"] == APP_ID
+    # 客户端认证必须带 client_secret（实测回归闸门）：只发 client_id 时飞书返回
+    # 400 invalid_client（"The auth method is not supported."，code 20140），
+    # 绑定链路会在第一步就失败 —— 离线 MockTransport 不会复现该失败，
+    # 故必须在此显式钉死「请求体带 secret」，防止后人误删。
+    assert seen["body"]["client_secret"] == APP_SECRET
     # 验证页链接必须带 flow_id（实测：旧形态 /page/cli?user_code= 已作废）。
     assert "flow_id=flow-123" in flow.verification_uri_complete
     assert "user_code=KR2E-FZQP" in flow.verification_uri_complete
@@ -118,6 +123,44 @@ async def test_start_device_flow_rejects_response_without_device_code() -> None:
 
     with pytest.raises(LarkCliError):
         await _client(handler).start_device_flow(user_id="user-a")
+
+
+async def test_start_device_flow_reads_flow_id_from_verify_url() -> None:
+    """真实响应形态回归：`flow_id` **不在顶层**，只嵌在验证链接查询串里。
+
+    实测（`uv run python .testtmp/diag_flow_keys.py`）响应键仅
+    `device_code / user_code / verification_uri / verification_uri_complete /
+    expires_in / interval / message`，且正文提示「原样使用、不得自行重构」。
+    旧实现读 `data["flow_id"]` 恒得空串 —— 若哪天走上自拼接兜底就会生成
+    `?flow_id=&user_code=` 的死链，故必须从链接里解析并钉死。
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(
+            {
+                "device_code": "d" * 100,
+                "user_code": "8ET2-CYZS",
+                "verification_uri": (
+                    "https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=ONmIRtqgaDLK_REAL"
+                ),
+                "verification_uri_complete": (
+                    "https://accounts.feishu.cn/oauth/v1/device/verify"
+                    "?flow_id=ONmIRtqgaDLK_REAL&user_code=8ET2-CYZS"
+                ),
+                "expires_in": 600,
+                "interval": 5,
+                "message": (
+                    "Use verification_uri and verification_uri_complete exactly as returned."
+                ),
+            }
+        )
+
+    flow = await _client(handler).start_device_flow(user_id="user-a")
+    assert flow.flow_id == "ONmIRtqgaDLK_REAL"
+    # 链接必须原样采用（不得重构）。
+    assert flow.verification_uri_complete.startswith(
+        "https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=ONmIRtqgaDLK_REAL"
+    )
 
 
 # —— 换码轮询（状态机）——

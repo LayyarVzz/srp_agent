@@ -19,6 +19,9 @@ v5.1 身份模型（dev-version5.1.md §4/§5/§6）：
 装配（§8.2）：进程启动时按「绑定功能是否可用」组装凭据提供者与绑定服务 ——
 有库 + 有 `lark_token_key` + 有应用凭据 → `BindingCredentialProvider`（多用户隔离）；
 否则退回配置态单用户凭据（本地 demo / 既有 v5.0 用法，零回归）。
+绑定域的建表与连接池生命周期由本模块的 `_binding_lifespan` 承担（启动 `setup()` /
+退出 `aclose()`），DSN 取 `LARK_DATABASE_URL`，缺省回退 `DATABASE_URL`
+（见 config.py 的 `binding_database_url`）。
 
 错误契约：参数校验失败 raise ValueError；未绑定 / 刷新失败 raise
 `LarkUnboundError`（消息带 `tool_error.lark_unbound` 前缀 → 图侧走绑定引导）；
@@ -30,6 +33,8 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastmcp import FastMCP
@@ -78,7 +83,7 @@ def _build_binding_pieces(
     cipher = build_token_cipher(settings.lark_token_key.get_secret_value())
     repository = build_lark_binding_repository(
         cipher,
-        settings.database_url.get_secret_value() if settings.database_url else None,
+        settings.binding_database_url,
         refresh_skew_s=settings.lark_token_refresh_skew_s,
     )
     oauth = LarkOAuthClient(
@@ -110,7 +115,36 @@ binding_service: LarkBindingService | None = (
     else None
 )
 
-mcp = FastMCP("lark-mcp")
+
+@asynccontextmanager
+async def _binding_lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    """服务生命周期：启动建表、退出关连接池（绑定域存储的**唯一**装配点）。
+
+    WHY 必须由本服务承担，且必须在启动期完成：
+    - `lark_bindings` / `lark_device_flows` 两张表的消费方是**本进程**（agent 经 MCP
+      调用过来，不直接持库），故建表只能在此发生 —— 放到 api 侧建是错的：
+      绑定域在无 DSN 时走 `sqlite+aiosqlite:///:memory:`，api 建的库与本子进程的库
+      是两个互不相干的内存库，看着成功、实际无效；
+    - 绑定状态要跨**多次工具调用**共享（`lark_bind_start` 写待定态 → 用户授权 →
+      `lark_bind_complete` 读回），而每次工具调用都是新子进程 → 每进程都必须先建表；
+    - 建表是幂等的（`create_all(checkfirst=True)`），多副本同时启动安全。
+    fail-fast 取舍：建表失败在**进程启动**即暴露（MCP 连接失败 → api 侧既有降级），
+    而非等用户第一次说「帮我绑定飞书」才失败 —— 后者会退化成一次误导性的道歉回答。
+    """
+    if _binding_repository is not None:
+        await _binding_repository.setup()
+        logger.info("飞书绑定域建表完成（幂等）：lark_bindings / lark_device_flows")
+    else:
+        logger.info("飞书绑定域未启用（缺应用凭据或 lark_token_key），跳过建表")
+    try:
+        yield
+    finally:
+        # 关闭连接池：退出时不关会残留 aiosqlite 工作线程 / psycopg 连接。
+        if _binding_repository is not None:
+            await _binding_repository.aclose()
+
+
+mcp = FastMCP("lark-mcp", lifespan=_binding_lifespan)
 
 
 def _serialize(payload: dict[str, Any]) -> str:

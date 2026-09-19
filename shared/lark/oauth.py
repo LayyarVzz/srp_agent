@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -104,28 +105,43 @@ class LarkOAuthClient:
 
         `scope` 显式声明为最小集合（含 `offline_access`）—— 漏了它就没有
         refresh_token，用户每 2 小时需重绑（§7）。
+
+        **客户端认证必带 `client_secret`（实测固化）**：只发 `client_id` 时飞书返回
+        `400 {"error":"invalid_client","error_description":"The auth method is not
+        supported.","code":20140}` —— 即「本应用不允许无密钥的公开客户端认证」。
+        换码/刷新两条路径（`exchange_device_code` / `refresh`）原本就带 secret，唯独
+        本路径漏了，导致绑定链路**在第一步就 400**（详见 `.testtmp/diag_client_auth.py`
+        的四组对照：body 带 secret / Basic 头 / 缺 client_id 的响应各不相同）。
         """
         issued_at = now or datetime.now(UTC)
         payload = {
             "client_id": self._app_id,
+            "client_secret": self._app_secret,
             "scope": " ".join(self._scopes),
         }
         data = await self._post(f"{self._accounts_base}{PATH_DEVICE_AUTHORIZATION}", payload)
         device_code = str(data.get("device_code") or "")
         user_code = str(data.get("user_code") or "")
-        flow_id = str(data.get("flow_id") or "")
         if not device_code or not user_code:
             raise LarkCliError("飞书设备码响应缺少 device_code/user_code，无法发起绑定")
-        verification_uri = str(
-            data.get("verification_uri") or f"{self._accounts_base}{PATH_DEVICE_VERIFY}"
+        # 验证链接**原样采用**飞书返回值：实测响应正文带明确提示
+        # 「Use verification_uri and verification_uri_complete exactly as returned.
+        #   Do not modify, reconstruct, ...」——自行拼接即越界。
+        verification_uri = str(data.get("verification_uri") or "")
+        complete = str(data.get("verification_uri_complete") or "")
+        # flow_id **不是顶层字段**（实测响应键只有 device_code / user_code /
+        # verification_uri / verification_uri_complete / expires_in / interval / message），
+        # 它嵌在验证链接的查询串里（`?flow_id=...`）。旧实现读 `data["flow_id"]` 恒得空串，
+        # 只因为 complete 链接一直存在才没暴露；一旦走上自拼接兜底，就会生成
+        # `?flow_id=&user_code=` 的死链（用户打开是空验证页）。
+        flow_id = str(data.get("flow_id") or "") or _query_value(
+            complete or verification_uri, "flow_id"
         )
-        # WHY 自行拼 verification_uri_complete：实测验证页**必须带 flow_id**
-        # （旧形态 /page/cli?user_code= 已作废）；响应里的 verification_uri 不含
-        # 查询串，直接给用户会打开一个空验证页。
-        complete = (
-            str(data.get("verification_uri_complete") or "")
-            or f"{verification_uri}?flow_id={flow_id}&user_code={user_code}"
-        )
+        if not complete:
+            # 兜底：飞书未给 complete 链接时，用 verification_uri + flow_id/user_code 拼接
+            # （实测验证页**必须带 flow_id**，旧形态 /page/cli?user_code= 已作废）。
+            base = verification_uri or f"{self._accounts_base}{PATH_DEVICE_VERIFY}"
+            complete = f"{base}?flow_id={flow_id}&user_code={user_code}"
         expires_in = int(data.get("expires_in") or 600)  # 实测 600s
         interval = float(data.get("interval") or _DEFAULT_INTERVAL_S)  # 实测默认 5s
         return LarkDeviceFlow(
@@ -337,6 +353,20 @@ def _optional_str(value: Any) -> str | None:
 def _safe_path(url: str) -> str:
     """只保留 path 供日志/异常使用（不带查询串，避免泄露参数）。"""
     return url.split("?", 1)[0].split("://", 1)[-1]
+
+
+def _query_value(url: str, key: str) -> str:
+    """取 URL 查询串里某个参数（缺失/畸形一律返回空串）。
+
+    WHY 需要它：飞书设备码响应把 `flow_id` **只放在验证链接的查询串里**，
+    不进顶层字段（实测）。用 `parse_qs` 而非手工 split，避免把 URL 里的其他
+    参数（`user_code` 等）或路径片段误当值；解析失败按缺省处理，由调用方决定兜底。
+    """
+    try:
+        values = parse_qs(urlparse(url).query).get(key) or []
+    except ValueError:  # 畸形 URL（urlparse 极少抛错，防御性保留）
+        return ""
+    return values[0] if values else ""
 
 
 __all__ = [
