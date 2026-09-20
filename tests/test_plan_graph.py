@@ -31,22 +31,26 @@ from agent.response.status import Status
 from tests.conftest import (
     RecordingFakeChatModel,
     StructuredFakeChatModel,
-    chat_turn_messages,
     fake_structured_message,
     fake_text_message,
     make_fake_tool,
+    understand_message,
 )
 
 
 def _plan_run_messages(plan_msgs: list[AIMessage], final_reply: str) -> list[AIMessage]:
-    """PLAN 轮 LLM 消息序列：意图(PLAN) + 规划/执行消息（按真实执行顺序）+ 整合回答。
+    """PLAN 轮 LLM 消息序列：意图(PLAN) + 查询理解 + 规划/执行消息（按真实执行顺序）+ 整合回答。
 
     `plan_msgs` 由调用方显式按序给出：PlanResult（plan_task 消费）、每步 execute_step
     的 AIMessage（工具步=带 tool_calls / 变换步=纯文本）、重规划 PlanResult
     （replan_task 消费，插在失败步消息之后）……与 fake 逐条消费契约一一对应。
+
+    v6.0 T2：意图分类之后新增 `understand_query` 节点，本 helper 的输入均为多字复合任务
+    （必然过门控）→ 每次 LLM 调用多消费一条查询理解消息，插在意图消息之后。
     """
     return [
         fake_structured_message(IntentResult(intent=Intent.PLAN, confidence=0.95, reason="test")),
+        understand_message(),
         *plan_msgs,
         fake_text_message(final_reply),
     ]
@@ -135,8 +139,8 @@ async def test_plan_execute_step_prompt_contains_plan_block(make_llm_service, ru
     _, _ = await run_graph(graph, text="查时间并翻译")
 
     prompts = service.chat_model.prompts
-    # 规划调用（prompts[1]）之后是 execute_step 的调用：含计划块与当前步指令。
-    step_text = "".join(str(getattr(m, "content", "")) for m in prompts[2])
+    # 调用序：0=意图分类、1=查询理解（v6.0 T2）、2=规划（plan_task）、3=execute_step。
+    step_text = "".join(str(getattr(m, "content", "")) for m in prompts[3])
     assert _PLAN_BLOCK_HEADER in step_text
     assert "1/2 [执行中/未完成]" in step_text
     assert "2/2 [待执行]" in step_text
@@ -245,6 +249,7 @@ async def test_invalid_plan_falls_back_to_react(build_graph, run_graph) -> None:
             fake_structured_message(
                 IntentResult(intent=Intent.PLAN, confidence=0.95, reason="test")
             ),
+            understand_message(),  # v6.0 T2：查询理解（门控通过）
             fake_structured_message(bad_plan),  # 校验失败 → 回退
             _tool_call_msg("calc", "c1"),
             fake_text_message("ReAct 回答"),
@@ -269,6 +274,7 @@ async def test_plan_disabled_falls_back_to_react(build_graph, run_graph) -> None
             fake_structured_message(
                 IntentResult(intent=Intent.PLAN, confidence=0.95, reason="test")
             ),
+            understand_message(),  # v6.0 T2：查询理解（门控通过）
             _tool_call_msg("calc", "c1"),
             fake_text_message("ReAct 回答"),
         ],
@@ -305,14 +311,19 @@ async def test_plan_tool_budget_leads_to_partial(build_graph, run_graph) -> None
 
 
 class _RaiseAtCallModel(StructuredFakeChatModel):
-    """第 raise_at 次 LLM 调用抛 RuntimeError（模拟 execute_step 的 LLM 失败）。
+    """第 raise_at（1-based）次 LLM 调用抛 RuntimeError（模拟 execute_step 的 LLM 失败）。
 
     计数在 super()._generate 消费消息之后自增再抛，保证被抛的那条消息已从
     迭代器消费、后续调用能取到下一条（replan 的 PlanResult）。
+
+    WHY 计数用 `list` 字段而非 `int` 字段：`bind_tools` 为每次结构化调用返回**浅拷贝**
+    （见 tests/conftest.StructuredFakeChatModel），标量字段的更新会留在那个临时拷贝上、
+    不回流到本体，下一次调用仍从初始值开始（表现为恒为「第 1 次调用」）。可变字段与
+    `prompts` 同理跨拷贝共享，故计数在整轮内真实累加。
     """
 
-    raise_at: int = 2  # 0=classify, 1=plan_task, 2=execute_step
-    calls: int = Field(default=0, exclude=True)
+    raise_at: int = 4  # 1=意图分类, 2=查询理解(T2), 3=plan_task, 4=execute_step（目标）
+    calls: list[int] = Field(default_factory=list, exclude=True)
 
     def _generate(
         self,
@@ -322,8 +333,8 @@ class _RaiseAtCallModel(StructuredFakeChatModel):
         **kwargs: Any,
     ) -> Any:
         result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        self.calls += 1
-        if self.calls - 1 == self.raise_at:
+        self.calls.append(1)
+        if len(self.calls) == self.raise_at:
             raise RuntimeError("injected step failure")
         return result
 
@@ -337,6 +348,7 @@ async def test_execute_step_llm_error_triggers_replan(make_llm_service, run_grap
             fake_structured_message(
                 IntentResult(intent=Intent.PLAN, confidence=0.95, reason="test")
             ),
+            understand_message(),  # v6.0 T2：查询理解（门控通过）
             fake_structured_message(plan),
             _tool_call_msg("fetch", "f1"),  # 被 execute_step 消费后抛错
             fake_structured_message(new_plan),  # replan_task 消费
@@ -358,16 +370,22 @@ async def test_plan_state_reset_across_turns(build_graph, run_graph) -> None:
     """跨轮重置：PLAN 轮结束保留 plan 状态，下一轮 CHAT 的 load_context 全部清空。"""
     plan = PlanResult(summary="单步", steps=[PlanStep(goal="总结", tool=None)])
     calc = make_fake_tool("x", content="ok")
-    # 两轮消息一次性提供：第 1 轮 PLAN（4 条：意图/规划/变换步/整合），第 2 轮 CHAT（2 条）。
+    # 两轮消息一次性提供：第 1 轮 PLAN（5 条：意图/查询理解/规划/变换步/整合），
+    # 第 2 轮 CHAT（3 条：意图/查询理解/回答）。
     graph = build_graph(
         [
             fake_structured_message(
                 IntentResult(intent=Intent.PLAN, confidence=0.95, reason="test")
             ),
+            understand_message(),
             fake_structured_message(plan),
             fake_text_message("总结完毕"),
             fake_text_message("整合回答"),
-            *chat_turn_messages(Intent.CHAT, "好的"),
+            fake_structured_message(
+                IntentResult(intent=Intent.CHAT, confidence=0.95, reason="test")
+            ),
+            understand_message(),
+            fake_text_message("好的"),
         ],
         tools=[calc],
     )
@@ -376,7 +394,8 @@ async def test_plan_state_reset_across_turns(build_graph, run_graph) -> None:
     assert state1.values.get("plan") is not None
     assert (state1.values.get("plan_steps_done") or 0) == 1
 
-    resp2, _ = await run_graph(graph, text="你好", session_id="s1")
+    # 第 2 轮用「非寒暄且长度过门控」的输入：确保本轮走 LLM 改写路径（消息条数确定）。
+    resp2, _ = await run_graph(graph, text="你好，请继续帮我总结吧", session_id="s1")
     assert resp1 is not None and resp2 is not None
     state2 = await graph.aget_state({"configurable": {"thread_id": "s1"}})
     assert state2.values.get("plan") is None
@@ -393,6 +412,7 @@ async def test_non_plan_turn_plan_stays_none(build_graph, run_graph) -> None:
             fake_structured_message(
                 IntentResult(intent=Intent.TOOL_USE, confidence=0.95, reason="test")
             ),
+            understand_message(),  # v6.0 T2：查询理解（门控通过）
             _tool_call_msg("calc", "c1"),
             fake_text_message("计算回答"),
         ],

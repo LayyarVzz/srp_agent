@@ -16,6 +16,7 @@ from agent.core.models import PlanResult, SubagentResult
 from agent.errors import ErrorRecord
 from agent.intent.models import Intent, IntentResult
 from agent.memory.models import MemoryItem
+from agent.query.models import QueryUnderstanding
 from agent.response.models import AgentResponse, Clarification
 from agent.response.status import Status, StatusEvent
 from agent.share.models import Citation
@@ -26,6 +27,9 @@ NODE_LOAD_CONTEXT = "load_context"
 NODE_TRIM_HISTORY = "trim_history"
 NODE_SUMMARIZE_HISTORY = "summarize_history"
 NODE_CLASSIFY_INTENT = "classify_intent"
+# 检索前查询理解（T2）：`classify_intent` 之后、`recall_memory` 之前 —— 顺序唯一解见
+# dev-version6.0.md §2.3 D3（召回要读改写结果，且要能被 retrieval_needed 跳过）。
+NODE_UNDERSTAND_QUERY = "understand_query"
 NODE_RECALL_MEMORY = "recall_memory"
 NODE_CALL_MODEL = "call_model"
 NODE_DISPATCH_TOOL = "dispatch_tool"
@@ -60,6 +64,13 @@ class AgentState(TypedDict, total=False):
     # —— 意图 ——
     intent: Intent
     intent_meta: IntentResult
+
+    # —— 检索前查询理解（T2；普通覆盖字段，load_context 每轮重置）——
+    # 一次结构化改写的完整产物（主改写/子查询/同义/HyDE）；None = 门控跳过或改写失败。
+    query_understanding: QueryUnderstanding | None
+    # 覆盖后的主检索查询（`query_understanding.main_query` 的扁平视图）：
+    # 记忆召回与 RAG 实参拦截器都读它，缺失时回退 `input`（v5.1 行为）。
+    retrieval_query: str | None
 
     # —— 状态事件（流式下发）——
     status: Status

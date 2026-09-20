@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import re
 import sys
@@ -29,6 +30,7 @@ from agent.core.graph import build_agent_graph
 from agent.intent.models import Intent, IntentResult
 from agent.llm import LLMService
 from agent.memory import MemoryStore
+from agent.query.models import QueryUnderstanding, QueryUnderstandingResult
 from agent.response.models import AgentResponse
 from agent.runtime import AgentRuntime
 from agent.session import build_session_backend
@@ -49,10 +51,19 @@ class StructuredFakeChatModel(GenericFakeChatModel):
     content 按空白切分（与基类一致），并把每条 tool_call 补成一个完整
     ToolCallChunk 增量块，使 call_model 的 astream_tools 聚合后能还原出
     AIMessage.tool_calls（图内 call_model 已全部切到流式调用）。
+
+    WHY `bind_tools` 返回**浅拷贝**而非 `self`：`with_structured_output` 的实现是
+    `self.bind_tools([schema])` 后再挂解析器，而 langchain 的绑定是可组合的
+    （在已有绑定之上叠加）。若这里返回 `self`，同一实例上的结构化绑定会**跨调用累积**
+    —— 表现为「图里第一次结构化调用（意图分类）之后，第二次（如 T2 查询理解）会拿到
+    上一次绑定的工具名」而解析失败。真实 provider（ChatOpenAI）的 bind_tools 本就返回
+    新对象，故这是 fake 保真度问题，不是生产缺陷。
+    浅拷贝共享 `prompts` / `route_iters` 等记录字段的**同一列表对象**，
+    故既有 prompt / 路由断言仍然生效。
     """
 
     def bind_tools(self, tools: Any, *, tool_choice: Any = None, **kwargs: Any) -> Any:
-        return self
+        return self.model_copy(deep=False)
 
     def _stream(
         self,
@@ -153,11 +164,26 @@ class RoutedFakeChatModel(RecordingFakeChatModel):
         return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
 
+_fake_call_seq = itertools.count(1)
+
+
 def fake_structured_message(result: BaseModel) -> AIMessage:
-    """构造产出指定结构化结果的 AIMessage（tool name 必须等于 schema 类名）。"""
+    """构造产出指定结构化结果的 AIMessage（tool name 必须等于 schema 类名）。
+
+    WHY tool_call_id 逐条唯一：图内 `add_messages` 按**消息 id** 去重，而 tool_call_id
+    固定会让「同轮第二次结构化调用」与第一次的 tool_call 复用同一个 id
+    （LangChain 的 tool_call 幂等合并语义），表现为第二次调用拿到**上一次**的模型输出。
+    v6.0 起同一轮会有多次结构化调用（意图分类 + 查询理解 + 澄清），故必须唯一。
+    """
     return AIMessage(
         content="",
-        tool_calls=[{"name": type(result).__name__, "args": result.model_dump(), "id": "call_1"}],
+        tool_calls=[
+            {
+                "name": type(result).__name__,
+                "args": result.model_dump(),
+                "id": f"call_{next(_fake_call_seq)}",
+            }
+        ],
     )
 
 
@@ -166,27 +192,66 @@ def fake_text_message(text: str) -> AIMessage:
     return AIMessage(content=text)
 
 
-def chat_turn_messages(intent: Intent, reply: str) -> list[AIMessage]:
-    """一轮对话所需的 LLM 消息序列：先结构化（意图）后文本（回答）。"""
-    return [
-        fake_structured_message(IntentResult(intent=intent, confidence=0.95, reason="test")),
-        fake_text_message(reply),
+def understand_message(
+    main_query: str = "改写后的查询",
+    *,
+    retrieval_needed: bool = True,
+    sub_queries: list[str] | None = None,
+    synonyms: list[str] | None = None,
+    hypothetical_answer: str | None = None,
+) -> AIMessage:
+    """构造一次查询理解（T2）的结构化输出消息。
+
+    WHY 需要 helper：v6.0 起每轮在意图分类之后新增一次结构化调用（`understand_query`，
+    通过门控时执行）。凡按「调用顺序」编排脚本的测试都必须在意图消息之后插入这条；
+    统一 helper 保证各处口径一致（默认 `retrieval_needed=True`，
+    使召回 / 澄清 / 规划等既有路径照常执行，测试只多一条消息、断言不变）。
+    """
+    return fake_structured_message(
+        QueryUnderstandingResult(
+            understanding=QueryUnderstanding(
+                retrieval_needed=retrieval_needed,
+                main_query=main_query,
+                sub_queries=sub_queries or [],
+                synonyms=synonyms or [],
+                hypothetical_answer=hypothetical_answer,
+            )
+        )
+    )
+
+
+def chat_turn_messages(intent: Intent, reply: str, *, understand: bool = False) -> list[AIMessage]:
+    """一轮对话所需的 LLM 消息序列：结构化（意图）[+ 查询理解] + 文本（回答）。
+
+    `understand=False`（默认）：适用于 CHAT 短输入 —— 它被确定性门控跳过，
+    `understand_query` 不调 LLM，脚本里不能多出这条消息（否则被后续调用误消费）。
+    `understand=True`：适用于会通过门控的输入（如 TOOL_USE 意图、较长文本），
+    在意图消息之后插入一条查询理解消息。
+    """
+    messages = [
+        fake_structured_message(IntentResult(intent=intent, confidence=0.95, reason="test"))
     ]
+    if understand:
+        messages.append(understand_message())
+    messages.append(fake_text_message(reply))
+    return messages
 
 
 def tool_call_messages(
     tool_calls_seq: Sequence[list[dict[str, Any]]], reply: str
 ) -> list[AIMessage]:
-    """工具型会话消息序列：意图(TOOL_USE) + 每次 call_model 产出的 tool_calls + 终答文本。
+    """工具型会话消息序列：意图(TOOL_USE) + 查询理解 + 每次 call_model 的 tool_calls + 终答文本。
 
-    消息数契约：fake 一次 LLM 调用消费一条。classify 消费意图、每次 call_model 消费
-    一条 AI（带 tool_calls 或最终文本）、dispatch_tool 不消费。末尾 `reply` 被末次
+    消息数契约：fake 一次 LLM 调用消费一条。classify 消费意图、`understand_query`
+    消费查询理解（TOOL_USE 意图必然通过门控）、每次 call_model 消费一条 AI
+    （带 tool_calls 或最终文本）、dispatch_tool 不消费。末尾 `reply` 被末次
     call_model 消费（产出终答文本 AI），generate_answer 复用该文本。
     """
     return [
         fake_structured_message(
             IntentResult(intent=Intent.TOOL_USE, confidence=0.95, reason="test")
         ),
+        understand_message(),
         *[AIMessage(content="", tool_calls=list(calls)) for calls in tool_calls_seq],
         fake_text_message(reply),
     ]
