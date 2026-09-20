@@ -71,6 +71,62 @@ def should_keep(extraction: MemoryExtraction, *, cfg: MemoryWorthConfig) -> bool
     return True
 
 
+def _worth_rank(extractions: Sequence[MemoryExtraction]) -> list[MemoryExtraction]:
+    """按 `worth_score` 降序排（稳定排序：同分保持模型输出顺序，跨运行可复现）。"""
+    return sorted(extractions, key=lambda e: e.worth_score, reverse=True)
+
+
+def _select_keepable(
+    extractions: Sequence[MemoryExtraction], *, cfg: MemoryWorthConfig
+) -> list[MemoryExtraction]:
+    """逐条过值得性判定，再按每轮上限截断；**顺带打印两种丢弃原因**（不同的原因必须可区分）。
+
+    WHY 先判后截：上限截断应以「值得记住的程度」为序，而不是模型输出顺序 ——
+    否则一次话多就可能把最值得记的那条挤掉。
+
+    WHY 日志在此处逐条打（而非调用方汇总后反推）：丢弃有两种**语义完全不同**的原因
+    ——「不值得记」（类别+分数判定）与「超上限」（值得记但名额不够）。若只按
+    「取过 should_keep 的差集」反推，会把被上限截断的条目误报成「不值得记」，
+    直接误导复盘（看起来像模型判错了，其实是名额不够）。
+    """
+    worth_dropped: list[MemoryExtraction] = []
+    kept: list[MemoryExtraction] = []
+    for e in extractions:
+        if should_keep(e, cfg=cfg):
+            kept.append(e)
+        else:
+            worth_dropped.append(e)
+    ranked = _worth_rank(kept)
+    overflow = ranked[cfg.memories_max_per_turn :]
+    if overflow:
+        logger.info(
+            "记忆条数超上限（上限 %d，候选 %d）→ 丢弃低价值 %d 条：%s",
+            cfg.memories_max_per_turn,
+            len(ranked),
+            len(overflow),
+            "；".join(f"{e.content}（{e.worth_score:.2f}）" for e in overflow),
+        )
+    for e in _worth_rank(worth_dropped):
+        # 值得性丢弃：类别 + 分数 + 模型自述理由全量落日志（可审计、可复盘误丢）。
+        logger.info(
+            "记忆丢弃（不值得）category=%s score=%.2f reason=%s（%s）",
+            e.category,
+            e.worth_score,
+            e.worth_reason or "无",
+            e.content,
+        )
+    if worth_dropped or overflow:
+        logger.info(
+            "记忆值得性判定：候选 %d 条 → 落库 %d 条（不值得 %d、超上限 %d，阈值 %.2f）",
+            len(extractions),
+            len(ranked) - len(overflow),
+            len(worth_dropped),
+            len(overflow),
+            cfg.min_worth_score,
+        )
+    return ranked[: cfg.memories_max_per_turn]
+
+
 async def save_conversation_memory(
     messages: Sequence[BaseMessage],
     *,
@@ -82,20 +138,22 @@ async def save_conversation_memory(
     judge: MemoryRelationJudge | None = None,
     worth: MemoryWorthConfig | None = None,
 ) -> None:
-    """抽取本轮值得记住的事实并逐条保存；内部吞掉一切异常，绝不抛出（尽力而为）。
+    """抽取本轮值得记住的事实，过值得性判定后逐条保存；内部吞掉一切异常（尽力而为）。
 
+    `worth` 缺省用 `MemoryWorthConfig()` 默认值（`enabled=True`：判定开启且保守）；
+    关闭判定（`worth.enabled=False`）即退回 v5.1「全部落库」行为。
     `dedup` 为 None（或 `enabled=False`）时退回逐条 `save` 原行为；
     启用时走 `_save_deduped`（L1 content-hash + 语义候选；`judge` 非空则按事实三分类
-    决策，否则退回 `store.upsert` 阈值路径）。两条路径都计算并落 `content_hash`：
-    为未来再启用去重留指纹，不改变 recall 行为。
+    决策，否则退回 `store.upsert` 阈值路径）。
     """
     extractions = await extractor.extract(messages)  # extract 契约：永不抛
-    # 保存过程对用户可观测（INFO，见 demo 默认级别）：抽取条数 → 逐条决策
-    # （_save_deduped / judge 内部均 INFO 记录分支与三分类）→ 落库结果。
+    worth_cfg = worth or MemoryWorthConfig()
+    # 保存过程对用户可观测（INFO，见 demo 默认级别）：抽取条数 → 值得性判定与上限截断
+    # （_select_keepable 内逐条打丢弃原因）→ 逐条保存决策（_save_deduped / judge 内部均 INFO）。
     logger.info(
-        "记忆抽取完成：%d 条待保存（session=%s, user=%s）", len(extractions), session_id, user_id
+        "记忆抽取完成：%d 条待判定（session=%s, user=%s）", len(extractions), session_id, user_id
     )
-    for e in extractions:
+    for e in _select_keepable(extractions, cfg=worth_cfg):
         if e.kind not in KNOWN_KINDS:
             # 模型漂移信号：不丢内容、不 re-label，仅告警；召回端归入 other 组仍可达。
             logger.warning("抽取到未知记忆类型 kind=%s（召回时归入 other 组）", e.kind)
@@ -166,9 +224,7 @@ async def _save_deduped(
     namespace = (item.user_id, LONG_TERM_NAMESPACE)
     exact, semantic = await store.find_dedup_candidates(item)
     if exact is not None:
-        logger.info(
-            "去重 L1 content-hash 精确命中 → 合并进 %s（%s）", exact.id, exact.content
-        )
+        logger.info("去重 L1 content-hash 精确命中 → 合并进 %s（%s）", exact.id, exact.content)
         return await store.merge(namespace, exact, item)
     if judge is None or not semantic:
         if judge is None:

@@ -277,6 +277,8 @@ class AgentRuntime:
                         store=self.memory_store,
                         dedup=self.cfg.memory.dedup,
                         judge=self.judge,
+                        # 写入价值判定（v6.0 T1）：抽取后按类别+阈值丢弃不值得记的内容。
+                        worth=self.cfg.memory.worth,
                     )
                 except BaseException as exc:
                     # 含 CancelledError（客户端断开取消生成器）：带外路径失败仅记日志。
@@ -344,7 +346,7 @@ def _build_mcp_servers(settings: RuntimeSettings, cfg: AgentFrameworkConfig) -> 
     lark_mcp（T4）门控装配（dev-version5.0 §3.1）：仅当「框架配置启用（cfg.lark.enabled）
     且环境启用（LARK_CLI_ENABLED）且 lark-cli 命令探测成功」才登记；任一不满足则跳过并记
     日志——无 CLI 环境下 Agent 以既有工具集照常服务（零回归，与 MCP 连接失败降级同语义）。
-    
+
     a2a_mcp（T6 远端智能体协作工具）与 tools_mcp 同传输方式，但**配置+注册表双门控**：
     仅当 a2a_mcp_enabled 且注册表非空才登记——无远端配置时工具集与既有完全一致（零回归）。
     """
