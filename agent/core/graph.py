@@ -1147,7 +1147,16 @@ def build_agent_graph(
         # WHY 随输入带 user_id：ToolNode 对普通 dict 输入原样透传（`_extract_state` 对
         # dict 直接 return input），故额外键会存进 `ToolRuntime.state` —— 飞书工具作用域
         # 拦截器（LarkScopeInterceptor）据此把「谁在调用」注入 MCP 实参（v5.1 §5）。
-        result = await tool_node.ainvoke({"messages": messages, "user_id": state.get("user_id")})
+        result = await tool_node.ainvoke(
+            {
+                "messages": messages,
+                "user_id": state.get("user_id"),
+                # 查询理解产物随输入透传给 MCP 客户端拦截器（RetrievalQueryInterceptor）：
+                # 它据此确定性覆盖 rag 工具的 query 实参（v6.0 T2 §6.2）。
+                "retrieval_query": state.get("retrieval_query"),
+                "query_understanding": state.get("query_understanding"),
+            }
+        )
         new_messages = result["messages"]
         tool_msgs = {tm.tool_call_id: tm for tm in new_messages}
         records, first_error = _records_from_tool_calls(
