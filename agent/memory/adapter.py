@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from datetime import UTC, datetime
 from langgraph.store.base import BaseStore, SearchItem
 
 from agent.memory.models import MemoryItem, MemoryRecallResult, SaveOutcome
+from agent.query.fusion import RankedHit, reciprocal_rank_fusion
 from agent.share.models import Citation, MemoryRecallConfig
 
 logger = logging.getLogger(__name__)
@@ -207,14 +209,16 @@ class MemoryStore:
         top_k: int = 5,
         kinds: Sequence[str] | None = None,
         query: str | None = None,
+        variant_queries: Sequence[str] | None = None,
         hybrid_weights: tuple[float, float, float] | None = None,
     ) -> MemoryRecallResult:
         """双模式召回：语义（query 非空且 embeddings 可用）或确定性。
 
         WHY 双模式：语义列是增量能力，未配 embedding / 无 query 时必须保持 v2.0 行为（零回归）。
-        语义模式：asearch(query, limit=top_k*fetch_factor) 预取放大 → kind 组过滤 →
-        混合重排（score/importance/recency）→ top_k；确定性模式：limit=top_k*2 →
-        kind 过滤 → importance 降序 + 时间倒序兜底。
+        语义模式：对 `[query, *variant_queries]` **并发 asearch**（各取 limit）→ RRF 融合
+        （v6.0 T2）→ kind 组过滤 → 混合重排（score/importance/recency）→ top_k；
+        确定性模式：limit=top_k*2 → kind 过滤 → importance 降序 + 时间倒序兜底。
+        `variant_queries` 为空/未传时逐字节退回单查询路径（零回归）；
         `hybrid_weights` 覆盖本次调用的混合权重：缺省用 `content_weights`；
         偏好预加载等调用方传 `preference_weights` 以区分召回职责（确定性模式忽略）。
         """
@@ -225,16 +229,17 @@ class MemoryStore:
 
         if semantic:
             limit = top_k * self._recall_config.recall_fetch_factor
-            hits = await self._store.asearch(namespace, query=norm_query, limit=limit)
             weights = (
                 hybrid_weights
                 if hybrid_weights is not None
                 else self._recall_config.content_weights
             )
-            ranked = self._hybrid_rerank(
-                self._filter_pairs_by_kinds(self._parse_hits(hits), kinds),
-                weights=weights,
+            pairs = await self._semantic_pairs(
+                namespace,
+                queries=[norm_query, *(q.strip() for q in (variant_queries or []) if q.strip())],
+                limit=limit,
             )
+            ranked = self._hybrid_rerank(self._filter_pairs_by_kinds(pairs, kinds), weights=weights)
         else:
             hits = await self._store.asearch(namespace, limit=top_k * 2)
             ranked = self._deterministic_rank(
@@ -247,6 +252,40 @@ class MemoryStore:
             for m, score in ranked[:top_k]
         ]
         return MemoryRecallResult(items=items, sources=sources)
+
+    async def _semantic_pairs(
+        self,
+        namespace: tuple[str, ...],
+        *,
+        queries: Sequence[str],
+        limit: int,
+    ) -> list[tuple[MemoryItem, float | None]]:
+        """并发多查询语义召回 + RRF 融合；单查询时退回原路径（不走融合）。
+
+        WHY 单查询直通：融合会按「名次」重排，而单路召回的名次与原始相似度完全一致 ——
+        没有必要为一路结果付出融合开销与排序语义变化（零回归）。
+        多路并发是纯读操作（store 支持并发读），不引入写竞态。
+        """
+        if len(queries) <= 1:
+            hits = await self._store.asearch(namespace, query=queries[0], limit=limit)
+            return self._parse_hits(hits)
+
+        hit_lists = await asyncio.gather(
+            *(self._store.asearch(namespace, query=q, limit=limit) for q in queries)
+        )
+        # 第二元素是**最高原始语义分**（供 Citation.score 回填），不是融合分 ——
+        # 融合分是排序产物，冒充「相似度」会让引用里的数字不可解释。
+        fused = reciprocal_rank_fusion(
+            [
+                [
+                    RankedHit(key=item.id, item=item, score=score)
+                    for item, score in self._parse_hits(hits)
+                ]
+                for hits in hit_lists
+            ],
+            k=self._recall_config.rrf_k,
+        )
+        return [(hit.item, hit.score) for hit in fused]
 
     def _parse_hits(self, hits: Sequence[SearchItem]) -> list[tuple[MemoryItem, float | None]]:
         """把 asearch 结果解析为 (item, raw_score) 对；脏数据跳过记 warning（双模式共用）"""

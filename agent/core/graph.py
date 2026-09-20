@@ -998,21 +998,73 @@ def build_agent_graph(
         return {"query_understanding": understanding, "retrieval_query": main_query}
 
     async def recall_memory(state: AgentState) -> dict[str, Any]:
+        """召回长期记忆（P4-3 / v6.0 T2 重排）：preference 预加载 + fact/episode 按需召回。
+
+        WHY 两处合并到本节点：v6.0 把改写节点放在召回之前，若预加载仍留在 load_context
+        就用不上改写结果（改写白跑一半），要么同一轮跑两次改写 —— 合并后**一次改写喂两次
+        召回**（dev-version6.0.md §0.3）。
+
+        `retrieval_needed=False` 只跳过 fact/episode（主题检索）；preference 是**身份预加载**、
+        不按主题检索，且既有语义要求每轮进行（`preload_profile` 开关控制）。
         """
-        按需召回 fact/episode（user 隔离，未配 embedding 自动降级 importance）
-        """
-        result = await memory.recall(
-            user_id=state.get("user_id") or "anonymous",
-            kinds=[KIND_FACT, KIND_EPISODE],
-            top_k=cfg.memory.top_k,
-            # 不传 hybrid_weights → 默认 content_weights（query 主导），与偏好预加载区分。
-            query=state.get("input") or None,
+        user_id = state.get("user_id") or "anonymous"
+        understanding = state.get("query_understanding")
+        retrieval_needed = understanding is None or understanding.retrieval_needed
+        query = state.get("retrieval_query") or state.get("input") or None
+        variants = (
+            understanding.retrieval_queries(max_variants=cfg.retrieval.max_variants)[1:]
+            if understanding is not None
+            else []
         )
-        if not result.items:
+
+        # 两次召回并发（互不依赖），共用一个查询与变体池。
+        tasks: list[Coroutine[Any, Any, MemoryRecallResult]] = []
+        if cfg.memory.preload_profile:
+            tasks.append(
+                memory.recall(
+                    user_id=user_id,
+                    kinds=[KIND_PREFERENCE],
+                    top_k=cfg.memory.top_k,
+                    query=query,
+                    variant_queries=variants,
+                    # preference 专用权重：importance 主导（身份先验），语义只做辅助决胜。
+                    hybrid_weights=cfg.memory.recall.preference_weights,
+                )
+            )
+        if retrieval_needed:
+            tasks.append(
+                memory.recall(
+                    user_id=user_id,
+                    kinds=[KIND_FACT, KIND_EPISODE],
+                    top_k=cfg.memory.top_k,
+                    # 不传 hybrid_weights → 默认 content_weights（query 主导）。
+                    query=query,
+                    variant_queries=variants,
+                )
+            )
+        if not tasks:
             return {}
-        updates = set_status(Status.RETRIEVING, message="正在检索长期记忆")
-        updates["memory_context"] = list(state.get("memory_context") or []) + result.items
-        updates["citations"] = _dedup_citations(state.get("citations") or [], result.sources)
+        results = await asyncio.gather(*tasks)
+
+        preference_result = results[0] if cfg.memory.preload_profile else None
+        topic_result = results[-1] if retrieval_needed else None
+        items: list[MemoryItem] = []
+        sources: list[Citation] = []
+        if preference_result is not None:
+            items.extend(preference_result.items)
+            sources.extend(preference_result.sources)
+        if topic_result is not None:
+            items.extend(topic_result.items)
+            sources.extend(topic_result.sources)
+        if not items:
+            return {}
+        updates: dict[str, Any] = {}
+        # 状态语义与 v5.1 保持一致：RETRIEVING 只在**主题召回有结果**时下发
+        # （preference 是每轮身份预加载，若也下发会让「仅预加载」的轮次多出一个检索状态帧）。
+        if topic_result is not None and topic_result.items:
+            updates.update(set_status(Status.RETRIEVING, message="正在检索长期记忆"))
+        updates["memory_context"] = list(state.get("memory_context") or []) + items
+        updates["citations"] = _dedup_citations(state.get("citations") or [], sources)
         return updates
 
     # —— 工具路径：call_model（bind_tools 选择/直接作答）+ dispatch_tool（ToolNode 执行）——
