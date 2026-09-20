@@ -224,6 +224,25 @@ class DedupConfig(BaseModel):
     semantic_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
 
 
+class MemoryWorthConfig(BaseModel):
+    """记忆值得性判定行为（v6.0 T1，dev-version6.0.md §4）。
+
+    `enabled=False` → 不判定、全部落库（v5.1 零回归）。
+
+    `min_worth_score` 是**唯一直接决定误丢率的旋钮**（dev-version6.0.md §0.2 双向风险）：
+    过滤过松只是噪声挤占召回，过滤过紧则是「用户说过的事没记住」——不可自愈、不可观测。
+    故默认取保守中值 0.5，且丢弃需「拒收类别 **且** 分数低于阈值」两个条件同时成立
+    （两者矛盾时保守保留，见 `persist.should_keep`）。
+
+    `memories_max_per_turn` 是单轮落库条数上限（防「一次对话灌一堆」）：
+    超限按 `worth_score` 降序保留前 N 条，其余丢弃并记日志。
+    """
+
+    enabled: bool = True
+    min_worth_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    memories_max_per_turn: int = Field(default=5, ge=1)
+
+
 class SummarizeConfig(BaseModel):
     """滚动摘要行为（短期上下文管理）。
 
@@ -259,6 +278,8 @@ class MemoryBehaviorConfig(BaseModel):
     recall: MemoryRecallConfig = Field(default_factory=MemoryRecallConfig)
     # 带外保存去重（保存端 L1 content-hash + L2 语义）。
     dedup: DedupConfig = Field(default_factory=DedupConfig)
+    # 写入价值判定（v6.0 T1）：抽取后判定「是否值得记住」，低价值内容不落库。
+    worth: MemoryWorthConfig = Field(default_factory=MemoryWorthConfig)
 
     # 短期上下文管理：滚动摘要 + 会话关键信息。
     summarize: SummarizeConfig = Field(default_factory=SummarizeConfig)
@@ -285,6 +306,8 @@ class LarkToolsConfig(BaseModel):
     """
 
     enabled: bool = True
+
+
 class A2AConfig(BaseModel):
     """A2A 智能体互联行为（T5 Server：入站 peer 注册；环境项见根 settings.py）。
 

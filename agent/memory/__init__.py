@@ -2,6 +2,7 @@
 
 P4-2 起额外导出：结构化抽取（MemoryExtractor / MemoryExtraction*）与
 带外非阻塞保存（submit_memory_save / save_conversation_memory / wait_pending_saves）。
+v6.0（T1）起额外导出：写入价值判定（should_keep / REJECT_CATEGORIES / 值得性类别常量）。
 """
 
 from agent.memory.adapter import (
@@ -18,10 +19,21 @@ from agent.memory.extractor import MemoryExtractor
 from agent.memory.factory import MemoryBackends, build_memory_backends
 from agent.memory.judge import MemoryRelationJudge
 from agent.memory.models import (
+    KEEP_CONSTRAINT,
+    KEEP_EXPLICIT,
+    KEEP_GOAL,
+    KEEP_IDENTITY,
+    KEEP_PLAN,
+    KEEP_PREFERENCE,
+    KEEP_RELATION,
     MERGEABLE_RELATIONS,
     RELATION_EXACT,
     RELATION_NOT_DUPLICATE,
     RELATION_OVERLAP,
+    WORTH_COMMONSENSE,
+    WORTH_DERIVABLE,
+    WORTH_SELF_GENERATED,
+    WORTH_SMALL_TALK,
     CandidateVerdict,
     MemoryExtraction,
     MemoryExtractionResult,
@@ -33,13 +45,22 @@ from agent.memory.models import (
 )
 from agent.memory.persist import (
     PROVENANCE_CONVERSATION,
+    REJECT_CATEGORIES,
     save_conversation_memory,
+    should_keep,
     submit_memory_save,
     wait_pending_saves,
 )
 from agent.share.models import MemoryRecallConfig
 
 __all__ = [
+    "KEEP_CONSTRAINT",
+    "KEEP_EXPLICIT",
+    "KEEP_GOAL",
+    "KEEP_IDENTITY",
+    "KEEP_PLAN",
+    "KEEP_PREFERENCE",
+    "KEEP_RELATION",
     "KIND_EPISODE",
     "KIND_FACT",
     "KIND_OTHER",
@@ -48,9 +69,14 @@ __all__ = [
     "LONG_TERM_NAMESPACE",
     "MERGEABLE_RELATIONS",
     "PROVENANCE_CONVERSATION",
+    "REJECT_CATEGORIES",
     "RELATION_EXACT",
     "RELATION_NOT_DUPLICATE",
     "RELATION_OVERLAP",
+    "WORTH_COMMONSENSE",
+    "WORTH_DERIVABLE",
+    "WORTH_SELF_GENERATED",
+    "WORTH_SMALL_TALK",
     "CandidateVerdict",
     "MemoryBackends",
     "MemoryExtraction",
@@ -66,6 +92,7 @@ __all__ = [
     "build_memory_backends",
     "normalize_content_hash",
     "save_conversation_memory",
+    "should_keep",
     "store_has_embeddings",
     "submit_memory_save",
     "wait_pending_saves",

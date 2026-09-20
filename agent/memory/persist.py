@@ -3,6 +3,10 @@
 非阻塞：长期记忆写入不得阻塞回答下发。
 回答经 format_response 下发（图 END）后，入口层调用 `submit_memory_save`
 以 fire-and-forget 后台任务执行「抽取 + 保存」；失败仅记日志、不影响主流程。
+
+v6.0（T1）：抽取结果先过**值得性判定**（`should_keep`，单点决策）——
+显式拒收常识/可推导/助手产出/寒暄（常识不必记），再走既有去重保存路径。
+判定失败一律保守保留（宁漏不误丢，dev-version6.0.md §0.2）。
 """
 
 from __future__ import annotations
@@ -15,13 +19,18 @@ from uuid import uuid4
 
 from langchain_core.messages import BaseMessage
 
-from agent.core.config import DedupConfig
+from agent.core.config import DedupConfig, MemoryWorthConfig
 from agent.memory.adapter import KNOWN_KINDS, LONG_TERM_NAMESPACE, MemoryStore
 from agent.memory.extractor import MemoryExtractor
 from agent.memory.judge import MemoryRelationJudge
 from agent.memory.models import (
     RELATION_EXACT,
     RELATION_OVERLAP,
+    WORTH_COMMONSENSE,
+    WORTH_DERIVABLE,
+    WORTH_SELF_GENERATED,
+    WORTH_SMALL_TALK,
+    MemoryExtraction,
     MemoryItem,
     SaveOutcome,
     normalize_content_hash,
@@ -32,8 +41,90 @@ logger = logging.getLogger(__name__)
 # 来源常量：会话对话抽取的记忆（要求 provenance 字段，禁止散落字面量）。
 PROVENANCE_CONVERSATION = "conversation"
 
+# 拒收类别集合：命中者**且**分数低于阈值时丢弃（见 should_keep）。
+# 集合只含「可判定」的硬负面类别 —— 不把「重要性低」这类连续量当落地门。
+REJECT_CATEGORIES = frozenset(
+    {WORTH_COMMONSENSE, WORTH_DERIVABLE, WORTH_SELF_GENERATED, WORTH_SMALL_TALK}
+)
+
 # 强引用集：asyncio 后台任务不持引用会被 GC 提前取消，保存引用防止 pending 任务被回收。
 _background_tasks: set[asyncio.Task[None]] = set()
+
+
+def should_keep(extraction: MemoryExtraction, *, cfg: MemoryWorthConfig) -> bool:
+    """值得性判定：拒收类别 + 分数阈值（**唯一决策点**，判据禁止散落别处）。
+
+    判定顺序（先类别后分数，可解释、可审计）：
+    ① `enabled=False` → 恒 True（v5.1 零回归）；
+    ② 内容为空 / 纯空白 → False（脏数据防御，与类别无关）；
+    ③ 拒收类别**且** `worth_score < min_worth_score` → False（值得丢弃）；
+    ④ 拒收类别但分数仍高（模型自相矛盾）→ **保守保留**：那是提示词漂移信号，
+       宁可多记一条，也不因一次矛盾判定丢掉用户的事实（宁漏不误丢）；
+    ⑤ 其余 → True。
+    """
+    if not cfg.enabled:
+        return True
+    if not extraction.content.strip():
+        return False
+    if extraction.category in REJECT_CATEGORIES:
+        return extraction.worth_score >= cfg.min_worth_score
+    return True
+
+
+def _worth_rank(extractions: Sequence[MemoryExtraction]) -> list[MemoryExtraction]:
+    """按 `worth_score` 降序排（稳定排序：同分保持模型输出顺序，跨运行可复现）。"""
+    return sorted(extractions, key=lambda e: e.worth_score, reverse=True)
+
+
+def _select_keepable(
+    extractions: Sequence[MemoryExtraction], *, cfg: MemoryWorthConfig
+) -> list[MemoryExtraction]:
+    """逐条过值得性判定，再按每轮上限截断；**顺带打印两种丢弃原因**（不同的原因必须可区分）。
+
+    WHY 先判后截：上限截断应以「值得记住的程度」为序，而不是模型输出顺序 ——
+    否则一次话多就可能把最值得记的那条挤掉。
+
+    WHY 日志在此处逐条打（而非调用方汇总后反推）：丢弃有两种**语义完全不同**的原因
+    ——「不值得记」（类别+分数判定）与「超上限」（值得记但名额不够）。若只按
+    「取过 should_keep 的差集」反推，会把被上限截断的条目误报成「不值得记」，
+    直接误导复盘（看起来像模型判错了，其实是名额不够）。
+    """
+    worth_dropped: list[MemoryExtraction] = []
+    kept: list[MemoryExtraction] = []
+    for e in extractions:
+        if should_keep(e, cfg=cfg):
+            kept.append(e)
+        else:
+            worth_dropped.append(e)
+    ranked = _worth_rank(kept)
+    overflow = ranked[cfg.memories_max_per_turn :]
+    if overflow:
+        logger.info(
+            "记忆条数超上限（上限 %d，候选 %d）→ 丢弃低价值 %d 条：%s",
+            cfg.memories_max_per_turn,
+            len(ranked),
+            len(overflow),
+            "；".join(f"{e.content}（{e.worth_score:.2f}）" for e in overflow),
+        )
+    for e in _worth_rank(worth_dropped):
+        # 值得性丢弃：类别 + 分数 + 模型自述理由全量落日志（可审计、可复盘误丢）。
+        logger.info(
+            "记忆丢弃（不值得）category=%s score=%.2f reason=%s（%s）",
+            e.category,
+            e.worth_score,
+            e.worth_reason or "无",
+            e.content,
+        )
+    if worth_dropped or overflow:
+        logger.info(
+            "记忆值得性判定：候选 %d 条 → 落库 %d 条（不值得 %d、超上限 %d，阈值 %.2f）",
+            len(extractions),
+            len(ranked) - len(overflow),
+            len(worth_dropped),
+            len(overflow),
+            cfg.min_worth_score,
+        )
+    return ranked[: cfg.memories_max_per_turn]
 
 
 async def save_conversation_memory(
@@ -45,21 +136,24 @@ async def save_conversation_memory(
     store: MemoryStore,
     dedup: DedupConfig | None = None,
     judge: MemoryRelationJudge | None = None,
+    worth: MemoryWorthConfig | None = None,
 ) -> None:
-    """抽取本轮值得记住的事实并逐条保存；内部吞掉一切异常，绝不抛出（尽力而为）。
+    """抽取本轮值得记住的事实，过值得性判定后逐条保存；内部吞掉一切异常（尽力而为）。
 
+    `worth` 缺省用 `MemoryWorthConfig()` 默认值（`enabled=True`：判定开启且保守）；
+    关闭判定（`worth.enabled=False`）即退回 v5.1「全部落库」行为。
     `dedup` 为 None（或 `enabled=False`）时退回逐条 `save` 原行为；
     启用时走 `_save_deduped`（L1 content-hash + 语义候选；`judge` 非空则按事实三分类
-    决策，否则退回 `store.upsert` 阈值路径）。两条路径都计算并落 `content_hash`：
-    为未来再启用去重留指纹，不改变 recall 行为。
+    决策，否则退回 `store.upsert` 阈值路径）。
     """
     extractions = await extractor.extract(messages)  # extract 契约：永不抛
-    # 保存过程对用户可观测（INFO，见 demo 默认级别）：抽取条数 → 逐条决策
-    # （_save_deduped / judge 内部均 INFO 记录分支与三分类）→ 落库结果。
+    worth_cfg = worth or MemoryWorthConfig()
+    # 保存过程对用户可观测（INFO，见 demo 默认级别）：抽取条数 → 值得性判定与上限截断
+    # （_select_keepable 内逐条打丢弃原因）→ 逐条保存决策（_save_deduped / judge 内部均 INFO）。
     logger.info(
-        "记忆抽取完成：%d 条待保存（session=%s, user=%s）", len(extractions), session_id, user_id
+        "记忆抽取完成：%d 条待判定（session=%s, user=%s）", len(extractions), session_id, user_id
     )
-    for e in extractions:
+    for e in _select_keepable(extractions, cfg=worth_cfg):
         if e.kind not in KNOWN_KINDS:
             # 模型漂移信号：不丢内容、不 re-label，仅告警；召回端归入 other 组仍可达。
             logger.warning("抽取到未知记忆类型 kind=%s（召回时归入 other 组）", e.kind)
@@ -130,9 +224,7 @@ async def _save_deduped(
     namespace = (item.user_id, LONG_TERM_NAMESPACE)
     exact, semantic = await store.find_dedup_candidates(item)
     if exact is not None:
-        logger.info(
-            "去重 L1 content-hash 精确命中 → 合并进 %s（%s）", exact.id, exact.content
-        )
+        logger.info("去重 L1 content-hash 精确命中 → 合并进 %s（%s）", exact.id, exact.content)
         return await store.merge(namespace, exact, item)
     if judge is None or not semantic:
         if judge is None:
@@ -191,8 +283,12 @@ def submit_memory_save(
     store: MemoryStore,
     dedup: DedupConfig | None = None,
     judge: MemoryRelationJudge | None = None,
+    worth: MemoryWorthConfig | None = None,
 ) -> None:
-    """fire-and-forget 触发带外保存；回答下发后调用一次，同步返回、不阻塞。"""
+    """fire-and-forget 触发带外保存；回答下发后调用一次，同步返回、不阻塞。
+
+    `worth` 由装配层从 `cfg.memory.worth` 传入（框架行为项）；缺省用默认值。
+    """
     if not messages:
         return
     try:
@@ -209,6 +305,7 @@ def submit_memory_save(
             store=store,
             dedup=dedup,
             judge=judge,
+            worth=worth,
         )
     )
     _background_tasks.add(task)
@@ -224,6 +321,7 @@ async def _background_persist(
     store: MemoryStore,
     dedup: DedupConfig | None = None,
     judge: MemoryRelationJudge | None = None,
+    worth: MemoryWorthConfig | None = None,
 ) -> None:
     """后台任务体：二次兜底，保证任务不带未处理异常退出。
 
@@ -240,6 +338,7 @@ async def _background_persist(
             store=store,
             dedup=dedup,
             judge=judge,
+            worth=worth,
         )
     except Exception as exc:
         logger.warning("记忆带外保存任务异常：%s", exc)
