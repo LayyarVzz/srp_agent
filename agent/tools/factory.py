@@ -18,6 +18,7 @@ from langchain_core.tools import BaseTool
 
 from agent.core.config import AgentFrameworkConfig
 from agent.tools.lark_scope import LarkScopeInterceptor
+from agent.tools.retrieval_args import RetrievalQueryInterceptor
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +57,16 @@ async def build_tools_from_mcp(
 
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    # 构造 MCP 多服务客户端；拦截器按 server_name 自行放行非飞书服务（零影响）。
+    # 构造 MCP 多服务客户端；拦截器各按 server_name 自行放行非目标服务（零影响）：
+    # - LarkScopeInterceptor：把图状态 user_id 注入 lark 工具实参（v5.1）；
+    # - RetrievalQueryInterceptor：归一 rag 检索实参 + 召回不足时惰性补检（v6.0 T2）。
     client = MultiServerMCPClient(
         connections=connections,
         handle_tool_errors=True,
-        tool_interceptors=[LarkScopeInterceptor()],
+        tool_interceptors=[
+            LarkScopeInterceptor(),
+            RetrievalQueryInterceptor(config=config.retrieval),
+        ],
     )
     last_exc: Exception | None = None
     tools: list[BaseTool] = []
