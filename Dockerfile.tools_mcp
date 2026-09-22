@@ -17,11 +17,33 @@ WORKDIR /app
 
 # 先复制依赖清单并同步依赖（利用 Docker 层缓存：源码改动不触发重新解析依赖）。
 # --no-install-project：只装依赖、不装本项目包（运行靠源码目录 + PYTHONPATH=/app）。
+# 依赖裁剪（见文件末尾「裁剪边界」）：本服务只用 fastmcp + starlette + pydantic-settings，
+# 其余重依赖（numpy / sqlalchemy / psycopg / langchain 全家 / openai）一概不装。
+# 实测 .venv 240 MB → 104 MB、镜像 490 → 312 MB，且 calculate / current_datetime 实调通过。
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=README.md,target=README.md \
-    uv sync --frozen --no-dev --no-install-project
+    uv sync --frozen --no-dev --no-install-project \
+        --no-install-package numpy \
+        --no-install-package rank-bm25 \
+        --no-install-package sqlalchemy \
+        --no-install-package aiosqlite \
+        --no-install-package psycopg \
+        --no-install-package psycopg-binary \
+        --no-install-package psycopg-pool \
+        --no-install-package langgraph-checkpoint-postgres \
+        --no-install-package langchain \
+        --no-install-package langchain-openai \
+        --no-install-package langgraph \
+        --no-install-package langgraph-checkpoint \
+        --no-install-package langgraph-prebuilt \
+        --no-install-package langgraph-sdk \
+        --no-install-package tiktoken \
+        --no-install-package regex \
+        --no-install-package sentry-sdk \
+        --no-install-package openai \
+        --no-install-package zstandard
 
 # ---------- 运行期：干净基底 + 只搬 .venv 与源码 ----------
 FROM python:3.12-slim AS runtime
@@ -41,3 +63,11 @@ COPY services/tools_mcp ./services/tools_mcp
 EXPOSE 8100
 
 CMD [".venv/bin/python", "-m", "services.tools_mcp"]
+
+# —— 裁剪边界（改动本服务代码后请复核）——
+# 本镜像只运行 services/tools_mcp（server / datetime_tool / calculator_tool / config /
+# client_config / __main__），其第三方 import 仅有：fastmcp、starlette、pydantic、
+# pydantic-settings、langchain-mcp-adapters（client_config 的 StdioConnection）。
+# 若将来给本服务加了新依赖（例如直接读库 / 调 LLM），必须同步从上表去掉对应排除项，
+# 否则运行期才会 ModuleNotFoundError（构建期不报错 —— 这是本裁剪方式的已知代价）。
+# 复核方式：docker run --rm <img> /app/.venv/bin/python -c "import services.tools_mcp.server"
