@@ -54,11 +54,34 @@ WORKDIR /app
 
 # 先复制依赖清单并同步依赖（利用 Docker 层缓存：源码改动不触发重新解析依赖）。
 # --no-install-project：只装依赖、不装本项目包（运行靠源码目录，见 CMD）。
+# 依赖裁剪（见文件末尾「裁剪边界」）：本服务需要 fastmcp + starlette + pydantic(+settings)
+# + sqlalchemy(+aiosqlite, +psycopg) + cryptography + httpx；其余重依赖不装。
+# 实测 .venv 240 MB → 136 MB、镜像 417 → 313 MB，且 9 个工具全部登记、Postgres 绑定域建表成功。
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=README.md,target=README.md \
-    uv sync --frozen --no-dev --no-install-project
+    uv sync --frozen --no-dev --no-install-project \
+        --no-install-package numpy \
+        --no-install-package rank-bm25 \
+        --no-install-package langchain \
+        --no-install-package langchain-openai \
+        --no-install-package langgraph \
+        --no-install-package langgraph-checkpoint \
+        --no-install-package langgraph-prebuilt \
+        --no-install-package langgraph-sdk \
+        --no-install-package langgraph-checkpoint-postgres \
+        --no-install-package tiktoken \
+        --no-install-package regex \
+        --no-install-package sentry-sdk \
+        --no-install-package openai \
+        --no-install-package zstandard \
+        --no-install-package fastapi-cli \
+        --no-install-package fastapi-cloud-cli
+# ⚠️ psycopg / psycopg-binary / psycopg-pool **不可裁**（实测踩过）：绑定域仓库会把 DSN
+#    改写成 `postgresql+psycopg://`（shared/lark/repository.py::_build_engine），
+#    容器内由 compose 注入 Postgres DSN → 裁掉即启动建表阶段 ModuleNotFoundError
+#    （SQLAlchemy 方言是运行期按 URL 惰性导入的，构建期不会报错）。
 
 # ---------- ③ 运行期：纯 python-slim + 二进制（零 node / 零 npm） ----------
 FROM python:3.12-slim AS runtime
@@ -93,3 +116,13 @@ RUN chmod +x /usr/local/bin/lark-cli
 EXPOSE 8101
 
 CMD [".venv/bin/python", "-m", "services.lark_mcp"]
+
+# —— 裁剪边界（改动本服务代码后请复核）——
+# 本镜像运行 services/lark_mcp/* + shared/lark/*，第三方 import 面为：
+#   fastmcp / starlette（服务与 health 探针）、pydantic + pydantic-settings（配置与模型）、
+#   sqlalchemy + aiosqlite + **psycopg[binary]**（绑定域仓库：建表与读写；DSN 由 compose 注入
+#   Postgres，见上方不可裁说明）、cryptography（Fernet 令牌加解密）、httpx（OAuth 设备码/刷新）、
+#   langchain-mcp-adapters（client_config 的 StdioConnection，**实测不可裁**）。
+# 若将来给本服务加了新依赖（例如调 LLM / 读向量库），必须同步从上表去掉对应排除项，
+# 否则运行期才会 ModuleNotFoundError（构建期不报错 —— 本裁剪方式的已知代价）。
+# 复核方式：docker run --rm <img> /app/.venv/bin/python -c "import services.lark_mcp.server"
