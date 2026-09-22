@@ -1,0 +1,80 @@
+# lark_mcp 独立运行镜像（飞书工具面 + 账号绑定）
+#
+# 为什么独立成容器（plan-docker-observability.md §2.1 / dev-version5.1.md §8.1）：
+#   1. lark-cli 是**独立二进制**（@larksuite/cli 的 bin/），与 Agent 运行环境解耦：
+#      api 容器不需要它，它也不需要 api 的依赖（numpy/rank_bm25 等）；
+#   2. 绑定域的状态跨**多次 MCP 工具调用**共享（lark_bind_start 写待定态 →
+#      用户授权 → lark_bind_complete 读回），HTTP 形态让「每进程都要建表」的
+#      约束变成「一个常驻服务建一次表」（services/lark_mcp/server.py::_binding_lifespan）。
+#
+# 构建：
+#   docker build -f Dockerfile.lark_mcp -t srp-agent-lark-mcp:latest .
+#
+# ⚠️ 三个容器化陷阱（均来自真实源码/实测，勿删）：
+#   1. LARKSUITE_CLI_CONFIG_DIR 必须显式给出：services/lark_mcp/cli.py 的
+#      _ENV_ALLOWLIST 刻意剔掉 HOME/USERPROFILE/APPDATA（设计意图：飞书身份不得
+#      回落本机既有登录），若无可写 config 目录，部分命令会失败。
+#   2. LARK_DATABASE_URL 必须指向编排内的 postgres：缺 DSN 时绑定域退化为
+#      `sqlite+aiosqlite:///:memory:`，而 HTTP 形态虽有常驻进程，**容器重建/多副本
+#      下仍是各库各的**；Compose 必须注入同一 DSN（见 compose.yaml）。
+#   3. LARK_TOKEN_KEY 必须与 api 容器**同值**：密文由本服务写入
+#      （shared/lark/repository.py），api 侧要解密取用；不同值 = 绑定链路静默失败。
+
+# ① 取 lark-cli 独立二进制：npm 包只是「下载器 + 垫片」，postinstall 把平台二进制
+#    放进包内 bin/。构建期一次性取出，运行期**不带 node**（省 ~47 MB 且少一个攻击面）。
+FROM node:22-bookworm-slim AS larkcli
+
+# 版本钉死：CLI 输出契约（`--format json`、`"ok": true`、退出码语义）见 cli.py 模块
+# docstring，随版本漂移会打破工具层解析，故不可用 @latest。
+# 不用 alpine：目标是 glibc 平台的预制二进制，musl 基底跑不起来。
+ARG LARK_CLI_VERSION=1.0.95
+# curl 是**必需**的：npm 包自带的 postinstall（scripts/install.js）用
+# `spawnSync curl` 下载平台二进制，而 node:*-slim 基底不含 curl →
+# 实测报错 `Failed to install lark-cli: spawnSync curl ENOENT`（不是网络问题，
+# 是缺工具）。ca-certificates 随 curl 一并装上以保证 HTTPS 校验链可用。
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g "@larksuite/cli@${LARK_CLI_VERSION}"
+
+# ② 运行期：纯 python-slim + 二进制（零 node / 零 npm）
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    PYTHONPATH=/app
+
+# 安装 uv（官方 uv 镜像提供现成二进制）
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# 飞书 CLI 身份与配置目录（§陷阱 1）：配置目录放 /tmp（容器内可写、无需持久化）。
+# 无 bot 身份（D5.1.4）：strict mode / default-as 在 CLI 侧兜底为 user，
+# 服务侧 argv 亦恒 --as user（services/lark_mcp/cli.py）。
+ENV LARKSUITE_CLI_CONFIG_DIR=/tmp/lark-cli \
+    LARKSUITE_CLI_STRICT_MODE=user \
+    LARKSUITE_CLI_DEFAULT_AS=user \
+    FASTMCP_CHECK_FOR_UPDATES=off
+
+WORKDIR /app
+
+# 先复制依赖清单并同步依赖（利用 Docker 层缓存：源码改动不触发重新解析依赖）。
+# --no-install-project：只装依赖、不装本项目包（运行靠源码目录，见 CMD）。
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# 只复制本服务所需源码：services/__init__.py 提供 services 命名空间包；
+# shared/lark 是绑定域（OAuth/令牌加解密/仓库），与 agent 侧共用。
+COPY services/__init__.py ./services/__init__.py
+COPY services/lark_mcp ./services/lark_mcp
+COPY shared ./shared
+
+# lark-cli 二进制（最终落点即 LARK_CLI_COMMAND 指向的路径）
+COPY --from=larkcli /usr/local/lib/node_modules/@larksuite/cli/bin/lark-cli /usr/local/bin/lark-cli
+RUN chmod +x /usr/local/bin/lark-cli
+
+# streamable-http 默认端口；host/port/path 由 compose 的 MCP_* 环境变量覆盖
+EXPOSE 8101
+
+CMD [".venv/bin/python", "-m", "services.lark_mcp"]

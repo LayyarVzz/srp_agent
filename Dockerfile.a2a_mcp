@@ -1,0 +1,35 @@
+# a2a_mcp 独立运行镜像（把远端智能体封装为 MCP 工具）
+#
+# 与 Dockerfile.tools_mcp 同构：服务自包含（只依赖本包 + config），
+# 不 import agent 包、不读项目根 settings.py，可独立打包部署。
+#
+# 构建：
+#   docker build -f Dockerfile.a2a_mcp -t srp-agent-a2a-mcp:latest .
+#
+# 注册表门控（零回归）：env `A2A_MCP_AGENTS`（JSON {"<agent_id>": "<base_url>"}）
+# 为空时，服务照常在端口上跑、但 Agent 侧不登记该服务（settings.a2a_mcp_agents 空
+# → runtime 门控跳过），工具集与既有完全一致（见 services/a2a_mcp/README.md）。
+
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy
+
+# 安装 uv（官方 uv 镜像提供现成二进制）
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+# 先复制依赖清单并同步依赖（利用 Docker 层缓存：源码改动不触发重新解析依赖）。
+# --no-install-project：只装依赖、不装本项目包（运行靠源码目录，见 CMD）。
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# 只复制本服务及其包结构（services/__init__.py 提供 services 命名空间包）
+COPY services/__init__.py ./services/__init__.py
+COPY services/a2a_mcp ./services/a2a_mcp
+
+# streamable-http 默认端口；host/port/path 由 compose 的 MCP_* 环境变量覆盖
+EXPOSE 8102
+
+CMD [".venv/bin/python", "-m", "services.a2a_mcp"]

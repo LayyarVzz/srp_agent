@@ -24,6 +24,13 @@ COPY app ./app
 COPY services/__init__.py ./services/__init__.py
 COPY services/tools_mcp ./services/tools_mcp
 COPY services/rag_mcp ./services/rag_mcp
+# lark_mcp / a2a_mcp 必须一并复制：agent/runtime.py 硬 import 二者的 client_config
+# （rag_mcp 的 stdio 子进程 + lark/a2a 的 HTTP 连接配置构造都在 api 进程内完成），
+# 漏掉即容器启动 ModuleNotFoundError（plan-docker §1.1 缺陷 B1）。
+# WHY 仍复制 services 目录而非整包安装：源码目录即运行单元（PYTHONPATH=/app），
+# 与 `uv sync --no-install-project` 配套，见 Dockerfile.tools_mcp 同款说明。
+COPY services/lark_mcp ./services/lark_mcp
+COPY services/a2a_mcp ./services/a2a_mcp
 COPY shared ./shared
 COPY settings.py main.py ./
 
