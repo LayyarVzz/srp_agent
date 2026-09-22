@@ -40,6 +40,7 @@ from tests.conftest import (
     fake_structured_message,
     fake_text_message,
     make_fake_tool,
+    understand_message,
 )
 
 
@@ -69,9 +70,10 @@ def _tool_call_msg(name: str, call_id: str, args: dict[str, object] | None = Non
 
 
 def _clarify_turn(intent: Intent, question: str, options: list[str]) -> list[AIMessage]:
-    """触发澄清的一轮 LLM 消息序列：意图 + ClarifyResult（clarify 消费，回合终止）。"""
+    """触发澄清的一轮 LLM 消息序列：意图 + 查询理解 + ClarifyResult（clarify 消费，回合终止）。"""
     return [
         fake_structured_message(IntentResult(intent=intent, confidence=0.3, reason="模糊")),
+        understand_message(),
         fake_structured_message(ClarifyResult(question=question, options=options)),
     ]
 
@@ -122,6 +124,7 @@ async def test_clarify_disabled_low_confidence_direct_answer(build_graph, run_gr
             fake_structured_message(
                 IntentResult(intent=Intent.CHAT, confidence=0.3, reason="模糊")
             ),
+            understand_message(),
             fake_text_message("直接回答"),
         ],
         config=cfg,
@@ -141,6 +144,7 @@ async def test_clarify_low_confidence_tool_use_asks(build_graph, run_graph) -> N
             fake_structured_message(
                 IntentResult(intent=Intent.TOOL_USE, confidence=0.3, reason="缺算式")
             ),
+            understand_message(),
             fake_structured_message(
                 ClarifyResult(question="你想让我计算什么？请给出算式", options=[])
             ),
@@ -165,6 +169,7 @@ async def test_clarify_low_confidence_plan_asks(build_graph, run_graph) -> None:
             fake_structured_message(
                 IntentResult(intent=Intent.PLAN, confidence=0.35, reason="对象不明")
             ),
+            understand_message(),
             fake_structured_message(
                 ClarifyResult(question="你想让我整理什么内容？", options=["文档", "数据", "图片"])
             ),
@@ -190,6 +195,7 @@ async def test_clarify_missing_argument_triggers(build_graph, run_graph) -> None
             fake_structured_message(
                 IntentResult(intent=Intent.TOOL_USE, confidence=0.95, reason="工具")
             ),
+            understand_message(),
             _tool_call_msg("clock", "c1"),  # args={} → zone 缺失 → ToolInvocationError
             fake_structured_message(
                 ClarifyResult(
@@ -220,6 +226,7 @@ async def test_clarify_unknown_tool_still_falls_back(build_graph, run_graph) -> 
             fake_structured_message(
                 IntentResult(intent=Intent.TOOL_USE, confidence=0.95, reason="工具")
             ),
+            understand_message(),
             _tool_call_msg("ghost_tool", "g1"),
             fake_text_message("兜底"),
         ],
@@ -251,6 +258,7 @@ async def test_plan_mode_missing_argument_replans_not_clarify(build_graph, run_g
             fake_structured_message(
                 IntentResult(intent=Intent.PLAN, confidence=0.95, reason="复合")
             ),
+            understand_message(),
             fake_structured_message(plan),
             _tool_call_msg("clock", "c1"),  # 第 1 步参数缺失 → 重规划
             fake_structured_message(new_plan),
@@ -279,14 +287,19 @@ async def test_plan_mode_missing_argument_replans_not_clarify(build_graph, run_g
 
 
 class _RaiseAtClarify(StructuredFakeChatModel):
-    """第 raise_at 次 LLM 调用抛 RuntimeError（模拟 clarify 的 LLM 失败）。
+    """第 raise_at（0-based）次 LLM 调用抛 RuntimeError（模拟 clarify 的 LLM 失败）。
 
     计数在 super()._generate 消费消息之后自增再抛，保证被抛的那条消息已从
     迭代器消费、后续调用能取到下一条（fallback_chat 的文本消息）。
+
+    WHY 计数用共享列表而非实例字段：v6.0 起 `bind_tools` 返回**浅拷贝**
+    （fake 必须如此才能让结构化绑定互不污染），实例字段的自增只作用在副本上，
+    原对象的 `calls` 永远是 0 —— 共享列表（浅拷贝共享同一 list 对象）才跨调用可见。
     """
 
-    raise_at: int = 1  # 0=classify, 1=clarify
-    calls: int = Field(default=0, exclude=True)
+    # v6.0 起调用序为 classify(0) → understand_query(1) → clarify(2)。
+    raise_at: int = 2
+    calls: list[int] = Field(default_factory=list, exclude=True)
 
     def _generate(
         self,
@@ -296,8 +309,8 @@ class _RaiseAtClarify(StructuredFakeChatModel):
         **kwargs: Any,
     ) -> Any:
         result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        self.calls += 1
-        if self.calls - 1 == self.raise_at:
+        self.calls.append(1)
+        if len(self.calls) - 1 == self.raise_at:
             raise RuntimeError("injected clarify failure")
         return result
 
@@ -309,6 +322,7 @@ async def test_clarify_llm_failure_falls_back(make_llm_service, run_graph) -> No
             fake_structured_message(
                 IntentResult(intent=Intent.CHAT, confidence=0.3, reason="模糊")
             ),
+            understand_message(),
             fake_structured_message(ClarifyResult(question="q", options=[])),
             fake_text_message("兜底回答"),
         ],
@@ -331,6 +345,7 @@ async def test_clarify_empty_result_falls_back(build_graph, run_graph) -> None:
             fake_structured_message(
                 IntentResult(intent=Intent.CHAT, confidence=0.3, reason="模糊")
             ),
+            understand_message(),
             fake_structured_message(ClarifyResult(question="", options=[])),
             fake_text_message("兜底"),
         ]
@@ -354,8 +369,9 @@ async def test_clarify_prompt_contains_untrusted_declaration(make_llm_service, r
     graph = build_agent_graph(service)
     _, _ = await run_graph(graph, text="我想知道一下那个")
 
-    # prompts[0] = classify，prompts[1] = clarify。
-    clarify_prompt = "".join(str(getattr(m, "content", "")) for m in service.chat_model.prompts[1])
+    # prompts[0] = classify，prompts[1] = understand_query，prompts[2] = clarify
+    # （v6.0 T2 在意图分类之后插入了一次查询理解调用）。
+    clarify_prompt = "".join(str(getattr(m, "content", "")) for m in service.chat_model.prompts[2])
     assert "不可信" in clarify_prompt
 
 
@@ -369,6 +385,7 @@ async def test_clarify_state_reset_across_turns(build_graph, run_graph) -> None:
             fake_structured_message(
                 IntentResult(intent=Intent.CHAT, confidence=0.3, reason="模糊")
             ),
+            understand_message(),
             fake_structured_message(ClarifyResult(question="q1", options=["A"])),
             *chat_turn_messages(Intent.CHAT, "好的"),
         ]

@@ -243,6 +243,44 @@ class MemoryWorthConfig(BaseModel):
     memories_max_per_turn: int = Field(default=5, ge=1)
 
 
+class QueryUnderstandingConfig(BaseModel):
+    """检索前查询理解行为（v6.0 T2，dev-version6.0.md §3）。
+
+    `enabled=False` → 不做查询理解，召回与检索全部回退原始输入（v5.1 零回归）。
+
+    门控两项：`min_query_chars` 是平凡输入的长度下限（含标点的极短输入直接跳过），
+    寒暄词表在 `agent/query/gate.py`（确定性、零 LLM 成本）。
+    `hypothetical_enabled` + `hyde_max_query_chars` 构成 HyDE 的**双门控**：
+    长查询本身信息已足、HyDE 收益低而编造风险高，故只在短查询上启用。
+    """
+
+    enabled: bool = True
+    min_query_chars: int = Field(default=2, ge=1)
+    sub_query_max: int = Field(default=3, ge=0, le=5)
+    synonym_max: int = Field(default=2, ge=0, le=5)
+    max_variant_chars: int = Field(default=200, ge=8)
+    hypothetical_enabled: bool = True  # HyDE 总开关
+    hyde_max_query_chars: int = Field(default=30, ge=1)  # 仅短查询启用 HyDE（门控）
+
+
+class RetrievalConfig(BaseModel):
+    """检索侧多查询融合行为（v6.0 T2，dev-version6.0.md §6）。
+
+    `multi_query_enabled=False` → 只做检索实参改写、不做召回不足时的补检融合；
+    `override_model_query=False` → 连实参改写也关掉（退化为 v5.1 原样透传）。
+
+    补检受三重约束：变体池上限 `max_variants`、弱结果阈值 `weak_score_threshold`、
+    累计耗时预算 `multi_query_budget_s`（任一命中即停）。
+    """
+
+    multi_query_enabled: bool = True
+    max_variants: int = Field(default=3, ge=1, le=5)
+    weak_score_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    multi_query_budget_s: float = Field(default=5.0, gt=0)
+    rrf_k: int = Field(default=60, ge=1)
+    override_model_query: bool = True  # 确定性覆盖模型填的 query
+
+
 class SummarizeConfig(BaseModel):
     """滚动摘要行为（短期上下文管理）。
 
@@ -339,6 +377,10 @@ class AgentFrameworkConfig(BaseModel):
     session: SessionBehaviorConfig = Field(default_factory=SessionBehaviorConfig)
     lark: LarkToolsConfig = Field(default_factory=LarkToolsConfig)  # 飞书工具面（T4）
     a2a: A2AConfig = Field(default_factory=A2AConfig)  # A2A 智能体互联（T5）
+    query_understanding: QueryUnderstandingConfig = Field(
+        default_factory=QueryUnderstandingConfig
+    )  # 检索前查询理解（T2）
+    retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)  # 多查询融合（T2）
 
     @classmethod
     def get_default(cls) -> AgentFrameworkConfig:

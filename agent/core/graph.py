@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Coroutine, Iterable, Sequence
 from typing import Any
 
 from langchain_core.messages import (
@@ -50,6 +51,7 @@ from agent.core.state import (
     NODE_RUN_SUBAGENT,
     NODE_SUMMARIZE_HISTORY,
     NODE_TRIM_HISTORY,
+    NODE_UNDERSTAND_QUERY,
     NODE_VALIDATE_OUTPUT,
     AgentState,
 )
@@ -63,7 +65,8 @@ from agent.intent.classifiers import (
 from agent.intent.models import Intent, IntentContext
 from agent.llm import LLMService, merge_ai_message_chunks
 from agent.memory import KIND_EPISODE, KIND_FACT, KIND_PREFERENCE, MemoryStore
-from agent.memory.models import MemoryItem
+from agent.memory.models import MemoryItem, MemoryRecallResult
+from agent.query import QueryRewriter, QueryUnderstanding, should_understand
 from agent.response.models import (
     FINISHED_REASON_COMPLETED,
     FINISHED_REASON_ERROR,
@@ -641,6 +644,33 @@ def _dedup_citations(existing: Sequence[Citation], new: Sequence[Citation]) -> l
     return [c for c in new if c.source_id not in seen]
 
 
+def _clamp_variant(text: str, max_chars: int) -> str | None:
+    """变体字段长度护栏：超预算**丢弃该条**（不截断 —— 截断后的检索语义不可控）。
+
+    见 dev-version6.0.md §3.2：截断会造出一个用户和模型都没说过的查询，
+    既无法解释也无法归因；丢弃只是少一路召回，代价可控。
+    """
+    norm = text.strip()
+    if not norm or len(norm) > max_chars:
+        return None
+    return norm
+
+
+def _clamp_variants(texts: Sequence[str], *, max_items: int, max_chars: int) -> list[str]:
+    """按上限截断变体列表，并逐条过长度护栏（配置上限必须真正生效）。
+
+    WHY 在节点里就截断：模型常给出比配置更多的子查询/同义（实测 `sub_query_max=3`
+    时返回 4~5 条）。若只在融合侧按 `max_variants` 截断，配置项形同虚设，超出的文本
+    还会一直挂在图状态里（日志噪声与序列化开销）。
+    """
+    keep: list[str] = []
+    for text in texts[:max_items]:
+        norm = _clamp_variant(text, max_chars)
+        if norm is not None:
+            keep.append(norm)
+    return keep
+
+
 def _degraded_fallback_text(state: AgentState) -> str:
     """LLM 不可用时的确定性兜底话术（按错误码选择）。
 
@@ -743,6 +773,14 @@ def build_agent_graph(
     # v5.1 §5.4-2）。执行侧仍用原 `tools`（ToolNode/子图），两侧互不影响。
     tools_for_model = visible_tools(tools)
     intent_classifier = LLMIntentClassifier(llm, fallback=RuleFallbackClassifier())
+    # 查询理解（T2）：改写器只依赖结构化调用能力（见 agent/query/rewriter.py 依赖纪律）；
+    # HyDE 双门控由配置决定（总开关 + 短查询长度）。
+    qcfg = cfg.query_understanding
+    rewriter = QueryRewriter(
+        llm,
+        enable_hypothetical=qcfg.hypothetical_enabled,
+        hypothetical_max_query_chars=qcfg.hyde_max_query_chars,
+    )
 
     # —— 会话与上下文 ——
     async def load_context(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -773,30 +811,19 @@ def build_agent_graph(
         # 澄清式追问状态每轮重置（普通覆盖，防跨轮残留；追问上限按轮次计）。
         updates["clarify_asked"] = False
         updates["clarification"] = None
-        # 长期记忆：每轮重置 memory_context（普通覆盖，防 operator.add 跨轮残留累积），
-        # 再按 preload_profile 预加载 preference。
-        # raw_input 提前计算：recall 的 query 用截断后的输入（预加载语义化）。
+        # 查询理解状态每轮重置（普通覆盖）：由 understand_query 节点填充；
+        # 长期记忆召回已迁至 recall_memory（dev-version6.0 §0.3 召回重排），
+        # 本节点只做作用域与状态重置，不再触碰记忆。
+        updates["query_understanding"] = None
+        updates["retrieval_query"] = None
+        # 长期记忆：每轮重置 memory_context（普通覆盖，防 operator.add 跨轮残留累积）；
+        # preference 预加载与 fact/episode 召回统一由 recall_memory 承担（共用一份查询理解）。
         updates["memory_context"] = []
         raw_input = (state.get("input") or "").strip()
         # 输入长度护栏：超长截断而非拒绝，防止超长输入失控。
         if len(raw_input) > cfg.graph.max_input_chars:
             raw_input = raw_input[: cfg.graph.max_input_chars]
             logger.warning("输入超长，已截断到 %d 字符", cfg.graph.max_input_chars)
-        if cfg.memory.preload_profile:
-            result = await memory.recall(
-                user_id=updates["user_id"],
-                kinds=[KIND_PREFERENCE],
-                top_k=cfg.memory.top_k,
-                # query 传截断后输入：空输入走确定性模式；preference 专用权重
-                # importance 主导（身份先验），query 语义只做辅助决胜。
-                query=raw_input or None,
-                hybrid_weights=cfg.memory.recall.preference_weights,
-            )
-            if result.items:
-                updates["memory_context"] = result.items
-                updates["citations"] = _dedup_citations(
-                    state.get("citations") or [], result.sources
-                )
         if raw_input:
             updates["input"] = raw_input
             updates["messages"] = [HumanMessage(content=raw_input, id=_new_message_id("h"))]
@@ -911,23 +938,133 @@ def build_agent_graph(
         logger.info("置信度：%s", result.confidence)
         return updates
 
-    # —— 长期记忆召回（P4-3）：fact/episode 注入 memory_context，闲聊/工具共同上游 ——
-    async def recall_memory(state: AgentState) -> dict[str, Any]:
+    # —— 长期记忆召回（P4-3 语义召回；v6.0 T2 起统一承载 preference 预加载 + fact/episode）——
+    async def understand_query(state: AgentState) -> dict[str, Any]:
+        """检索前查询理解（T2）：一次结构化改写，供记忆召回与 RAG 检索共用。
+
+        门控优先（零 LLM 成本）：判定明显无需检索的输入 → 直接给常量结果，
+        下游据此跳过 fact/episode 召回与 RAG 实参改写。
+        改写失败/跳过一律零回归：`retrieval_query=None` → 下游回退原始输入（v5.1 行为）。
         """
-        按需召回 fact/episode（user 隔离，未配 embedding 自动降级 importance）
-        """
-        result = await memory.recall(
-            user_id=state.get("user_id") or "anonymous",
-            kinds=[KIND_FACT, KIND_EPISODE],
-            top_k=cfg.memory.top_k,
-            # 不传 hybrid_weights → 默认 content_weights（query 主导），与偏好预加载区分。
-            query=state.get("input") or None,
+        text = (state.get("input") or "").strip()
+        if not qcfg.enabled or not should_understand(
+            text, settings=qcfg, intent=state.get("intent")
+        ):
+            # 门控命中：不调 LLM；retrieval_needed=False 表示「本轮不需要主题检索」。
+            logger.info("查询理解门控跳过（输入无需主题检索）：%s", text[:40])
+            return {
+                "query_understanding": QueryUnderstanding(
+                    retrieval_needed=False, main_query=text, reason="确定性预门控"
+                ),
+                "retrieval_query": None,
+            }
+        understanding = await rewriter.rewrite(
+            text,
+            intent=state.get("intent"),
+            # 会话摘要/关键信息用于补全指代（已在 state，注入零额外成本）。
+            context=_intent_context_from_state(state),
         )
-        if not result.items:
+        if understanding is None:
+            return {"query_understanding": None, "retrieval_query": None}
+        main_query = _clamp_variant(understanding.main_query, qcfg.max_variant_chars) or text
+        # 现场把模型多给的子查询/同义截到配置上限（并逐条过长度护栏）后回写状态，
+        # 使 `sub_query_max` / `synonym_max` 真正生效（见 _clamp_variants 的 WHY）。
+        understanding = understanding.model_copy(
+            update={
+                "sub_queries": _clamp_variants(
+                    understanding.sub_queries,
+                    max_items=qcfg.sub_query_max,
+                    max_chars=qcfg.max_variant_chars,
+                ),
+                "synonyms": _clamp_variants(
+                    understanding.synonyms,
+                    max_items=qcfg.synonym_max,
+                    max_chars=qcfg.max_variant_chars,
+                ),
+                "hypothetical_answer": _clamp_variant(
+                    understanding.hypothetical_answer or "", qcfg.max_variant_chars
+                ),
+                "main_query": main_query,
+            }
+        )
+        logger.info(
+            "查询理解：main=%s | 子查询 %d | 同义 %d | hyde=%s | retrieval_needed=%s",
+            main_query,
+            len(understanding.sub_queries),
+            len(understanding.synonyms),
+            "有" if understanding.hypothetical_answer else "无",
+            understanding.retrieval_needed,
+        )
+        return {"query_understanding": understanding, "retrieval_query": main_query}
+
+    async def recall_memory(state: AgentState) -> dict[str, Any]:
+        """召回长期记忆（P4-3 / v6.0 T2 重排）：preference 预加载 + fact/episode 按需召回。
+
+        WHY 两处合并到本节点：v6.0 把改写节点放在召回之前，若预加载仍留在 load_context
+        就用不上改写结果（改写白跑一半），要么同一轮跑两次改写 —— 合并后**一次改写喂两次
+        召回**（dev-version6.0.md §0.3）。
+
+        `retrieval_needed=False` 只跳过 fact/episode（主题检索）；preference 是**身份预加载**、
+        不按主题检索，且既有语义要求每轮进行（`preload_profile` 开关控制）。
+        """
+        user_id = state.get("user_id") or "anonymous"
+        understanding = state.get("query_understanding")
+        retrieval_needed = understanding is None or understanding.retrieval_needed
+        query = state.get("retrieval_query") or state.get("input") or None
+        variants = (
+            understanding.retrieval_queries(max_variants=cfg.retrieval.max_variants)[1:]
+            if understanding is not None
+            else []
+        )
+
+        # 两次召回并发（互不依赖），共用一个查询与变体池。
+        tasks: list[Coroutine[Any, Any, MemoryRecallResult]] = []
+        if cfg.memory.preload_profile:
+            tasks.append(
+                memory.recall(
+                    user_id=user_id,
+                    kinds=[KIND_PREFERENCE],
+                    top_k=cfg.memory.top_k,
+                    query=query,
+                    variant_queries=variants,
+                    # preference 专用权重：importance 主导（身份先验），语义只做辅助决胜。
+                    hybrid_weights=cfg.memory.recall.preference_weights,
+                )
+            )
+        if retrieval_needed:
+            tasks.append(
+                memory.recall(
+                    user_id=user_id,
+                    kinds=[KIND_FACT, KIND_EPISODE],
+                    top_k=cfg.memory.top_k,
+                    # 不传 hybrid_weights → 默认 content_weights（query 主导）。
+                    query=query,
+                    variant_queries=variants,
+                )
+            )
+        if not tasks:
             return {}
-        updates = set_status(Status.RETRIEVING, message="正在检索长期记忆")
-        updates["memory_context"] = list(state.get("memory_context") or []) + result.items
-        updates["citations"] = _dedup_citations(state.get("citations") or [], result.sources)
+        results = await asyncio.gather(*tasks)
+
+        preference_result = results[0] if cfg.memory.preload_profile else None
+        topic_result = results[-1] if retrieval_needed else None
+        items: list[MemoryItem] = []
+        sources: list[Citation] = []
+        if preference_result is not None:
+            items.extend(preference_result.items)
+            sources.extend(preference_result.sources)
+        if topic_result is not None:
+            items.extend(topic_result.items)
+            sources.extend(topic_result.sources)
+        if not items:
+            return {}
+        updates: dict[str, Any] = {}
+        # 状态语义与 v5.1 保持一致：RETRIEVING 只在**主题召回有结果**时下发
+        # （preference 是每轮身份预加载，若也下发会让「仅预加载」的轮次多出一个检索状态帧）。
+        if topic_result is not None and topic_result.items:
+            updates.update(set_status(Status.RETRIEVING, message="正在检索长期记忆"))
+        updates["memory_context"] = list(state.get("memory_context") or []) + items
+        updates["citations"] = _dedup_citations(state.get("citations") or [], sources)
         return updates
 
     # —— 工具路径：call_model（bind_tools 选择/直接作答）+ dispatch_tool（ToolNode 执行）——
@@ -1010,7 +1147,16 @@ def build_agent_graph(
         # WHY 随输入带 user_id：ToolNode 对普通 dict 输入原样透传（`_extract_state` 对
         # dict 直接 return input），故额外键会存进 `ToolRuntime.state` —— 飞书工具作用域
         # 拦截器（LarkScopeInterceptor）据此把「谁在调用」注入 MCP 实参（v5.1 §5）。
-        result = await tool_node.ainvoke({"messages": messages, "user_id": state.get("user_id")})
+        result = await tool_node.ainvoke(
+            {
+                "messages": messages,
+                "user_id": state.get("user_id"),
+                # 查询理解产物随输入透传给 MCP 客户端拦截器（RetrievalQueryInterceptor）：
+                # 它据此确定性覆盖 rag 工具的 query 实参（v6.0 T2 §6.2）。
+                "retrieval_query": state.get("retrieval_query"),
+                "query_understanding": state.get("query_understanding"),
+            }
+        )
         new_messages = result["messages"]
         tool_msgs = {tm.tool_call_id: tm for tm in new_messages}
         records, first_error = _records_from_tool_calls(
@@ -1656,6 +1802,7 @@ def build_agent_graph(
     builder.add_node(NODE_TRIM_HISTORY, trim_history)
     builder.add_node(NODE_SUMMARIZE_HISTORY, summarize_history)
     builder.add_node(NODE_CLASSIFY_INTENT, classify_intent)
+    builder.add_node(NODE_UNDERSTAND_QUERY, understand_query)
     builder.add_node(NODE_RECALL_MEMORY, recall_memory)
     builder.add_node(NODE_CALL_MODEL, call_model)
     builder.add_node(NODE_DISPATCH_TOOL, dispatch_tool)
@@ -1681,7 +1828,10 @@ def build_agent_graph(
     builder.add_edge(NODE_LOAD_CONTEXT, NODE_TRIM_HISTORY)
     builder.add_edge(NODE_TRIM_HISTORY, NODE_SUMMARIZE_HISTORY)
     builder.add_edge(NODE_SUMMARIZE_HISTORY, NODE_CLASSIFY_INTENT)
-    builder.add_edge(NODE_CLASSIFY_INTENT, NODE_RECALL_MEMORY)
+    # 查询理解必须在召回之前（T2，dev-version6.0 §2.3 D3）：召回要读改写结果，
+    # 且 `retrieval_needed=False` 要能跳过 fact/episode 召回 —— 顺序不能反转。
+    builder.add_edge(NODE_CLASSIFY_INTENT, NODE_UNDERSTAND_QUERY)
+    builder.add_edge(NODE_UNDERSTAND_QUERY, NODE_RECALL_MEMORY)
 
     builder.add_conditional_edges(
         NODE_RECALL_MEMORY,

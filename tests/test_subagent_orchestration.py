@@ -36,6 +36,7 @@ from tests.conftest import (
     fake_structured_message,
     fake_text_message,
     make_fake_tool,
+    understand_message,
 )
 
 # 计划/子代理 prompt 的特征 marker（与 graph.py 模板文本强耦合，改模板须同步）。
@@ -52,6 +53,17 @@ def _plan_intent() -> AIMessage:
 
 def _chat_intent() -> AIMessage:
     return fake_structured_message(IntentResult(intent=Intent.CHAT, confidence=0.95, reason="闲聊"))
+
+
+def _planned_turn(intent: AIMessage, reply: AIMessage) -> list[AIMessage]:
+    """默认（未命中任何 route marker）脚本的一轮：意图分类 → 查询理解 → 终答文本。
+
+    WHY 必须夹查询理解消息：v6.0 起 `classify_intent` 之后新增 `understand_query`
+    节点，通过门控时做一次结构化 LLM 调用（fake 一次调用消费一条），故任何
+    「按调用顺序编排」的脚本都要在意图消息后补一条，否则该调用会吃掉下一条脚本消息。
+    本文件默认脚本的输入均为长句（≥2 字符且非寒暄），门控必然放行。
+    """
+    return [intent, understand_message(), reply]
 
 
 def _tool_call_msg(name: str, call_id: str, args: dict[str, Any] | None = None) -> AIMessage:
@@ -118,7 +130,7 @@ async def test_parallel_batch_fans_out_and_joins() -> None:
             ),
             (_M_SERIAL + " 3/3 步", [fake_text_message("汇总完成")]),
         ],
-        [_plan_intent(), fake_text_message("最终整合回答")],
+        _planned_turn(_plan_intent(), fake_text_message("最终整合回答")),
         tools=[calc],
     )
     response, values = await _finish(graph, "并行计算甲乙两组并汇总")
@@ -166,7 +178,7 @@ async def test_batch_failure_triggers_replan() -> None:
             (_M_REPLAN, [fake_structured_message(new_plan)]),
             (_M_SERIAL + " 1/1 步", [_tool_call_msg("fetch", "f2")]),
         ],
-        [_plan_intent(), fake_text_message("整合回答")],
+        _planned_turn(_plan_intent(), fake_text_message("整合回答")),
         tools=[
             make_fake_tool("fetch", content="数据"),
             make_fake_tool("bad_tool", fail_with=RuntimeError("boom")),
@@ -210,7 +222,7 @@ async def test_replan_failure_with_prior_success_is_partial() -> None:
             (_M_REPLAN, [fake_structured_message(new_plan)]),
             (_M_SERIAL + " 1/1 步", [_tool_call_msg("bad", "b2")]),
         ],
-        [_plan_intent(), fake_text_message("部分成功回答")],
+        _planned_turn(_plan_intent(), fake_text_message("部分成功回答")),
         tools=[
             make_fake_tool("fetch", content="数据"),
             make_fake_tool("bad", fail_with=RuntimeError("boom")),
@@ -243,7 +255,7 @@ async def test_zero_success_after_replan_falls_back() -> None:
             (_M_SUB + "再故障一步", [_tool_call_msg("bad", "b3")]),
             (_M_SUB + "再故障二步", [_tool_call_msg("bad", "b4")]),
         ],
-        [_plan_intent(), fake_text_message("兜底回答文本")],
+        _planned_turn(_plan_intent(), fake_text_message("兜底回答文本")),
         tools=[make_fake_tool("bad", fail_with=RuntimeError("boom"))],
     )
     response, values = await _finish(graph, "两路查询")
@@ -271,6 +283,7 @@ async def test_subagent_disabled_serial_zero_regression() -> None:
         [],
         [
             _plan_intent(),
+            understand_message(),
             fake_structured_message(plan),
             _tool_call_msg("fetch", "f1"),
             _tool_call_msg("fetch", "f2"),
@@ -314,6 +327,7 @@ async def test_max_parallel_one_serial_zero_regression() -> None:
         [],
         [
             _plan_intent(),
+            understand_message(),
             fake_structured_message(plan),
             _tool_call_msg("fetch", "f1"),
             _tool_call_msg("fetch", "f2"),
@@ -346,7 +360,7 @@ async def test_plan_budget_counts_subagent_tool_calls() -> None:
             (_M_SUB + "查询甲数据", [_tool_call_msg("fetch", "f1"), fake_text_message("甲数据")]),
             (_M_SUB + "查询乙数据", [_tool_call_msg("fetch", "f2"), fake_text_message("乙数据")]),
         ],
-        [_plan_intent(), fake_text_message("预算内整合回答")],
+        _planned_turn(_plan_intent(), fake_text_message("预算内整合回答")),
         cfg=cfg,
         tools=[make_fake_tool("fetch", content="数据")],
     )
@@ -383,7 +397,7 @@ async def test_serial_then_parallel_mixed_mode() -> None:
                 [_tool_call_msg("calc", "c2"), fake_text_message("乙分析完成")],
             ),
         ],
-        [_plan_intent(), fake_text_message("最终整合回答")],
+        _planned_turn(_plan_intent(), fake_text_message("最终整合回答")),
         tools=[
             make_fake_tool("fetch", content="基准数据"),
             make_fake_tool("calc", content="分析ok"),
@@ -423,8 +437,9 @@ async def test_subagent_state_reset_across_turns() -> None:
             (_M_SUB + "查询乙数据", [_tool_call_msg("fetch", "f2"), fake_text_message("乙数据")]),
         ],
         [
-            _plan_intent(),
-            fake_text_message("第一轮整合回答"),
+            *_planned_turn(_plan_intent(), fake_text_message("第一轮整合回答")),
+            # 第二轮输入是寒暄词「谢谢」（CHAT 且整句命中词表）→ 查询理解被门控跳过、
+            # 不消费 LLM 消息，故此处**不补** understand_message()。
             _chat_intent(),
             fake_text_message("不客气"),
         ],
@@ -459,7 +474,7 @@ async def test_subagent_result_model_in_state() -> None:
             (_M_SUB + "查询甲数据", [_tool_call_msg("fetch", "f1"), fake_text_message("甲数据")]),
             (_M_SUB + "查询乙数据", [_tool_call_msg("fetch", "f2"), fake_text_message("乙数据")]),
         ],
-        [_plan_intent(), fake_text_message("整合回答")],
+        _planned_turn(_plan_intent(), fake_text_message("整合回答")),
         tools=[make_fake_tool("fetch", content="数据")],
     )
     _, values = await _finish(graph, "两路查询")
@@ -506,7 +521,7 @@ async def test_generate_answer_integrates_subagent_results() -> None:
             (_M_SUB + "查询甲数据", [_tool_call_msg("fetch", "f1"), fake_text_message("甲数据")]),
             (_M_SUB + "查询乙数据", [_tool_call_msg("fetch", "f2"), fake_text_message("乙数据")]),
         ],
-        [_plan_intent(), fake_text_message("两路结果已整合")],
+        _planned_turn(_plan_intent(), fake_text_message("两路结果已整合")),
         tools=[make_fake_tool("fetch", content="数据")],
     )
     response, _ = await _finish(graph, "两路查询")
@@ -543,7 +558,7 @@ async def test_serial_step_sees_upstream_subagent_results() -> None:
                 [_tool_call_msg("calc", "c2"), fake_text_message("乙分析完成")],
             ),
         ],
-        [_plan_intent(), fake_text_message("最终整合回答")],
+        _planned_turn(_plan_intent(), fake_text_message("最终整合回答")),
         tools=[
             make_fake_tool("fetch", content="基准数据"),
             make_fake_tool("calc", content="分析ok"),
@@ -586,7 +601,7 @@ async def test_integration_reports_current_failed_step_only() -> None:
             (_M_SUB + "再查询", [_tool_call_msg("fetch", "f2"), fake_text_message("再查询数据")]),
             (_M_SUB + "再汇总", [_tool_call_msg("bad2", "b2")]),
         ],
-        [_plan_intent(), fake_text_message("部分成功回答")],
+        _planned_turn(_plan_intent(), fake_text_message("部分成功回答")),
         tools=[
             make_fake_tool("fetch", content="数据"),
             make_fake_tool("bad1", fail_with=RuntimeError("失败甲号")),

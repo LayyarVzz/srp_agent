@@ -43,6 +43,10 @@ class MemoryRecallConfig(BaseModel):
     # 近因半衰期（天）：recency = 1/(1 + age_days/half_life)，越大衰减越慢。
     recency_half_life_days: float = Field(default=30.0, ge=1.0)
 
+    # 多查询 RRF 融合的平滑常数（v6.0 T2）：越大名次差异被压得越平、头部越不激进。
+    # 只在传入 `variant_queries`（变体池）时生效；单查询路径不使用融合。
+    rrf_k: int = Field(default=60, ge=1)
+
     @model_validator(mode="after")
     def _validate_weights_non_negative(self) -> MemoryRecallConfig:
         """两套权重每项必须非负；元组长度已由 `tuple[float, float, float]`
