@@ -2,25 +2,38 @@
 #
 # 服务说明：
 #   - postgres  : 记忆后端（长期 Store + checkpointer + 会话 sessions 表共用此库）。
-#                 pgvector 镜像内置 vector 扩展，语义召回（EMBEDDING_ENABLED）必需。
-#   - tools_mcp : 工具服务，以 streamable-http 方式运行在 8100 端口。
+#                 pgvector 镜像内置 vector 扩展，语义召回（EMBEDDING_ENABLED）必需；
+#                 lark_mcp 的绑定域（lark_bindings / lark_device_flows）**也落这个库**。
+#   - tools_mcp : 工具服务（datetime 等纯函数），以 streamable-http 方式运行在 8100 端口。
+#   - lark_mcp  : 飞书工具面 + 账号绑定，streamable-http 运行在 8101；lark-cli 在本容器内。
+#   - a2a_mcp   : 远端智能体协作工具，streamable-http 运行在 8102（注册表为空则工具不登记）。
+#   - api       : FastAPI + Agent 组合根，对外开放 8000。
 #   - qdrant    : RAG 向量库（Agent 主流程暂不使用，后续接 RAG 时取消注释即可）。
 #
 # 使用（仓库根目录）：
-#   docker compose up -d --build   # 首次：构建 tools_mcp 镜像并启动
+#   docker compose up -d --build   # 首次：构建全部镜像并启动
 #   docker compose up -d           # 之后直接启动
 #   docker compose ps              # 查看状态
-#   docker compose logs -f tools_mcp
+#   docker compose logs -f lark_mcp
 #   docker compose down            # 停止（数据卷保留）
 #   docker compose down -v         # 停止并删除数据卷（彻底清理）
 #
 # 之后在 .env 里配：
 #   LLM_PROVIDER=deepseek
 #   LLM_API_KEY=sk-xxx
+#   LARK_APP_ID / LARK_APP_SECRET / LARK_TOKEN_KEY   # 飞书绑定闭环（三件套缺一即 fail-closed）
+#   MCP_TRANSPORT=streamable-http                    # 仅本机 uv 运行 Agent 时需要
 #   DATABASE_URL=postgresql://postgres:postgres@localhost:5432/srp_agent
-#   MCP_TRANSPORT=streamable-http
-# 即可让Agent直连上面的 Postgres 与 tools_mcp。
+# 即可让Agent直连上面的 Postgres 与各 MCP 服务。
 name: srp-agent
+
+# 日志：统一走 stdout，聚合交 `docker compose logs`；轮转交 json-file driver。
+# WHY：容器内写文件在多 worker / 容器重建下必然丢（plan-docker §4），故不落盘、只轮转。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
   postgres:
@@ -41,6 +54,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+    logging: *default-logging
     restart: unless-stopped
 
   tools_mcp:
@@ -59,13 +73,93 @@ services:
       MCP_STATELESS_HTTP: "true"
       LOG_LEVEL: INFO
     ports:
-      - "8100:8100"
+      # 只绑回环：MCP 服务供 api 容器经 compose 网络访问，无需对整个局域网开放
+      - "127.0.0.1:8100:8100"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)\""]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 15s
+    logging: *default-logging
+    restart: unless-stopped
+
+  lark_mcp:
+    # 飞书工具面 + 账号绑定（v5.1 §8.1）：独立容器，lark-cli 二进制装在本镜像内。
+    # api 侧经 LARK_MCP_TRANSPORT=streamable-http 连过来，**不在 api 容器里探测 CLI**。
+    build:
+      context: .
+      dockerfile: Dockerfile.lark_mcp
+    image: srp-agent-lark-mcp:latest
+    container_name: srp-agent-lark-mcp
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8101
+      MCP_STREAMABLE_HTTP_PATH: /mcp
+      MCP_STATELESS_HTTP: "true"
+      # —— 绑定域数据库：必须显式指向编排内的 pgvector ——
+      # WHY（容器化陷阱 2）：DSN 缺失时绑定域退化为 `sqlite+aiosqlite:///:memory:`，
+      # 「看着成功、实际无效」；且 lark_bind_start（写待定态）与 lark_bind_complete
+      # （读回）是**两次独立工具调用** → 内存库互相不可见 → 对话内绑定闭环静默断链。
+      # 只给 LARK_DATABASE_URL（绑定域专用，优先级高于 DATABASE_URL），**不注入
+      # DATABASE_URL**：本服务不承担记忆/会话后端，少一份全局裁决就少一处误配。
+      LARK_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/srp_agent
+      # —— lark-cli 命令：镜像内绝对路径（PATH 探测可用，但显式更可诊断）——
+      LARK_CLI_COMMAND: /usr/local/bin/lark-cli
+      # —— 飞书应用（仅作 OAuth 客户端，无 bot 身份）+ 令牌加密密钥 ——
+      # ⚠️ LARK_TOKEN_KEY 必须与 api 侧**同值**（容器化陷阱 3）：密文由本服务写入，
+      #    api 侧解密取用；不同值 = 绑定链路静默失败。
+      LARK_APP_ID: ${LARK_APP_ID:-}
+      LARK_APP_SECRET: ${LARK_APP_SECRET:-}
+      LARK_TOKEN_KEY: ${LARK_TOKEN_KEY:-}
+      LARK_BINDING_ENABLED: ${LARK_BINDING_ENABLED:-true}
+      LARK_ACCOUNTS_BASE_URL: ${LARK_ACCOUNTS_BASE_URL:-https://accounts.feishu.cn}
+      LARK_OPEN_BASE_URL: ${LARK_OPEN_BASE_URL:-https://open.feishu.cn}
+      # 配置态单用户回退路径（不配 LARK_TOKEN_KEY 时使用；多用户隔离不可用）
+      LARK_USER_ACCESS_TOKEN: ${LARK_USER_ACCESS_TOKEN:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      # 只绑回环：api 容器经 compose 网络直连，本机联调时该映射已够用
+      - "127.0.0.1:8101:8101"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8101/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *default-logging
+    restart: unless-stopped
+
+  a2a_mcp:
+    # 远端智能体协作工具（T6）：注册表为空时服务照常跑，但 api 侧不登记该服务（零回归）。
+    build:
+      context: .
+      dockerfile: Dockerfile.a2a_mcp
+    image: srp-agent-a2a-mcp:latest
+    container_name: srp-agent-a2a-mcp
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8102
+      MCP_STREAMABLE_HTTP_PATH: /mcp
+      MCP_STATELESS_HTTP: "true"
+      # 远端注册表 JSON {"<agent_id>": "<base_url>"}；空表 → 无工具可调（零回归）
+      A2A_MCP_AGENTS: ${A2A_MCP_AGENTS:-}
+      A2A_MCP_PEER_ID: ${A2A_MCP_PEER_ID:-srp-agent}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8102:8102"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8102/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *default-logging
     restart: unless-stopped
 
   api:
@@ -91,6 +185,22 @@ services:
       MCP_HOST: tools_mcp
       MCP_PORT: 8100
       MCP_STREAMABLE_HTTP_PATH: /mcp
+      # —— lark_mcp：**独立连接项**，刻意不复用上面的 MCP_*（那是 tools_mcp 的 8100）——
+      #    lark 走 streamable-http 后，api 侧不做本地 CLI 探测（lark-cli 在 lark_mcp 容器内）。
+      LARK_MCP_TRANSPORT: streamable-http
+      LARK_MCP_HOST: lark_mcp
+      LARK_MCP_PORT: 8101
+      LARK_CLI_ENABLED: ${LARK_CLI_ENABLED:-true}
+      # 飞书凭据与本服务侧**同值**（token 密文加解密需同源密钥，见 lark_mcp service 注释）
+      LARK_APP_ID: ${LARK_APP_ID:-}
+      LARK_APP_SECRET: ${LARK_APP_SECRET:-}
+      LARK_TOKEN_KEY: ${LARK_TOKEN_KEY:-}
+      # —— a2a_mcp：注册表非空才登记（空表 = 工具集与既有完全一致，零回归）——
+      A2A_MCP_ENABLED: ${A2A_MCP_ENABLED:-true}
+      A2A_MCP_AGENTS: ${A2A_MCP_AGENTS:-}
+      A2A_MCP_PEER_ID: ${A2A_MCP_PEER_ID:-srp-agent}
+      A2A_MCP_HOST: a2a_mcp
+      A2A_MCP_PORT: 8102
       # —— 语义召回（可选，默认关；与 .env 对齐）——
       EMBEDDING_ENABLED: ${EMBEDDING_ENABLED:-false}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
@@ -111,12 +221,19 @@ services:
         condition: service_healthy
       tools_mcp:
         condition: service_healthy
+      # 等 MCP 服务 healthy 再启动：MCP 客户端连接失败会降级为空工具集，
+      # 静默丢工具面比启动慢几秒更糟（api 侧 get_tools 有有限重试，见 agent/tools/factory.py）。
+      lark_mcp:
+        condition: service_healthy
+      a2a_mcp:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)\""]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 20s
+    logging: *default-logging
     restart: unless-stopped
 
   # —— 可选：Qdrant（RAG 向量库）。Agent 主流程不用，后续接 RAG 时再启用 ——
