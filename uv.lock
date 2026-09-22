@@ -2411,6 +2411,7 @@ name = "srp-agent"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "aiosqlite" },
     { name = "cryptography" },
     { name = "fastapi", extra = ["standard"] },
     { name = "fastmcp" },
@@ -2439,6 +2440,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiosqlite", specifier = ">=0.22.1" },
     { name = "cryptography", specifier = ">=50.0.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.140.13" },
     { name = "fastmcp", specifier = ">=3.4.5" },

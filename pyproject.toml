@@ -5,6 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # aiosqlite 是**运行期**依赖而非仅测试依赖：`shared/lark/repository.py` 与
+    # `agent/session/repository.py` 的「无 DSN → SQLite memory」回退分支以字符串
+    # `sqlite+aiosqlite:///:memory:` 交给 SQLAlchemy，方言在 create_async_engine 时
+    # 才惰性导入该包 → 容器内 `uv sync --no-dev` 缺它会 ModuleNotFoundError。
+    "aiosqlite>=0.22.1",
     "cryptography>=50.0.0",
     "fastapi[standard]>=0.140.13",
     "fastmcp>=3.4.5",
