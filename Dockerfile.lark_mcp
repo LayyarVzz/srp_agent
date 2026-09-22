@@ -20,13 +20,14 @@
 #   3. LARK_TOKEN_KEY 必须与 api 容器**同值**：密文由本服务写入
 #      （shared/lark/repository.py），api 侧要解密取用；不同值 = 绑定链路静默失败。
 
-# ① 取 lark-cli 独立二进制：npm 包只是「下载器 + 垫片」，postinstall 把平台二进制
-#    放进包内 bin/。构建期一次性取出，运行期**不带 node**（省 ~47 MB 且少一个攻击面）。
+# ---------- ① 取 lark-cli 二进制（构建期专用，不进运行期镜像） ----------
+# npm 包只是「下载器 + 垫片」，postinstall 把平台二进制放进包内 bin/。
+# 运行期**不带 node**（省 ~47 MB 且少一个攻击面）。
 FROM node:22-bookworm-slim AS larkcli
 
 # 版本钉死：CLI 输出契约（`--format json`、`"ok": true`、退出码语义）见 cli.py 模块
 # docstring，随版本漂移会打破工具层解析，故不可用 @latest。
-# 不用 alpine：目标是 glibc 平台的预制二进制，musl 基底跑不起来。
+# 不用 alpine：目标是 glibc 平台的预制二进制（实测该二进制为静态链接，但基座按官方口径取 glibc）。
 ARG LARK_CLI_VERSION=1.0.95
 # curl 是**必需**的：npm 包自带的 postinstall（scripts/install.js）用
 # `spawnSync curl` 下载平台二进制，而 node:*-slim 基底不含 curl →
@@ -39,15 +40,32 @@ RUN set -eux; \
 RUN --mount=type=cache,target=/root/.npm \
     npm install -g "@larksuite/cli@${LARK_CLI_VERSION}"
 
-# ② 运行期：纯 python-slim + 二进制（零 node / 零 npm）
-FROM python:3.12-slim
+# ---------- ② 构建期：只负责产出 /app/.venv ----------
+FROM python:3.12-slim AS builder
+
+# uv 钉版本（`:latest` 不可复现）；libc 变体须与基底一致（Debian/glibc）。
+COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /uvx /bin/
+
+ENV UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_CACHE_DIR=/root/.cache/uv
+
+WORKDIR /app
+
+# 先复制依赖清单并同步依赖（利用 Docker 层缓存：源码改动不触发重新解析依赖）。
+# --no-install-project：只装依赖、不装本项目包（运行靠源码目录，见 CMD）。
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=README.md,target=README.md \
+    uv sync --frozen --no-dev --no-install-project
+
+# ---------- ③ 运行期：纯 python-slim + 二进制（零 node / 零 npm） ----------
+FROM python:3.12-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app
-
-# 安装 uv（官方 uv 镜像提供现成二进制）
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # 飞书 CLI 身份与配置目录（§陷阱 1）：配置目录放 /tmp（容器内可写、无需持久化）。
 # 无 bot 身份（D5.1.4）：strict mode / default-as 在 CLI 侧兜底为 user，
@@ -59,10 +77,7 @@ ENV LARKSUITE_CLI_CONFIG_DIR=/tmp/lark-cli \
 
 WORKDIR /app
 
-# 先复制依赖清单并同步依赖（利用 Docker 层缓存：源码改动不触发重新解析依赖）。
-# --no-install-project：只装依赖、不装本项目包（运行靠源码目录，见 CMD）。
-COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-install-project
+COPY --from=builder /app/.venv /app/.venv
 
 # 只复制本服务所需源码：services/__init__.py 提供 services 命名空间包；
 # shared/lark 是绑定域（OAuth/令牌加解密/仓库），与 agent 侧共用。
