@@ -45,7 +45,10 @@ from services.a2a_mcp.client_config import (
     build_a2a_mcp_stdio_connection,
 )
 from services.lark_mcp.cli import resolve_lark_cli_command
-from services.lark_mcp.client_config import build_lark_mcp_stdio_connection
+from services.lark_mcp.client_config import (
+    build_lark_mcp_http_connection,
+    build_lark_mcp_stdio_connection,
+)
 from services.rag_mcp.client_config import (
     RAG_MCP_SERVER_NAME,
     build_rag_mcp_stdio_connection,
@@ -343,9 +346,11 @@ def _build_mcp_servers(settings: RuntimeSettings, cfg: AgentFrameworkConfig) -> 
     rag_mcp 仅 stdio（见 services/rag_mcp/client_config.py）；tools_mcp 双传输：
     streamable-http 走远端地址，stdio 以子进程自动拉起（见 services/tools_mcp/client_config.py）。
 
-    lark_mcp（T4）门控装配（dev-version5.0 §3.1）：仅当「框架配置启用（cfg.lark.enabled）
-    且环境启用（LARK_CLI_ENABLED）且 lark-cli 命令探测成功」才登记；任一不满足则跳过并记
-    日志——无 CLI 环境下 Agent 以既有工具集照常服务（零回归，与 MCP 连接失败降级同语义）。
+    lark_mcp（T4）门控装配（dev-version5.0 §3.1）：stdio 形态仅当「框架配置启用
+    （cfg.lark.enabled）且环境启用（LARK_CLI_ENABLED）且 lark-cli 命令探测成功」才登记；
+    HTTP 形态（lark_mcp 独立容器，v5.1 §8.1）改由 `LARK_MCP_TRANSPORT` 决定，且
+    **不做本地探测**（CLI 在另一容器，api 侧探测无意义）—— 任一不满足则跳过并记
+    日志，Agent 以既有工具集照常服务（零回归，与 MCP 连接失败降级同语义）。
 
     a2a_mcp（T6 远端智能体协作工具）与 tools_mcp 同传输方式，但**配置+注册表双门控**：
     仅当 a2a_mcp_enabled 且注册表非空才登记——无远端配置时工具集与既有完全一致（零回归）。
@@ -368,15 +373,38 @@ def _build_mcp_servers(settings: RuntimeSettings, cfg: AgentFrameworkConfig) -> 
         servers[TOOLS_MCP_SERVER_NAME] = build_tools_mcp_stdio_connection()
         if register_a2a:
             servers[A2A_MCP_SERVER_NAME] = build_a2a_mcp_stdio_connection()
-    if cfg.lark.enabled and settings.lark_cli_enabled:
-        if resolve_lark_cli_command(settings.lark_cli_command):
-            servers[LARK_MCP_SERVER_NAME] = build_lark_mcp_stdio_connection()
-        else:
-            logger.warning(
-                "lark-cli 命令探测失败，跳过 lark_mcp 登记"
-                "（无 CLI 环境零回归；可配置 LARK_CLI_COMMAND 指向可执行文件）"
-            )
+    lark_conn = _build_lark_connection(settings, cfg)
+    if lark_conn is not None:
+        servers[LARK_MCP_SERVER_NAME] = lark_conn
     return servers
+
+
+def _build_lark_connection(settings: RuntimeSettings, cfg: AgentFrameworkConfig) -> dict | None:
+    """按传输方式构造 lark_mcp 连接配置；未登记返回 None（零回归门控在此集中）。
+
+    HTTP 形态（容器 / 远程部署）：lark-cli 住在 **lark_mcp 容器内**，api 侧不持有它
+    → **不做本地命令探测**（探测的是本机 PATH，与远端容器能力无关，必失败且失败
+    会静默丢掉整个飞书工具面）。门控收敛为「框架启用 + 环境启用」，与 a2a_mcp
+    的「配置 + 注册表」双门控同语义。
+
+    stdio 形态（本地开发，语义逐字未变）：仍需 `resolve_lark_cli_command` 探测 ——
+    CLI 与 api 同机，探测成功才登记；无 CLI 环境不登记、Agent 以既有工具集照常服务。
+    """
+    if not (cfg.lark.enabled and settings.lark_cli_enabled):
+        return None
+    if settings.lark_mcp_transport is MCPTransport.STREAMABLE_HTTP:
+        return build_lark_mcp_http_connection(
+            host=settings.lark_mcp_host,
+            port=settings.lark_mcp_port,
+            path=settings.mcp_streamable_http_path,
+        )
+    if resolve_lark_cli_command(settings.lark_cli_command):
+        return build_lark_mcp_stdio_connection()
+    logger.warning(
+        "lark-cli 命令探测失败，跳过 lark_mcp 登记"
+        "（无 CLI 环境零回归；可配置 LARK_CLI_COMMAND 指向可执行文件）"
+    )
+    return None
 
 
 __all__ = ["A2AStreamEvent", "AgentRuntime", "ChatStreamEvent"]

@@ -38,3 +38,16 @@ def build_lark_mcp_stdio_connection() -> StdioConnection:
         "cwd": str(_get_repo_root()),
         "env": env,
     }
+
+
+def build_lark_mcp_http_connection(*, host: str, port: int, path: str) -> dict[str, str]:
+    """构造连接 lark_mcp 的 streamable-http 配置（容器 / 远程部署形态）。
+
+    WHY 地址必须由调用方显式传入（而非本模块读 env）：与 tools_mcp / a2a_mcp 的
+    builder 同构 —— 连接参数是运行环境决策（settings.py），本模块只做纯构造，
+    避免「服务侧偷偷读一份 env」导致配置来源分裂（CLAUDE.md：单点配置）。
+
+    注意服务端传输值用连字符 `streamable-http`，客户端连接键用下划线
+    `streamable_http`（fastmcp 与 langchain-mcp-adapters 的既有差异）。
+    """
+    return {"transport": "streamable_http", "url": f"http://{host}:{port}{path}"}

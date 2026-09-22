@@ -10,6 +10,7 @@ import pytest
 
 from agent.core.config import AgentFrameworkConfig, LarkToolsConfig
 from agent.runtime import _build_mcp_servers
+from services.tools_mcp.config import MCPTransport
 from settings import RuntimeSettings
 
 FAKE_CLI = "/fake/path/lark-cli"
@@ -82,3 +83,54 @@ def test_existing_services_unconditional(settings, cfg, probe_fail) -> None:
     servers = _build_mcp_servers(settings, cfg)
     assert servers["rag"]["transport"] == "stdio"
     assert servers["tools_mcp"]["transport"] == "stdio"
+
+
+# —— HTTP 形态（lark_mcp 独立容器，v5.1 §8.1 / plan-docker §2.2）——
+
+
+@pytest.fixture
+def http_settings(settings) -> RuntimeSettings:
+    """容器部署形态：lark 走 streamable-http，指向 compose 服务名。
+
+    WHY 用枚举值而非字符串：`model_copy(update=...)` **绕过校验**，传字符串会让
+    运行时 `is MCPTransport.STREAMABLE_HTTP` 判定失效（真实 env 路径经
+    pydantic-settings 校验，恒为枚举成员）。
+    """
+    return settings.model_copy(
+        update={
+            "lark_mcp_transport": MCPTransport.STREAMABLE_HTTP,
+            "lark_mcp_host": "lark_mcp",
+            "lark_mcp_port": 8101,
+        }
+    )
+
+
+def test_lark_http_registered_without_local_probe(http_settings, cfg, probe_fail) -> None:
+    """HTTP 形态不探测本地 CLI：lark-cli 在另一容器，探测必失败但登记照常（B3 修复）。"""
+    servers = _build_mcp_servers(http_settings, cfg)
+    assert set(servers) == {"rag", "tools_mcp", "lark_mcp"}
+    lark_conn = servers["lark_mcp"]
+    assert lark_conn["transport"] == "streamable_http"
+    assert lark_conn["url"] == "http://lark_mcp:8101/mcp"
+    # tools_mcp 传输与本项**刻意分离**：lark 走 HTTP 不代表 tools_mcp 也走 HTTP。
+    assert servers["tools_mcp"]["transport"] == "stdio"
+
+
+def test_lark_http_still_gated_by_environment(http_settings, cfg, probe_ok) -> None:
+    """HTTP 形态下双门控仍生效：环境关闭 → 不登记（探测成功也不登记）。"""
+    env_settings = http_settings.model_copy(update={"lark_cli_enabled": False})
+    assert "lark_mcp" not in _build_mcp_servers(env_settings, cfg)
+
+
+def test_lark_http_still_gated_by_framework_config(http_settings, probe_ok) -> None:
+    """HTTP 形态下框架配置门控仍生效：cfg.lark.enabled=False → 不登记。"""
+    cfg = AgentFrameworkConfig.get_default()
+    cfg.lark = LarkToolsConfig(enabled=False)
+    assert "lark_mcp" not in _build_mcp_servers(http_settings, cfg)
+
+
+def test_lark_stdio_semantics_unchanged(settings, cfg, probe_ok) -> None:
+    """默认（stdio）路径逐字未变：仍是子进程形态，且探测成功才登记。"""
+    servers = _build_mcp_servers(settings, cfg)
+    assert servers["lark_mcp"]["transport"] == "stdio"
+    assert servers["lark_mcp"]["args"] == ["-m", "services.lark_mcp"]
