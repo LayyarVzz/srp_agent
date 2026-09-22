@@ -87,3 +87,26 @@ A2A_MCP_AGENTS='{"peer_agent":"http://host.docker.internal:9000"}' docker compos
 - 编排内地址：api 侧 `A2A_MCP_HOST=a2a_mcp` / `A2A_MCP_PORT=8102`（compose 网络内解析）；
 - 宿主端口映射为 `127.0.0.1:8102`（仅供本机联调，容器间走 compose 网络）；
 - 远端智能体若跑在**宿主**上，容器内需用 `host.docker.internal` 作 base_url。
+
+## 镜像瘦身与裁剪边界
+
+镜像不是「装齐 `uv.lock` 的全部依赖」，而是按本服务真实 import 面裁剪
+（plan-docker-observability.md §3）：
+
+| 手段 | 效果 |
+|---|---|
+| 多阶段 + `--mount=type=cache,target=/root/.cache/uv` + 显式 `UV_CACHE_DIR` | 镜像内**零 uv 缓存残留**（此前每镜像残留 241 MB） |
+| `UV_PYTHON_DOWNLOADS=never` + uv 钉版本 | 不会自下载 CPython；构建可复现 |
+| `PYTHONDONTWRITEBYTECODE=1` | 不写 `.pyc` |
+| `uv sync --no-install-package …`（见 `Dockerfile.a2a_mcp`） | `.venv` 240 MB → **104 MB** |
+
+**裁剪边界（改动本服务代码后必须复核）**：本镜像的第三方 import 面只有
+`fastmcp` / `starlette` / `httpx` / `pydantic` / `pydantic-settings`，以及
+**`langchain-mcp-adapters`** —— 后者来自 `client_config.py` 的
+`from langchain_mcp_adapters.sessions import StdioConnection`，**实测裁掉即
+`ModuleNotFoundError`**，故不可进入排除清单。
+
+> 复核方法（零成本）：从排除清单里去掉可疑项后重建，或直接用
+> `docker run --rm <img> /app/.venv/bin/python -c "import services.a2a_mcp.server"` 冒烟。
+> **裁剪方式的已知代价**：新增依赖时构建期不报错、运行期才报 —— 因此新增 import
+> 必须同步更新 Dockerfile 的排除清单。

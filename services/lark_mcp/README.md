@@ -164,6 +164,34 @@ docker run --rm -p 127.0.0.1:8101:8101 \
 
 > 绑定域的真实闭环（写密文 → 读回）**必须**用 Postgres：内存库只够冒烟探活。
 
+### 镜像瘦身与裁剪边界（Phase B）
+
+本镜像不是「装齐 `uv.lock` 的全部依赖」，而是按**本服务真实 import 面**裁剪
+（plan-docker-observability.md §3）：
+
+| 手段 | 效果（本机实测） |
+|---|---|
+| 多阶段（builder → runtime）+ `--mount=type=cache,target=/root/.cache/uv` + 显式 `UV_CACHE_DIR` | 镜像内**零 uv 缓存残留**（原来每镜像残留 **241 MB**） |
+| uv 钉 `0.11.28`（原 `:latest`）+ `UV_PYTHON_DOWNLOADS=never` | 不自下载 CPython；构建可复现 |
+| 构建期不编译字节码 + runtime `PYTHONDONTWRITEBYTECODE=1` | `.pyc` 归零（api/tools 各省 **88 MB**；lark/a2a 本就没有） |
+| `uv sync --no-install-package …`（见 `Dockerfile.lark_mcp`） | `.venv` **240 MB → 136 MB**；镜像 946 MB → 417 MB |
+
+**裁剪边界（改动本服务代码后必须复核）**：本镜像的第三方 import 面 =
+`fastmcp` / `starlette`（服务与 `/health`）+ `pydantic` + `pydantic-settings` +
+`sqlalchemy` + `aiosqlite` + **`psycopg[binary]`**（绑定域仓库建表与读写）+
+`cryptography`（Fernet）+ `httpx`（OAuth）+ `langchain-mcp-adapters`。
+
+> ⚠️ **`psycopg` 不可裁（实测踩过）**：绑定域仓库把 DSN 改写成
+> `postgresql+psycopg://`（`shared/lark/repository.py::_build_engine`），而 SQLAlchemy
+> 的方言是**运行期按 URL 惰性导入**的 —— 裁掉后构建期不报错，启动建表阶段才
+> `ModuleNotFoundError`。容器内 compose 恒注入 Postgres DSN，故必须保留。
+> 同理 `langchain-mcp-adapters` 来自 `client_config.py` 的 `StdioConnection` 导入，也不可裁。
+
+**复核方式（零成本）**：
+`docker run --rm srp-agent-lark-mcp:latest /app/.venv/bin/python -c "import services.lark_mcp.server"`。
+**本裁剪方式的已知代价**：新增 import 时构建期不报错、运行期才报 —— 因此给本服务加依赖
+必须同步更新 Dockerfile 的排除清单。
+
 ## 数据模型
 
 两张表（`shared/lark/repository.py`，SQLAlchemy；dev=SQLite memory / prod=Postgres）：
