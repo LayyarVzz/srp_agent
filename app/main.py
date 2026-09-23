@@ -4,6 +4,9 @@ Windows 注意：`ensure_selector_event_loop()` 必须在任何事件循环创�
 放本模块导入期=——漏掉它 Postgres 异步连接会报
 `Psycopg cannot use the 'ProactorEventLoop'`（纯 SQLite memory 路径不受影响）。
 
+日志：配置统一经 `shared.logging`（与 3 个 MCP 服务同一 formatter / 脱敏 / 关联标识口径）；
+`RequestContextMiddleware` 在入口注入 `X-Request-Id`，使 api→agent→MCP 全链路可 grep。
+
 根 `main.py` 仅 re-export 本模块的 `app`（保持 `uvicorn main:app` 兼容）。
 """
 
@@ -21,11 +24,16 @@ from agent.runtime import AgentRuntime
 from agent.share.eventloop import ensure_selector_event_loop
 from app.a2a import routes as a2a
 from app.errors import register_exception_handlers
+from app.request_context import REQUEST_ID_HEADER_OUT, RequestContextMiddleware
 from app.routes import chat, health, sessions
-from settings import configure_logging, get_settings
+from settings import get_settings
+from shared.logging import LoggingConfig, ServiceName, configure_logging
 
 # Windows：psycopg 异步需 SelectorEventLoop，须在 uvicorn 建 loop 之前设置（模块导入期）。
 ensure_selector_event_loop()
+
+# 允许外部携带/读取的关联头：CORS 下不回 expose，前端就拿不到 trace_id 去对日志。
+_REQUEST_ID_HEADERS = ["X-Request-Id", "X-User-Id"]
 
 
 def create_app(*, runtime: AgentRuntime | None = None) -> FastAPI:
@@ -41,7 +49,8 @@ def create_app(*, runtime: AgentRuntime | None = None) -> FastAPI:
             await app.state.runtime.aclose()
 
     settings = get_settings()
-    configure_logging(settings)
+    # 日志单点配置：service=api（事件按进程归属），格式/级别来自 LOG_* 环境项。
+    configure_logging(LoggingConfig.from_settings(settings, service=ServiceName.API))
     app = FastAPI(
         title=settings.app_name,
         description="数字人 Agent 交互服务（MVP）：会话管理 + 文字/语音交互（SSE）",
@@ -55,9 +64,13 @@ def create_app(*, runtime: AgentRuntime | None = None) -> FastAPI:
         allow_origins=settings.cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "X-User-Id"],
+        allow_headers=[*_REQUEST_ID_HEADERS, "Content-Type"],
+        # 不回 expose_headers，浏览器侧 JS 读不到 X-Request-Id → 前端报错时无法提供 trace_id。
+        expose_headers=[REQUEST_ID_HEADER_OUT],
     )
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])  # dev；部署收紧
+    # 关联上下文（最外层：异常路径与第三方库日志也要带 trace_id）。
+    app.add_middleware(RequestContextMiddleware)
     register_exception_handlers(app)
     app.include_router(health.router)
     app.include_router(sessions.router, prefix="/api/v1")

@@ -137,6 +137,20 @@ def test_mask_value_walks_structures() -> None:
     assert masked["b"]["api_key"] == MASKED
 
 
+def test_mask_value_preserves_tuple_type() -> None:
+    """tuple 保持 tuple：改成 list 会让 logging 的 `%` 拼装抛 TypeError（每条带参日志都炸）。"""
+    masked = mask_value(("Bearer abcdef1234567890", 1))
+    assert isinstance(masked, tuple)
+    assert masked[1] == 1
+
+
+def test_parametrized_log_renders_after_masking(text_record) -> None:
+    """带参日志（`%s`/`%d`）经脱敏后仍能正确渲染（回归护栏：曾被改成 list 而全崩）。"""
+    record = text_record("main=%s | 子查询 %d", ("改写后的查询", 0))
+    rendered = _rendered(record, TextFormatter())
+    assert "main=改写后的查询 | 子查询 0" in rendered
+
+
 def test_sensitive_filter_rewrites_both_msg_and_args(text_record) -> None:
     """msg 与 args 都被改写（`%s` 拼装后不得残留密钥）。"""
     record = text_record("key=%s", ("sk-live-abcdef123456",))

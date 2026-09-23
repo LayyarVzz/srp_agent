@@ -11,12 +11,13 @@
 
 from __future__ import annotations
 
-import logging
 from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from shared.logging import LoggingConfig, ServiceName
 
 
 class MCPTransport(StrEnum):
@@ -58,6 +59,8 @@ class A2AMCPRuntimeSettings(BaseSettings):
     a2a_poll_interval_s: float = Field(default=1.0, ge=0.05)  # task/get 轮询间隔
     a2a_output_max_chars: int = Field(default=10_000, ge=1)  # 工具输出长度上限（服务侧截断）
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # 日志形态与 api 同一开关（env LOG_FORMAT）：容器里 4 个进程必须能切到同一形态。
+    log_format: Literal["text", "json"] = "text"
 
 
 def build_run_params(settings: A2AMCPRuntimeSettings) -> dict[str, Any]:
@@ -78,9 +81,10 @@ def build_run_params(settings: A2AMCPRuntimeSettings) -> dict[str, Any]:
     return params
 
 
-def configure_logging(settings: A2AMCPRuntimeSettings) -> None:
-    """集中配置 a2a_mcp 的 root logger 级别（入口层调用一次）。"""
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+def build_logging_config(settings: A2AMCPRuntimeSettings) -> LoggingConfig:
+    """把本服务运行环境投影为日志底座配置（入口层调 `shared.logging.configure_logging`）。
+
+    与 api / 其余 MCP 服务共用同一 formatter、脱敏规则与关联标识口径；MCP 侧不再
+    自行 `basicConfig`（否则 MCP 日志缺 `trace_id`，全链路观测断在最后一跳）。
+    """
+    return LoggingConfig.from_settings(settings, service=ServiceName.A2A_MCP)

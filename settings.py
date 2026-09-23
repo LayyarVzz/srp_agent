@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import logging
 from functools import lru_cache
 from typing import Literal
 
@@ -98,17 +97,14 @@ class RuntimeSettings(BaseSettings):
     xf_iat_api_secret: SecretStr = Field(default_factory=lambda: SecretStr(""))
     xf_iat_url: str = "wss://iat-api.xfyun.cn/v2/iat"  # 可覆盖默认端点
 
-    # —— 日志（运行期级别）——
+    # —— 日志（运行期级别与形态；格式化/脱敏/关联标识统一由 shared.logging 承担）——
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # LOG_FORMAT：text（默认，人眼可读 + trace 前缀）| json（一行一条，供日志采集）。
+    # 未知值由 shared.logging 回退 text —— 日志形态拼错不得让服务起不来。
+    log_format: Literal["text", "json"] = "text"
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> RuntimeSettings:
     """进程内单例；测试需要隔离环境时可 `get_settings.cache_clear()` 或直接构造。"""
     return RuntimeSettings()
-
-
-def configure_logging(settings: RuntimeSettings | None = None) -> None:
-    """集中配置 root logger 级别（入口层调用一次）。"""
-    level = (settings or get_settings()).log_level
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

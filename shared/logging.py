@@ -125,8 +125,8 @@ _STANDARD_RECORD_ATTRS: Final[frozenset[str]] = frozenset(
     logging.LogRecord("", 0, "", 0, "", (), None).__dict__
 ) | {"message", "asctime", "taskName"}
 
-# 事件名 → 触发它的模块前缀（供 `snapshot_events` 的「事件命中」用例与排查）。
-# 只声明**本项目自产**的事件名；第三方库日志没有 `event` 字段。
+# 事件：结构化事件的统一契约 —— 事件名是**产品级接口**（日志检索、事件表、
+# 指标三者同名同义），故以常量声明，禁止在调用点散落字符串字面量。
 EVENT_REQUEST_RECEIVED: Final = "request.received"
 EVENT_INTENT_CLASSIFIED: Final = "intent.classified"
 EVENT_TOOL_CALLED: Final = "tool.called"
@@ -134,12 +134,29 @@ EVENT_ANSWER_GENERATED: Final = "answer.generated"
 EVENT_MEMORY_SAVED: Final = "memory.saved"
 EVENT_REQUEST_FINISHED: Final = "request.finished"
 
+# 事件类日志的统一 logger 名：事件是「带结构化字段的日志行」，跨进程同名，
+# 便于按 `logger == srp_agent.event` 过滤出全部结构化事件（与业务日志区分）。
+EVENT_LOGGER_NAME: Final = "srp_agent.event"
+
 
 class LogFormat(StrEnum):
     """日志输出格式：text = 人眼可读（默认，带关联前缀）；json = 一行一条 JSON。"""
 
     TEXT = "text"
     JSON = "json"
+
+
+class ServiceName(StrEnum):
+    """进程身份（事件字段与 `service` 标签的取值域）。
+
+    用于 `event.service`：一条日志/事件属于哪个进程，是排查的第一步
+    （「api 说有、MCP 说没有」比「不知道谁说的」有用得多）。
+    """
+
+    API = "api"
+    TOOLS_MCP = "tools_mcp"
+    LARK_MCP = "lark_mcp"
+    A2A_MCP = "a2a_mcp"
 
 
 class LoggingConfig(BaseModel):
@@ -305,12 +322,19 @@ def mask_text(text: str) -> str:
 
 
 def mask_value(value: Any) -> Any:
-    """递归脱敏任意 JSON 结构（dict / list / str 深走；其余类型原样返回）。"""
+    """递归脱敏任意 JSON 结构（dict / list / str 深走；其余类型原样返回）。
+
+    WHY tuple 必须保持 tuple：`logging` 的 `%` 拼装要求 `record.args` 是 tuple
+    （list 会直接抛 `TypeError: not all arguments converted`）—— 脱敏改写把
+    `("a", 1)` 变成 `["a", 1]` 就会让**每一条带参日志**炸掉。故按容器类型分别还原。
+    """
     if isinstance(value, str):
         return mask_text(value)
     if isinstance(value, dict):
         return {key: mask_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, tuple):
+        return tuple(mask_value(item) for item in value)
+    if isinstance(value, list):
         return [mask_value(item) for item in value]
     return value
 
@@ -801,6 +825,7 @@ class RecordingListener:
 __all__ = [
     "EVENT_ANSWER_GENERATED",
     "EVENT_INTENT_CLASSIFIED",
+    "EVENT_LOGGER_NAME",
     "EVENT_MEMORY_SAVED",
     "EVENT_REQUEST_FINISHED",
     "EVENT_REQUEST_RECEIVED",
@@ -819,6 +844,7 @@ __all__ = [
     "LoggingConfig",
     "RecordingListener",
     "SensitiveFilter",
+    "ServiceName",
     "TextFormatter",
     "bind_context",
     "clear_context",
