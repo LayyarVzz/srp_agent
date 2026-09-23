@@ -78,6 +78,17 @@ _EVENT_FIELD_NAMES: Final = frozenset(
 # 关联标识字段名：formatter 从 record 上按这些名字取值（由 Filter 统一注入）。
 _CONTEXT_FIELD_NAMES: Final = ("trace_id", "session_id", "user_id")
 
+# 可从 `fields` 提升为事件顶层字段的名字（见 log_event 的 WHY）。
+_PROMOTABLE_FIELDS: Final = (
+    "trace_id",
+    "session_id",
+    "user_id",
+    "status",
+    "code",
+    "duration_ms",
+    "tool_name",
+)
+
 # 关联标识约束：request id / session id / user id 均为短串；超长/带控制字符者
 # 直接丢弃（污染日志的输入不该被原样写进去）。48 字符覆盖 UUID + 前缀。
 _CONTEXT_ID_MAX_CHARS: Final = 48
@@ -534,6 +545,24 @@ class JsonFormatter(logging.Formatter):
 # —— 配置入口 ——
 
 
+# —— 输出流 ——
+
+
+class _DynamicStdout:
+    """动态 stdout 代理：每次写入时解析 `sys.stdout`（而非在配置时绑死对象）。
+
+    WHY 不直接持有 `sys.stdout`：`logging.StreamHandler` 会把流对象存成字段，一旦
+    运行期替换了 `sys.stdout`（测试捕获、服务热重载、容器内日志重定向），日志会继续
+    写向**旧的**流 —— 表现为「日志凭空消失」或绕过采集。代理只转发需要的两个方法。
+    """
+
+    def write(self, message: str) -> int:
+        return sys.stdout.write(message)
+
+    def flush(self) -> None:
+        sys.stdout.flush()
+
+
 def configure_logging(
     config: LoggingConfig | None = None,
     *,
@@ -548,7 +577,9 @@ def configure_logging(
     - `fmt`：显式覆盖 text 模板（测试与特化场景；json 格式忽略）；
     - `force=True`：先摘除 root 现有 handler（**容器/测试**：清掉 uvicorn 等
       预设 handler 造成的双份输出）；
-    - `stream`：输出流（缺省 stdout —— 容器内一切走 stdout，聚合交 compose）。
+    - `stream`：输出流（缺省 **动态解析 sys.stdout** —— 容器内一切走 stdout，
+      聚合交 compose；动态解析而非绑死对象，是为了让输出跟随运行期的 stdout 重定向，
+      否则日志会绕过捕获/重定向直接写到进程原始 stdout）。
 
     返回生效的 `LoggingConfig`，便于入口层记录「以什么形态起的服务」。
     """
@@ -560,7 +591,7 @@ def configure_logging(
     level = logging.getLevelNamesMapping()[cfg.level]
     root.setLevel(level)
 
-    handler = logging.StreamHandler(stream or sys.stdout)
+    handler = logging.StreamHandler(stream or _DynamicStdout())
     handler.setLevel(level)
     handler.setFormatter(
         JsonFormatter() if cfg.log_format is LogFormat.JSON else TextFormatter(fmt=fmt)
@@ -612,20 +643,28 @@ def log_event(
     关联标识缺省取当前 ContextVar（中间件/装配点绑定一次，全链路自动带上）；
     显式传参用于「不在请求上下文里」的场景（如装配期、带外任务收尾）。
 
+    `fields` 里的**事件标准字段**（trace_id/session_id/user_id/status/code/duration_ms/
+    tool_name）会被提升为事件顶层字段，而不是塞进 `fields` 子字典 —— 这样事件表列
+    与事件属性始终一一对应（否则同一语义会有「顶层列」与「payload 里的键」两套口径，
+    聚合统计必然对不上）。便捷函数（`log_memory_saved` 等）因此不必逐个声明这些参数。
+
     监听器（落库）失败**只记日志、不上抛** —— 可观测性绝不反噬主链路。
     """
+    extra_fields = dict(fields or {})
+    promoted = {name: extra_fields.pop(name) for name in _PROMOTABLE_FIELDS if name in extra_fields}
     payload = LogEvent(
         event=event,
         level=level,
         service=_service_name(),
-        trace_id=_sanitize_context_id(trace_id) or _trace_id.get(),
-        session_id=_sanitize_context_id(session_id) or _session_id.get(),
-        user_id=_sanitize_context_id(user_id) or _user_id.get(),
-        status=status,
-        code=code,
-        duration_ms=duration_ms,
-        tool_name=tool_name,
-        fields=fields or {},
+        trace_id=_sanitize_context_id(trace_id or promoted.get("trace_id")) or _trace_id.get(),
+        session_id=_sanitize_context_id(session_id or promoted.get("session_id"))
+        or _session_id.get(),
+        user_id=_sanitize_context_id(user_id or promoted.get("user_id")) or _user_id.get(),
+        status=status or promoted.get("status"),
+        code=code or promoted.get("code"),
+        duration_ms=duration_ms if duration_ms is not None else promoted.get("duration_ms"),
+        tool_name=tool_name or promoted.get("tool_name"),
+        fields=extra_fields,
     )
     extra: dict[str, Any] = {"event": event}
     if code:

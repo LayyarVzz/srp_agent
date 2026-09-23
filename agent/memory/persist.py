@@ -35,8 +35,11 @@ from agent.memory.models import (
     SaveOutcome,
     normalize_content_hash,
 )
+from shared.logging import EVENT_LOGGER_NAME, log_memory_saved, summarize_text
 
 logger = logging.getLogger(__name__)
+# 结构化事件专用 logger（C3：`memory.saved` 事件）—— 与业务日志分开便于过滤。
+event_logger = logging.getLogger(EVENT_LOGGER_NAME)
 
 # 来源常量：会话对话抽取的记忆（要求 provenance 字段，禁止散落字面量）。
 PROVENANCE_CONVERSATION = "conversation"
@@ -169,6 +172,7 @@ async def save_conversation_memory(
             content_hash=normalize_content_hash(e.content),
         )
         try:
+            action = "inserted"
             if dedup is not None and dedup.enabled:
                 outcome = await _save_deduped(
                     item,
@@ -176,6 +180,7 @@ async def save_conversation_memory(
                     judge=judge,
                     semantic_threshold=dedup.semantic_threshold,
                 )
+                action = outcome.action
                 # 决策明细已在上方 _save_deduped 内按分支 INFO 记录，此处记落库结果。
                 logger.info(
                     "长期记忆保存 action=%s kind=%s id=%s（%s）",
@@ -184,11 +189,24 @@ async def save_conversation_memory(
                     outcome.item.id,
                     item.content,
                 )
+                saved_item = outcome.item
             else:
                 await store.save(item)
+                saved_item = item
                 logger.info(
                     "长期记忆保存（直存）kind=%s id=%s（%s）", item.kind, item.id, item.content
                 )
+            # 结构化事件（C3）：只记动作/类型/id 与内容摘要，**内容原文不进事件/日志**
+            # （记忆常含用户个人信息，事件表同样受「禁止会话明文落盘」约束）。
+            log_memory_saved(
+                event_logger,
+                action=action,
+                kind=item.kind,
+                memory_id=saved_item.id,
+                session_id=session_id,
+                user_id=user_id,
+                content=summarize_text(saved_item.content),
+            )
         except Exception as exc:
             logger.warning("记忆带外保存失败（kind=%s）：%s", e.kind, exc)
 
