@@ -38,7 +38,10 @@ class QueryUnderstanding(BaseModel):
     """
 
     retrieval_needed: bool = True  # 是否值得做主题检索（False → 跳过召回的 fact/episode 部分）
-    main_query: str  # 补全指代 + 规范表达后的主检索查询
+    # 主检索查询（补全指代 + 规范表达）。空串 = 模型未产出有效改写：
+    # 结构化 schema 不能把本字段设为 required（模型可能只给出 retrieval_needed=False），
+    # 下游 `ranked_queries` 与 `rewriter` 都以「空串」承载「无产出」语义。
+    main_query: str = ""
     sub_queries: list[str] = Field(default_factory=list)  # 子问题（复合任务；≤ sub_query_max）
     synonyms: list[str] = Field(default_factory=list)  # 同义/近义表述（扩大召回；≤ synonym_max）
     hypothetical_answer: str | None = None  # HyDE 假设文档（仅门控通过时产出）
@@ -76,11 +79,18 @@ class QueryUnderstanding(BaseModel):
         return [item.query for item in self.ranked_queries(max_variants=max_variants)]
 
 
-class QueryUnderstandingResult(BaseModel):
-    """结构化输出容器；失败/无产出 → `understanding is None`。
+class QueryUnderstandingResult(QueryUnderstanding):
+    """结构化 LLM 输出的**扁平**载体（本模型即结构化调用 schema）。
 
-    WHY 包一层：`with_structured_output` 要求 schema 为对象根；可选语义用
-    「字段为 None」表达，比「让模型输出空对象再判空」更不容易漂移。
+    WHY 不用「外层容器 + 可选内层对象」的嵌套形态（旧实现：`understanding: X | None`）：
+    嵌套 `anyOf: [object, null]` 会让部分兼容端点（实测阿里云 MaaS + deepseek-v4.1-flash）
+    **失控生成**——`tool_calls` 照样产出，但在 tool call 之前先写一大段自由文本，一路跑到
+    端点默认 completion 上限 8192，单次请求 40~60s，直接撞 `request_timeout` 并触发重试，
+    表现为「一个节点卡 120~180s、最终还回退成原始输入」。
+    实测对照：嵌套形态 6/6 次跑满 8192（40~60s），扁平形态 0/6 次（2~4s，约 200 token）。
+    故 schema 保持**对象根 + 全原始类型字段**，「无产出」由 `rewriter` 以
+    「实例为空 / main_query 为空串」判定。
+
+    WHY 继承而非重复声明字段：结构化 schema 与领域模型必须**同源**，否则改一处漏一处。
+    本类不额外声明字段（`produced` 这类客户端信号会污染 schema，故不引入）。
     """
-
-    understanding: QueryUnderstanding | None = None
