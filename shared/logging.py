@@ -79,6 +79,16 @@ _EVENT_FIELD_NAMES: Final = frozenset(
 # 关联标识字段名：formatter 从 record 上按这些名字取值（由 Filter 统一注入）。
 _CONTEXT_FIELD_NAMES: Final = ("trace_id", "session_id", "user_id")
 
+# 事件 payload 在 LogRecord 上的承载键（下划线前缀：与 LogRecord 自有属性、
+# 调用方 `extra=` 的任意键名都不会撞车；脱敏 Filter 与 `_extra_fields` 均跳过下划线键）。
+_EVENT_FIELDS_KEY: Final = "_event_fields"
+
+# text 形态下事件 payload 的渲染上限：日志行必须保持可读、可 grep。
+# 超限时按顺序截断并追加 `…+N`，让人看得出「还有字段没显示」，而不是静默丢弃。
+_EVENT_TEXT_MAX_FIELDS: Final = 8
+# 单个字段值的最大字符数（长字符串如 sha256 组合串按此截断）。
+_EVENT_TEXT_MAX_VALUE_CHARS: Final = 60
+
 # 可从 `fields` 提升为事件顶层字段的名字（见 log_event 的 WHY）。
 _PROMOTABLE_FIELDS: Final = (
     "trace_id",
@@ -95,6 +105,11 @@ _PROMOTABLE_FIELDS: Final = (
 _CONTEXT_ID_MAX_CHARS: Final = 48
 
 _TAG_RE: Final = re.compile(r"[^A-Za-z0-9_.@:-]")
+# payload 值净化：比关联标识宽松 —— 保留 `/`（path）、`=`、`,`、`+`、空格等常见值字符，
+# 只替换**能伪造日志结构**的字符（换行/回车/制表/`[`/`]`/`(`/`)`/`|`）。
+# WHY 不共用 `_TAG_RE`：那条规则会把 `/api/v1/x` 压成 `apiv1x`、把 `Bearer sk-***` 截成
+# `Bearer`，排查最需要的路径与形态信息反而被自己抹掉。
+_VALUE_SANITIZE_RE: Final = re.compile(r"[\r\n\t\[\]()|]")
 
 # —— 脱敏规则（有序：先特化后一般；`(?!)` 组回填 key，保留可读性）——
 
@@ -392,7 +407,19 @@ class _LogView:
     视图统一把缺失值折成 None，模板再渲染成空串。
     """
 
-    __slots__ = ("asctime", "code", "duration_ms", "event", "extra", "levelname", "name", "service")
+    __slots__ = (
+        "asctime",
+        "code",
+        "duration_ms",
+        "event",
+        "event_fields",
+        "extra",
+        "levelname",
+        "name",
+        "service",
+        "status",
+        "tool_name",
+    )
 
     def __init__(self, record: logging.LogRecord) -> None:
         self.name = record.name
@@ -401,12 +428,16 @@ class _LogView:
         self.event = getattr(record, "event", None)
         self.duration_ms = getattr(record, "duration_ms", None)
         self.code = getattr(record, "code", None)
+        self.status = getattr(record, "status", None)
+        self.tool_name = getattr(record, "tool_name", None)
         self.service = getattr(record, "_service", None) or ""
         self.extra = _extra_fields(record)
+        raw_fields = getattr(record, _EVENT_FIELDS_KEY, None)
+        self.event_fields: dict[str, Any] = raw_fields if isinstance(raw_fields, dict) else {}
 
 
 def _extra_fields(record: logging.LogRecord) -> dict[str, Any]:
-    """取调用方经 `extra=` 携带的自定义字段（排除标准属性与关联标识）。"""
+    """取调用方经 `extra=` 携带的自定义字段（排除标准属性、关联标识与内部键）。"""
     extra: dict[str, Any] = {}
     for key, value in record.__dict__.items():
         if key in _STANDARD_RECORD_ATTRS or key in _CONTEXT_FIELD_NAMES:
@@ -415,6 +446,29 @@ def _extra_fields(record: logging.LogRecord) -> dict[str, Any]:
             continue
         extra[key] = value
     return extra
+
+
+def _render_event_fields(fields: dict[str, Any]) -> str:
+    """把事件 payload 渲染成 `key=value` 片段（text 形态；保持单行、可 grep）。
+
+    WHY 要渲染进 stdout：payload 只进事件表的话，`docker compose logs` 里只剩
+    `event=tool.called` —— 「哪个工具、耗时多少、批次几条」全看不到，排查必须去查库，
+    等于把最常用的观测面砍掉一半。此处与事件表**同源**（同一个 fields 字典），
+    不是两次采集。
+    """
+    if not fields:
+        return ""
+    shown = list(fields.items())[:_EVENT_TEXT_MAX_FIELDS]
+    segments = []
+    for key, value in shown:
+        text = mask_text(_safe_value(value))
+        if len(text) > _EVENT_TEXT_MAX_VALUE_CHARS:
+            text = f"{text[:_EVENT_TEXT_MAX_VALUE_CHARS]}…"
+        segments.append(f"{key}={text}")
+    omitted = len(fields) - len(shown)
+    if omitted > 0:
+        segments.append(f"…+{omitted}")
+    return " ".join(segments)
 
 
 def _format_ts(created: float) -> str:
@@ -435,6 +489,36 @@ def _join_context(view: _LogView, record: logging.LogRecord) -> str:
 def _safe_token(value: Any) -> str:
     """标签值净化：只保留 `[A-Za-z0-9-_.]`（防伪造换行/括号污染日志行结构）。"""
     return _TAG_RE.sub("", str(value))
+
+
+def _safe_value(value: Any) -> str:
+    """payload 值净化：替换换行/括号等可伪造日志结构的字符，其余原样保留。
+
+    WHY 嵌套结构要**先净化再序列化**（而不是先 JSON 再净化）：JSON 自身的 `[]`/`{}`
+    是语法字符，事后净化会把结构打成乱码（`tokens={"total_tokens":812,"models":·…·}`）；
+    而换行注入只可能来自字符串内容/键名 —— 递归替换掉它们即可，序列化后天然单行。
+    """
+    if isinstance(value, dict | list):
+        value = _sanitize_value_tree(value)
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        except (TypeError, ValueError):  # 不可序列化时退化 repr（不因取值失败而丢字段）
+            return _VALUE_SANITIZE_RE.sub("·", repr(value))
+    return _VALUE_SANITIZE_RE.sub("·", str(value))
+
+
+def _sanitize_value_tree(value: Any) -> Any:
+    """递归净化嵌套结构里的字符串与键名（序列化前调用）。"""
+    if isinstance(value, str):
+        return _VALUE_SANITIZE_RE.sub("·", value)
+    if isinstance(value, dict):
+        return {
+            _VALUE_SANITIZE_RE.sub("·", str(key)): _sanitize_value_tree(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_sanitize_value_tree(item) for item in value]
+    return value
 
 
 class ContextFilter(logging.Filter):
@@ -508,8 +592,19 @@ class TextFormatter(logging.Formatter):
             segments.append(f"({view.duration_ms}ms)")
         if view.event:
             segments.append(f"event={view.event}")
+            if view.tool_name:
+                # 工具名是 `tool.called` 的核心事实：只进 payload 会让 text 形态看不出「哪个工具」。
+                segments.append(f"tool={view.tool_name}")
+            if view.status:
+                segments.append(f"status={view.status}")
             if view.code:
                 segments.append(f"code={view.code}")
+            # payload 紧随事件名（同一段的延续），排查时一行看全「发生了什么 + 关键字段」。
+            payload = _render_event_fields(view.event_fields)
+            if payload:
+                segments.append(payload)
+        elif view.event_fields:
+            segments.append(_render_event_fields(view.event_fields))
         return " ".join(segment for segment in segments if segment)
 
     def formatException(self, ei: Any) -> str:  # 覆写 stdlib 命名
@@ -521,7 +616,12 @@ class JsonFormatter(logging.Formatter):
     """json 格式：一行一条 JSON（键序固定），供容器日志采集与 grep。
 
     字段：`ts/level/logger/service/trace_id/session_id/user_id/event/code/duration_ms/
-    message/extra`（None 值省略）；异常走 `exc`；`extra` 里的键以调用方为准。
+    tool_name/message` + **事件 payload 平铺到顶层**（None 值省略）；非事件日志的
+    `extra=` 收在 `extra` 子对象里；异常走 `exc`。
+
+    WHY payload 平铺而不放 `extra`：消费方（Loki/ELK/jq）要能直接 `| select(.intent)`
+    —— 塞进子对象就得先知道「哪些字段在 extra 里」，而事件字段本来就与事件表列同口径，
+    平铺才与「同一契约、两种载体」一致。
     """
 
     def format(self, record: logging.LogRecord) -> str:
@@ -537,12 +637,22 @@ class JsonFormatter(logging.Formatter):
             value = getattr(record, name, None)
             if value:
                 payload[name] = value
-        for name, value in (("event", view.event), ("code", view.code)):
+        for name, value in (
+            ("event", view.event),
+            ("status", view.status),
+            ("tool_name", view.tool_name),
+        ):
             if value:
                 payload[name] = value
+        if view.code:
+            payload["code"] = view.code
         if view.duration_ms is not None:
             payload["duration_ms"] = view.duration_ms
         payload["message"] = mask_text(record.getMessage())
+        # 事件 payload 平铺顶层（键序：标准字段之后、extra 之前）。
+        for key, value in view.event_fields.items():
+            if key not in payload:
+                payload[key] = value
         if view.extra:
             payload["extra"] = view.extra
         if record.exc_info:
@@ -679,6 +789,12 @@ def log_event(
         extra["code"] = code
     if duration_ms is not None:
         extra["duration_ms"] = duration_ms
+    if status:
+        extra["status"] = status
+    if tool_name:
+        extra["tool_name"] = tool_name
+    # payload 经下划线键承载：既进 stdout（可观测），又不会与 `extra=` 的任意键名冲突。
+    extra[_EVENT_FIELDS_KEY] = extra_fields
     logger.log(logging.getLevelNamesMapping()[level], message, extra=extra)
     _dispatch(payload)
     return payload

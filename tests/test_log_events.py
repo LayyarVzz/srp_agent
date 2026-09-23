@@ -328,6 +328,57 @@ async def test_json_format_events_are_parseable(
     assert finished["duration_ms"] >= 0
 
 
+async def test_text_event_line_carries_payload_fields(
+    api_app_factory: Any, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """text 形态事件行**带 payload 字段**（否则 `docker compose logs` 看不出「哪个工具」）。
+
+    WHY 这条必须有：payload 只进事件表的话，stdout 里只剩 `event=tool.called`，
+    「工具名 / 批次大小 / 回答摘要」全要查库才看得到 —— 最常用的观测面等于被砍掉。
+    """
+    app, runtime = await api_app_factory(
+        _tool_echo_messages("现在是十点"), tools=[make_fake_tool("current_datetime")]
+    )
+    try:
+        async with _client(app) as client:
+            await client.post(CHAT_URL, headers=HEADERS, json={"text": "现在几点"})
+    finally:
+        await runtime.aclose()
+
+    lines = [line for line in capfd.readouterr().out.splitlines() if "event=" in line]
+    tool_lines = [line for line in lines if "event=tool.called" in line]
+    assert tool_lines, "未捕获到 tool.called 事件行"
+    assert any("tool=current_datetime" in line for line in tool_lines), tool_lines
+    assert any("status=ok" in line for line in tool_lines), tool_lines
+    assert any("batch_size=1" in line for line in tool_lines), tool_lines
+    # 回答体只以 len + sha256 出现（安全口径在两种形态下一致）。
+    answer_lines = [line for line in lines if "event=answer.generated" in line]
+    assert answer_lines and "sha256=" in answer_lines[0]
+    assert "现在是十点" not in answer_lines[0]
+
+
+async def test_stdout_event_fields_cannot_forge_log_lines(
+    api_app_factory: Any, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """payload 值里的换行/方括号被净化：无法伪造出新的日志行（真实攻击面）。"""
+    from shared.logging import clear_context, log_event
+
+    log_event(
+        logging.getLogger("srp_agent.event"),
+        "tool.called",
+        status="ok",
+        tool_name="calc",
+        fields={"note": "第一行\n2026-01-01 00:00:00 INFO [fake] 伪造行 [x]"},
+    )
+    clear_context()
+    out = capfd.readouterr().out
+    assert "伪造行" in out, "字段值本身应保留（只是结构字符被替换）"
+    assert "[fake]" not in out, "方括号必须被替换，否则可伪装出日志结构"
+    assert all("INFO    [fake]" not in line for line in out.splitlines())
+    # 一条事件只产生一行（值里的 \n 不得撑出第二行）。
+    assert len([line for line in out.splitlines() if "event=tool.called" in line]) == 1
+
+
 def test_log_event_event_names_are_constants() -> None:
     """事件名以常量声明（禁止散落字面量 —— 与日志检索/事件表/指标三处同名同义）。"""
     import inspect
