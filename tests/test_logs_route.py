@@ -134,6 +134,7 @@ async def test_all_events_after_received_carry_session(api_app_factory: Any) -> 
                 headers={**HEADERS, "X-Request-Id": "req-sess", "X-Session-Id": session_id},
                 json={"text": "你好", "session_id": session_id},
             )
+            assert resp.status_code == 200
             await _wait_for_trace_finished(repository, "req-sess")
             records = await repository.list_by_trace(trace_id="req-sess")
     finally:
