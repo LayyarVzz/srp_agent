@@ -20,6 +20,7 @@ from httpx import ASGITransport, AsyncClient
 from agent.intent.models import Intent
 from shared.events_store import EventRepository, SQLAlchemyEventRepository, build_event_repository
 from shared.logging import (
+    EVENT_ANSWER_GENERATED,
     EVENT_INTENT_CLASSIFIED,
     EVENT_REQUEST_FINISHED,
     EVENT_REQUEST_RECEIVED,
@@ -34,7 +35,7 @@ LOGS_URL = "/api/v1/logs/recent"
 
 
 @pytest.fixture(autouse=True)
-def _clean_context() -> None:
+def _clean_context() -> Any:
     """用例前后清空关联标识（避免上一个用例的 user_id 串到本用例事件里）。"""
     clear_context()
     yield
@@ -57,60 +58,81 @@ def _start_observability(app: Any) -> None:
     app.state.event_sink.start()
 
 
-async def _wait_for_events(repository: EventRepository, *, at_least: int = 1) -> None:
-    """等待 sink 把事件写进库（带外写是异步的，测试不能假设入队即已落库）。"""
-    for _ in range(50):
-        if await repository.count() >= at_least:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError(f"等待事件落库超时（当前 {await repository.count()} 条）")
+async def _wait_for_trace_event(
+    repository: EventRepository, trace_id: str, event: str, *, attempts: int = 600
+) -> None:
+    """等指定 trace 的指定事件落库（默认 600 × 25ms ≈ 15s 上限）。
 
+    WHY 必须等：`request.finished` 由 SSE 生成器的 `finally` 产生，可能晚于响应体读完；
+    带外写本身也是异步的。不等就查接口 = 与「事件何时落库」赛跑。
 
-async def _wait_for_trace_finished(repository: EventRepository, trace_id: str) -> None:
-    """等**指定 trace** 的 `request.finished` 落库：它是「这条链路已完整写下」的终点标志。
-
-    WHY 不等条数：一次测试里会发多个 HTTP 请求（拿会话 + 查日志），条数是含混的 ——
-    等条数会与「另一个请求的事件交错」赛跑（表现为偶发多出一条别的 trace 的事件）。
+    WHY 上限放到 15s：首次运行要现场编译全部 pyc（冷启动），几秒钟的等待是正常的
+    —— 上限过紧会把「机器慢」误报成「事件丢了」，这类假失败比等久一点昂贵得多。
     """
-    for _ in range(50):
+    for _ in range(attempts):
         records = await repository.list_by_trace(trace_id=trace_id)
-        if any(r.event == EVENT_REQUEST_FINISHED for r in records):
+        if any(r.event == event for r in records):
             return
-        await asyncio.sleep(0.02)
-    raise AssertionError(f"等待 {trace_id} 的 request.finished 落库超时")
+        await asyncio.sleep(0.025)
+    raise AssertionError(f"等待超时：{trace_id} 的 {event} 未落库")
+
+
+async def _post_chat_and_wait(
+    client: AsyncClient,
+    app: Any,
+    *,
+    text: str = "你好",
+    trace_id: str | None = None,
+    session_id: str | None = None,
+) -> str:
+    """发一次对话请求并等它的关键事件落库，返回本次 trace_id。
+
+    等待锚在**本次 trace** 上而不是事件条数：条数会被同一用例的其他请求（建会话、查接口）
+    放大，是这类测试最初偶发失败的根因。
+    """
+    headers = dict(HEADERS)
+    if trace_id is not None:
+        headers["X-Request-Id"] = trace_id
+    if session_id is not None:
+        headers["X-Session-Id"] = session_id
+    body: dict[str, Any] = {"text": text}
+    if session_id is not None:
+        body["session_id"] = session_id
+    resp = await client.post(CHAT_URL, headers=headers, json=body)
+    assert resp.status_code == 200, resp.text
+    resolved = resp.headers["X-Request-Id"]
+    repository = _repository(app)
+    for event in (EVENT_ANSWER_GENERATED, EVENT_REQUEST_FINISHED):
+        await _wait_for_trace_event(repository, resolved, event)
+    return resolved
 
 
 async def test_recent_returns_events_of_real_request(api_app_factory: Any) -> None:
     """真发一次请求 → 事件落库 → `/logs/recent` 读回（HTTP 口径与 Agent 口径都在）。"""
     app, runtime = await api_app_factory(chat_turn_messages(Intent.CHAT, "你好"))
-    repository = _repository(app)
     _start_observability(app)
     try:
         async with _client(app) as client:
-            resp = await client.post(CHAT_URL, headers=HEADERS, json={"text": "你好"})
-            assert resp.status_code == 200
-            trace_id = resp.headers["X-Request-Id"]
-            await _wait_for_trace_finished(repository, trace_id)
+            trace_id = await _post_chat_and_wait(client, app)
             logs = await client.get(LOGS_URL, headers=HEADERS)
         assert logs.status_code == 200
     finally:
         await runtime.aclose()
 
-    # 本次对话的事件全在同一 trace 下（`/logs/recent` 的过滤口径即 user，不带 trace）。
     body = logs.json()
     assert body["ok"] is True
     assert body["limit"] == 50
+    # 本次对话的事件全在同一 trace 下（`/recent` 按 user 过滤，故这里按 trace 收窄）。
     events = [e for e in body["events"] if e["trace_id"] == trace_id]
     names = [e["event"] for e in events]
     assert EVENT_REQUEST_RECEIVED in names
     assert EVENT_REQUEST_FINISHED in names
     assert all(e["user_id"] == "demo-user" for e in events)
     assert all(e["service"] == "api" for e in events)
-    # 会话可回溯：入口中间件先于「自动建会话」发生，故 `request.received` 允许无 session_id，
-    # 但请求收尾与图内事件必须带上（否则一条链路无法归到某个会话）。
+    # 会话可回溯：入口中间件先于「自动建会话」执行，故 `request.received` 允许无 session_id，
+    # 但收尾事件必须带上（否则一条链路无法归到某个会话）。
     finished = next(e for e in events if e["event"] == EVENT_REQUEST_FINISHED)
     assert finished["session_id"]
-    assert any(e["session_id"] for e in events)
     # 耗时是可聚合的列（不是塞在 payload 里的字符串）。
     assert finished["duration_ms"] >= 0
     assert finished["status"] == "completed"
@@ -119,24 +141,17 @@ async def test_recent_returns_events_of_real_request(api_app_factory: Any) -> No
 async def test_all_events_after_received_carry_session(api_app_factory: Any) -> None:
     """已存在会话的一轮：`request.received` **之后**的事件都带 session_id。
 
-    `request.received` 是入口第一件事（那时还不知道权威会话 id，除非调用方带
-    `X-Session-Id` 头），除此之外整条链路必须可归到会话 —— 否则「按会话排查」断链。
+    `request.received` 是入口第一件事（除非调用方带 `X-Session-Id` 头，那时权威会话 id
+    已可知）；除此之外整条链路必须可归到会话 —— 否则「按会话排查」在入口处断链。
     """
     app, runtime = await api_app_factory(chat_turn_messages(Intent.CHAT, "你好"))
-    repository = _repository(app)
     _start_observability(app)
     try:
         async with _client(app) as client:
             created = await client.post("/api/v1/sessions", headers=HEADERS)
             session_id = created.json()["session_id"]
-            resp = await client.post(
-                CHAT_URL,
-                headers={**HEADERS, "X-Request-Id": "req-sess", "X-Session-Id": session_id},
-                json={"text": "你好", "session_id": session_id},
-            )
-            assert resp.status_code == 200
-            await _wait_for_trace_finished(repository, "req-sess")
-            records = await repository.list_by_trace(trace_id="req-sess")
+            await _post_chat_and_wait(client, app, trace_id="req-sess", session_id=session_id)
+            records = await _repository(app).list_by_trace(trace_id="req-sess")
     finally:
         await runtime.aclose()
 
@@ -153,15 +168,10 @@ async def test_trace_endpoint_returns_ordered_chain(api_app_factory: Any) -> Non
     """`/logs/trace/{trace_id}` 返回一条链路的事件且**升序**（真实发生顺序）。"""
     messages = tool_call_messages([[{"name": "calc", "args": {}, "id": "c1"}]], "算好了")
     app, runtime = await api_app_factory(messages)
-    repository = _repository(app)
     _start_observability(app)
     try:
         async with _client(app) as client:
-            resp = await client.post(
-                CHAT_URL, headers={**HEADERS, "X-Request-Id": "req-trace"}, json={"text": "算一下"}
-            )
-            trace_id = resp.headers["X-Request-Id"]
-            await _wait_for_trace_finished(repository, trace_id)
+            trace_id = await _post_chat_and_wait(client, app, text="算一下", trace_id="req-trace")
             trace = await client.get(f"/api/v1/logs/trace/{trace_id}", headers=HEADERS)
         assert trace.status_code == 200
     finally:
@@ -188,15 +198,33 @@ async def test_trace_endpoint_unknown_id_is_empty(api_app_factory: Any) -> None:
         await runtime.aclose()
 
 
-async def test_recent_is_isolated_by_user(api_app_factory: Any) -> None:
-    """归属隔离：另一个用户查不到 demo-user 的事件（接口层不得跨用户泄漏）。"""
+async def test_recent_excludes_its_own_query_trace(api_app_factory: Any) -> None:
+    """`/recent` 不回显这次查询自身的事件（否则第一屏永远是「你在查日志」这件事）。
+
+    查事件本身也会产生 `request.received` / `request.finished`，且它们**先于**读库发生；
+    不排除就会自占最多 2 条最新位置，把真正要看的业务事件挤下去。
+    """
     app, runtime = await api_app_factory(chat_turn_messages(Intent.CHAT, "你好"))
-    repository = _repository(app)
     _start_observability(app)
     try:
         async with _client(app) as client:
-            resp = await client.post(CHAT_URL, headers=HEADERS, json={"text": "你好"})
-            await _wait_for_trace_finished(repository, resp.headers["X-Request-Id"])
+            await _post_chat_and_wait(client, app)
+            resp = await client.get(LOGS_URL, headers=HEADERS)
+        own_trace = resp.headers["X-Request-Id"]
+    finally:
+        await runtime.aclose()
+
+    traces = {e["trace_id"] for e in resp.json()["events"]}
+    assert own_trace not in traces, "查询自身的事件不应出现在结果里"
+
+
+async def test_recent_is_isolated_by_user(api_app_factory: Any) -> None:
+    """归属隔离：另一个用户查不到 demo-user 的事件（接口层不得跨用户泄漏）。"""
+    app, runtime = await api_app_factory(chat_turn_messages(Intent.CHAT, "你好"))
+    _start_observability(app)
+    try:
+        async with _client(app) as client:
+            await _post_chat_and_wait(client, app)
             mine = await client.get(LOGS_URL, headers=HEADERS)
             others = await client.get(LOGS_URL, headers={"X-User-Id": "someone-else"})
         assert mine.json()["events"], "自己的事件应可见"
@@ -233,12 +261,10 @@ async def test_recent_limit_is_bounded(api_app_factory: Any) -> None:
 async def test_recent_respects_limit(api_app_factory: Any) -> None:
     """`limit` 生效且回显（前端可对账「我请求的上限是否被采纳」）。"""
     app, runtime = await api_app_factory(chat_turn_messages(Intent.CHAT, "你好"))
-    repository = _repository(app)
     _start_observability(app)
     try:
         async with _client(app) as client:
-            resp = await client.post(CHAT_URL, headers=HEADERS, json={"text": "你好"})
-            await _wait_for_trace_finished(repository, resp.headers["X-Request-Id"])
+            await _post_chat_and_wait(client, app)
             limit_resp = await client.get(LOGS_URL, headers=HEADERS, params={"limit": 2})
         assert limit_resp.json()["limit"] == 2
         assert len(limit_resp.json()["events"]) == 2
@@ -249,12 +275,10 @@ async def test_recent_respects_limit(api_app_factory: Any) -> None:
 async def test_recent_orders_newest_first(api_app_factory: Any) -> None:
     """最新事件排最前（排查时第一屏就是刚发生的事）。"""
     app, runtime = await api_app_factory(chat_turn_messages(Intent.CHAT, "你好"))
-    repository = _repository(app)
     _start_observability(app)
     try:
         async with _client(app) as client:
-            resp = await client.post(CHAT_URL, headers=HEADERS, json={"text": "你好"})
-            await _wait_for_trace_finished(repository, resp.headers["X-Request-Id"])
+            await _post_chat_and_wait(client, app)
             events = (await client.get(LOGS_URL, headers=HEADERS)).json()["events"]
         timestamps = [e["ts"] for e in events]
         assert timestamps == sorted(timestamps, reverse=True)
