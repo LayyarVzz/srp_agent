@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -384,3 +384,128 @@ def test_event_logger_does_not_use_business_logger() -> None:
     assert graph.event_logger.name == EVENT_LOGGER_NAME
     assert memory_persist.event_logger.name == EVENT_LOGGER_NAME
     assert logging.getLogger(EVENT_LOGGER_NAME).name != graph.logger.name
+
+
+# —— C4：耗时真实计时 + LLM token 累计 ——
+
+
+async def test_tool_duration_is_measured_not_zero(
+    api_app_factory: Any, listener: RecordingListener
+) -> None:
+    """工具耗时不再恒为 0（历史上 `ToolResult.duration_ms` 存在但无人写入）。
+
+    用带 `delay_s` 的假工具制造可测量耗时：断言记录、事件、tool_trace 三处口径一致。
+    """
+    slow = make_fake_tool("current_datetime", content="ok", delay_s=0.03)
+    app, runtime = await api_app_factory(_tool_echo_messages("现在是十点"), tools=[slow])
+    try:
+        async with _client(app) as client:
+            resp = await client.post(CHAT_URL, headers=HEADERS, json={"text": "现在几点"})
+        trace = resp.json()["tool_trace"]
+    finally:
+        await runtime.aclose()
+
+    assert trace, "tool_trace 为空"
+    assert trace[0]["result"]["duration_ms"] >= 20  # 计时确实覆盖了工具执行
+    event = listener.find(EVENT_TOOL_CALLED)[0]
+    assert event.duration_ms is not None and event.duration_ms >= 20
+
+
+async def test_request_finished_carries_tokens_and_duration(
+    api_app_factory: Any, listener: RecordingListener
+) -> None:
+    """agent 侧 `request.finished` 带 token 累计与端到端耗时（指标口径）。
+
+    WHY 用 source 区分两条 `request.finished`：api 中间件记的是 **HTTP** 请求口径，
+    agent runtime 记的是**一轮交互**口径（含 token 用量）。同名事件靠 `source` 区分，
+    混在一起聚合会把「HTTP 往返」与「Agent 一轮」当成同一个指标。
+    """
+    app, runtime = await api_app_factory(_tool_echo_messages("现在是十点"))
+    try:
+        async with _client(app) as client:
+            await client.post(CHAT_URL, headers=HEADERS, json={"text": "现在几点"})
+    finally:
+        await runtime.aclose()
+
+    agent_events = [
+        e for e in listener.find(EVENT_REQUEST_FINISHED) if e.fields.get("source") == "agent"
+    ]
+    assert agent_events, "缺 agent 侧 request.finished"
+    event = agent_events[-1]
+    assert event.duration_ms is not None and event.duration_ms >= 0
+    assert event.status == "completed"
+    tokens = event.fields["tokens"]
+    assert tokens["total_tokens"] > 0  # 这一轮确实调过 LLM
+    assert tokens["input_tokens"] > 0 and tokens["output_tokens"] > 0
+    assert tokens["total_tokens"] == tokens["input_tokens"] + tokens["output_tokens"]
+    assert tokens["models"], "缺多模型明细（归因需要）"
+
+
+def test_request_finished_tokens_empty_when_no_llm_call() -> None:
+    """未调用 LLM 的一轮：tokens 为空表（如实反映「没花钱」，而不是伪造 0 计数）。"""
+    from langchain_core.callbacks.usage import UsageMetadataCallbackHandler
+
+    from agent.runtime import _token_usage
+
+    assert _token_usage(UsageMetadataCallbackHandler()) == {}
+
+
+def test_token_usage_folds_multiple_models() -> None:
+    """多模型 usage 折叠：顶层合计 + models 明细（合计供看板、明细供归因）。"""
+
+    class _Handler:
+        usage_metadata: ClassVar[dict[str, dict[str, int]]] = {
+            "model-a": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            "model-b": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+        }
+
+    from agent.runtime import _token_usage
+
+    folded = _token_usage(_Handler())  # type: ignore[arg-type]
+    assert folded["input_tokens"] == 11
+    assert folded["output_tokens"] == 7
+    assert folded["total_tokens"] == 18
+    assert set(folded["models"]) == {"model-a", "model-b"}
+
+
+def test_token_usage_never_raises_on_broken_handler() -> None:
+    """指标读取失败不得反噬主链路（异常吞掉返回空表）。"""
+
+    class _Broken:
+        @property
+        def usage_metadata(self) -> dict[str, Any]:
+            raise RuntimeError("boom")
+
+    from agent.runtime import _token_usage
+
+    assert _token_usage(_Broken()) == {}  # type: ignore[arg-type]
+
+
+async def test_failed_turn_records_error_status(
+    api_app_factory: Any, listener: RecordingListener
+) -> None:
+    """图运行中断：`request.finished` 落 status=error + 错误类型（失败轮次可被检索）。"""
+    app, runtime = await api_app_factory(_tool_echo_messages("现在是十点"))
+
+    async def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("graph down")
+        yield  # pragma: no cover  # 保持 async generator 语义
+
+    original = runtime.graph.astream
+    runtime.graph.astream = _boom  # type: ignore[method-assign]
+    try:
+        # raise_app_exceptions=False：异常由 app 的处理器转 500 信封，测试要的是「状态码 +
+        # 事件」两件事，而不是让 ASGI 传输把异常直接抛给调用方。
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(CHAT_URL, headers=HEADERS, json={"text": "现在几点"})
+        assert resp.status_code == 500
+    finally:
+        runtime.graph.astream = original  # type: ignore[method-assign]
+        await runtime.aclose()
+
+    agent_events = [
+        e for e in listener.find(EVENT_REQUEST_FINISHED) if e.fields.get("source") == "agent"
+    ]
+    assert agent_events and agent_events[-1].status == "error"
+    assert agent_events[-1].code == "RuntimeError"

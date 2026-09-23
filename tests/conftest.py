@@ -30,7 +30,7 @@ from agent.core.graph import build_agent_graph
 from agent.intent.models import Intent, IntentResult
 from agent.llm import LLMService
 from agent.memory import MemoryStore
-from agent.query.models import QueryUnderstanding, QueryUnderstandingResult
+from agent.query.models import QueryUnderstandingResult
 from agent.response.models import AgentResponse
 from agent.runtime import AgentRuntime
 from agent.session import build_session_backend
@@ -41,6 +41,39 @@ from app.main import create_app
 # 须在任何事件循环创建之前设置，故放 conftest 模块导入期。
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+# fake 自报的模型名：`UsageMetadataCallbackHandler` 以 `response_metadata["model_name"]`
+# 为聚合键（缺它则丢弃整条 usage），故 fake 必须声明一个稳定的名字，token 链路才可断言。
+FAKE_MODEL_NAME = "fake-chat-model"
+
+
+def _fake_usage(message: AIMessage, messages: list[BaseMessage]) -> dict[str, int]:
+    """按字符数折算 token 用量（确定性、可断言；只为「确实累计过」提供证据）。"""
+    input_tokens = max(1, sum(len(str(getattr(m, "content", ""))) for m in messages) // 4)
+    output_tokens = max(1, len(str(message.content or "")) // 4)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def attach_fake_usage(result: Any, messages: list[BaseMessage]) -> Any:
+    """给 fake 的生成结果补 `usage_metadata` + `model_name`（就地改写后返回）。
+
+    WHY 在 `_generate` 出口统一补：非流式 `ainvoke` 直接走 `_generate`（不经 `_stream`），
+    只补流式路径会让「token 累计」在非流式用例里静默为空 —— 观测字段的测试必须两条
+    路径都给得出确定性输入。真实 provider 的 `usage_metadata` 也正是在这条出口上。
+    """
+    for generation in getattr(result, "generations", []):
+        message = getattr(generation, "message", None)
+        if not isinstance(message, AIMessage):
+            continue
+        if not message.usage_metadata:
+            message.usage_metadata = _fake_usage(message, messages)
+        message.response_metadata.setdefault("model_name", FAKE_MODEL_NAME)
+    return result
 
 
 class StructuredFakeChatModel(GenericFakeChatModel):
@@ -65,6 +98,18 @@ class StructuredFakeChatModel(GenericFakeChatModel):
     def bind_tools(self, tools: Any, *, tool_choice: Any = None, **kwargs: Any) -> Any:
         return self.model_copy(deep=False)
 
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        # 统一出口补 token 用量（流式 _stream 复用本方法，故两条路径都带上 usage）。
+        return attach_fake_usage(
+            super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs), messages
+        )
+
     def _stream(
         self,
         messages: list[BaseMessage],
@@ -76,6 +121,14 @@ class StructuredFakeChatModel(GenericFakeChatModel):
         # 随后把单条消息流式化为 AIMessageChunk 序列。
         result = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
         message = result.generations[0].message
+        # token 用量（C4 观测）：真实 provider 会把 usage 挂在**流式末块**上，
+        # `UsageMetadataCallbackHandler` 据此聚合；fake 默认不带 —— 显式补到末块，
+        # 使「token 累计」链路在离线测试里有可断言的输入（否则该链路恒为空 = 没测）。
+        usage = message.usage_metadata or _fake_usage(message, messages)
+        # `UsageMetadataCallbackHandler` 以 `response_metadata["model_name"]` 为聚合键
+        # （缺它则整条 usage 被丢弃）—— fake 必须自报模型名，token 链路才可断言。
+        if not message.response_metadata.get("model_name"):
+            message.response_metadata["model_name"] = FAKE_MODEL_NAME
         content = message.content
         if content:
             if not isinstance(content, str):
@@ -84,8 +137,11 @@ class StructuredFakeChatModel(GenericFakeChatModel):
             content_chunks = re.split(r"(\s)", content)
             for idx, token in enumerate(content_chunks):
                 chunk = ChatGenerationChunk(message=AIMessageChunk(content=token, id=message.id))
-                if idx == len(content_chunks) - 1 and not message.additional_kwargs:
-                    chunk.message.chunk_position = "last"
+                if idx == len(content_chunks) - 1:
+                    # 末块带 usage（真实 provider 即此口径；tool_calls 分支随末块下发）。
+                    chunk.message.usage_metadata = usage
+                    if not message.additional_kwargs:
+                        chunk.message.chunk_position = "last"
                 if run_manager:
                     run_manager.on_llm_new_token(token, chunk=chunk)
                 yield chunk
@@ -100,7 +156,9 @@ class StructuredFakeChatModel(GenericFakeChatModel):
                 for i, tc in enumerate(message.tool_calls)
             ]
             chunk = ChatGenerationChunk(
-                message=AIMessageChunk(content="", tool_call_chunks=tool_chunks, id=message.id)
+                message=AIMessageChunk(
+                    content="", tool_call_chunks=tool_chunks, id=message.id, usage_metadata=usage
+                )
             )
             if run_manager:
                 run_manager.on_llm_new_token("", chunk=chunk)
@@ -209,13 +267,11 @@ def understand_message(
     """
     return fake_structured_message(
         QueryUnderstandingResult(
-            understanding=QueryUnderstanding(
-                retrieval_needed=retrieval_needed,
-                main_query=main_query,
-                sub_queries=sub_queries or [],
-                synonyms=synonyms or [],
-                hypothetical_answer=hypothetical_answer,
-            )
+            retrieval_needed=retrieval_needed,
+            main_query=main_query,
+            sub_queries=sub_queries or [],
+            synonyms=synonyms or [],
+            hypothetical_answer=hypothetical_answer,
         )
     )
 
@@ -262,12 +318,14 @@ def make_fake_tool(
     *,
     content: str = "ok",
     fail_with: Exception | None = None,
+    delay_s: float = 0.0,
     recorder: list[dict[str, Any]] | None = None,
 ) -> BaseTool:
-    """构造可配置成败的假 BaseTool（StructuredTool），供 ToolNode 执行与断言。
+    """构造可配置成败/耗时的假 BaseTool（StructuredTool），供 ToolNode 执行与断言。
 
     `recorder` 收集每次调用的参数（dict）；`fail_with` 非空时工具执行抛异常，
-    ToolNode（handle_tool_errors=True）会把异常归一为 ToolMessage(status="error")。
+    ToolNode（handle_tool_errors=True）会把异常归一为 ToolMessage(status="error")；
+    `delay_s` 模拟真实工具耗时（C4 的「耗时不再是恒 0」验收需要可测量的时间）。
 
     WHY infer_schema=False：args_schema 缺省时 LangChain 对纯 `extra="allow"` 模型
     会误判为「无参数工具」并丢弃入参；无 schema 时 dict 输入原样透传给 coroutine，
@@ -284,6 +342,8 @@ def make_fake_tool(
             recorder.append(kwargs)
         if fail_with is not None:
             raise fail_with
+        if delay_s:
+            await asyncio.sleep(delay_s)
         return content
 
     return StructuredTool.from_function(

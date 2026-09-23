@@ -350,6 +350,7 @@ def _records_from_tool_calls(
     *,
     known_tools: set[str],
     max_content_chars: int,
+    duration_ms: int = 0,
 ) -> tuple[list[ToolCallRecord], ToolError | None]:
     """把 AIMessage.tool_calls × ToolMessage 配对成 ToolCallRecord（主图/子代理共用口径）。
 
@@ -357,6 +358,9 @@ def _records_from_tool_calls(
     （服务侧 `tool_error.lark_unbound` 前缀）→ lark_unbound（引导绑定而非降级）；
     参数校验失败（ToolNode 的 ToolInvocationError）→ missing_argument；其余 → execution。
     返回 (记录列表, 首个错误)——首个错误为 None 即全部成功。
+
+    `duration_ms` 为**派发级**耗时（ToolNode 并行跑本批全部 tool_calls，逐条计时需另路
+    拦截）：每条记录带同一值，读轨迹的人能看出「这是并行批的总耗时」而非单条耗时。
     """
     records: list[ToolCallRecord] = []
     first_error: ToolError | None = None
@@ -384,7 +388,9 @@ def _records_from_tool_calls(
                     tool_name=name,
                     arguments=args,
                     status="error",
-                    result=ToolResult(tool_name=name, ok=False, error=terr),
+                    result=ToolResult(
+                        tool_name=name, ok=False, error=terr, duration_ms=duration_ms
+                    ),
                 )
             )
             first_error = first_error or terr
@@ -398,6 +404,7 @@ def _records_from_tool_calls(
                         tool_name=name,
                         ok=True,
                         data={"content": str(tm.content or "") if tm else ""},
+                        duration_ms=duration_ms,
                     ),
                 )
             )
@@ -1229,16 +1236,18 @@ def build_agent_graph(
         )
         new_messages = result["messages"]
         tool_msgs = {tm.tool_call_id: tm for tm in new_messages}
+        # 工具耗时（C4）：ToolNode 同时执行本批全部 tool_calls，故这是**批量**耗时；
+        # 逐条均摊只会制造假精度，事件与轨迹另带同一值 + batch_size 指明口径。
+        elapsed = _elapsed_ms(tool_started)
         records, first_error = _records_from_tool_calls(
             calls,
             tool_msgs,
             known_tools={t.name for t in tools},
             max_content_chars=cfg.tools.mcp_max_content_chars,
+            duration_ms=elapsed,
         )
         all_ok = first_error is None
-        # 工具耗时（C4）：ToolNode 同时执行本批全部 tool_calls，故这是**批量**耗时；
-        # 逐条均摊只会制造假精度，事件里另带 batch_size 指明口径。
-        _emit_tool_events(records, duration_ms=_elapsed_ms(tool_started))
+        _emit_tool_events(records, duration_ms=elapsed)
         updates["messages"] = new_messages
         updates["tool_calls"] = records
         updates["tool_result"] = ToolResult(
@@ -1458,6 +1467,10 @@ def build_agent_graph(
         子图自有 messages 轨迹；本节点把子图终态转成 `SubagentResult`（含工具记录，
         经 tool_calls reducer 透出为并行 tool 事件）后合并回主图。
 
+        耗时口径（C4）：子图内的工具调用与主图不同源（`ToolNode` 在子图内独立运行，
+        主图无法逐批拦到），故这里取**整个子图调用**的耗时并写入工具记录 —— 与主图
+        「派发级耗时」同为「这一批工具实际花了多久」的量级口径，不是单条工具的精确值。
+
         v5.1：子图输入同样携带 `user_id`（子代理也要带用户身份调飞书工具 —— 否则
         并行分支的工具调用会落到「未知作用域」而被判未绑定）。
         """
@@ -1465,7 +1478,9 @@ def build_agent_graph(
             "messages": [SystemMessage(content=_subagent_prompt(payload))],
             "user_id": payload.get("user_id"),
         }
+        sub_started = time.perf_counter()
         sub_out = await subgraph.ainvoke(sub_input, config=config)
+        sub_elapsed = _elapsed_ms(sub_started)
         messages = sub_out.get("messages") or []
         calls = [
             call for m in messages if isinstance(m, AIMessage) for call in (m.tool_calls or [])
@@ -1476,6 +1491,7 @@ def build_agent_graph(
             tool_msgs,
             known_tools={t.name for t in tools},
             max_content_chars=cfg.tools.mcp_max_content_chars,
+            duration_ms=sub_elapsed,
         )
         llm_error = sub_out.get("error")
         failed = bool(llm_error) or first_error is not None
