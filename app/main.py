@@ -7,6 +7,10 @@ Windows 注意：`ensure_selector_event_loop()` 必须在任何事件循环创�
 日志：配置统一经 `shared.logging`（与 3 个 MCP 服务同一 formatter / 脱敏 / 关联标识口径）；
 `RequestContextMiddleware` 在入口注入 `X-Request-Id`，使 api→agent→MCP 全链路可 grep。
 
+事件落库（C5）：`EventStoreSink` 订阅结构化事件、带外批量写 `interaction_events`
+（不阻塞请求）；`/api/v1/logs/recent` 与 sink 共享同一仓库实例，故接口读到的事件与
+stdout 日志是同一份事实。
+
 根 `main.py` 仅 re-export 本模块的 `app`（保持 `uvicorn main:app` 兼容）。
 """
 
@@ -25,9 +29,11 @@ from agent.share.eventloop import ensure_selector_event_loop
 from app.a2a import routes as a2a
 from app.errors import register_exception_handlers
 from app.request_context import REQUEST_ID_HEADER_OUT, RequestContextMiddleware
-from app.routes import chat, health, sessions
+from app.routes import chat, health, logs, sessions
 from settings import get_settings
-from shared.logging import LoggingConfig, ServiceName, configure_logging
+from shared.events_sink import EventStoreSink, build_event_sink
+from shared.events_store import EventRepository
+from shared.logging import LoggingConfig, ServiceName, configure_logging, subscribe_events
 
 # Windows：psycopg 异步需 SelectorEventLoop，须在 uvicorn 建 loop 之前设置（模块导入期）。
 ensure_selector_event_loop()
@@ -36,19 +42,49 @@ ensure_selector_event_loop()
 _REQUEST_ID_HEADERS = ["X-Request-Id", "X-User-Id"]
 
 
-def create_app(*, runtime: AgentRuntime | None = None) -> FastAPI:
-    """应用工厂。`runtime` 供测试注入 fake 组合根；生产传 None 由 lifespan 装配。"""
+def create_app(
+    *,
+    runtime: AgentRuntime | None = None,
+    event_repository: EventRepository | None = None,
+    event_sink: EventStoreSink | None = None,
+) -> FastAPI:
+    """应用工厂。
+
+    `runtime` / `event_repository` 供测试注入（fake 组合根 / 隔离库）；
+    生产传 None 由本函数按 DSN 装配事件存储、由 lifespan 装配 runtime。
+    """
+
+    settings = get_settings()
+    # 事件存储装配（进程级单例）：按 DSN 裁决 dev=SQLite memory / prod=Postgres。
+    # 仓库在此（而非 lifespan）构造并挂到 app.state：路由（读）与 sink（写）必须共享
+    # 同一实例，SQLite memory 下各建一份会得到两个互不相见的库。
+    if event_repository is not None:
+        sink = event_sink or EventStoreSink(event_repository)
+        repository = event_repository
+    elif event_sink is not None:
+        repository = event_sink.repository
+    else:
+        sink, repository = build_event_sink(settings.database_url)
+    app_state_event_repository = repository
+    app_state_event_sink = sink
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # 建表（幂等）+ 启动带外写线程 + 订阅事件：装配期完成，避免首个请求时踩空表。
+        await app_state_event_repository.setup()
+        subscribe_events(app_state_event_sink.send)
+        app_state_event_sink.start()
         app.state.runtime = runtime or await AgentRuntime.create()
         try:
             yield
         finally:
-            await wait_pending_saves()  # 先排干带外记忆保存，再关连接池
+            # 顺序：先排干带外记忆保存，再排干事件 sink（含排空队列），最后关 runtime。
+            # WHY sink 在 runtime 之前关：runtime.aclose() 自身会产生事件（关闭路径也要
+            # 可观测），队列必须先还活着，否则最后一批事件被丢。
+            await wait_pending_saves()
             await app.state.runtime.aclose()
+            await app_state_event_sink.aclose()
 
-    settings = get_settings()
     # 日志单点配置：service=api（事件按进程归属），格式/级别来自 LOG_* 环境项。
     configure_logging(LoggingConfig.from_settings(settings, service=ServiceName.API))
     app = FastAPI(
@@ -57,6 +93,9 @@ def create_app(*, runtime: AgentRuntime | None = None) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    # 事件仓库挂在 state 上（路由依赖读它；测试直接覆盖该属性即可换库）。
+    app.state.event_repository = app_state_event_repository
+    app.state.event_sink = app_state_event_sink
     # 中间件决策：CORS 必须、TrustedHost 推荐；
     # GZip 不用（SSE 流式不该压缩，会缓冲破坏实时性）。
     app.add_middleware(
@@ -75,6 +114,7 @@ def create_app(*, runtime: AgentRuntime | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(sessions.router, prefix="/api/v1")
     app.include_router(chat.router, prefix="/api/v1")
+    app.include_router(logs.router, prefix="/api/v1")
     # A2A 端点挂根路径（/.well-known/agent.json 与 /a2a，协议约定的绝对路径）。
     app.include_router(a2a.router)
     if runtime is not None:

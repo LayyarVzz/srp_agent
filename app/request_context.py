@@ -16,6 +16,8 @@ import logging
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Final
 from uuid import uuid4
 
@@ -56,6 +58,25 @@ CODE_STREAM_ERROR: Final = "stream_error"
 _HTTP_ERROR_THRESHOLD: Final = 400
 # 未收到响应起始帧（客户端中途断开）时的兜底状态码：不得把「无响应」记成成功。
 _STATUS_UNKNOWN: Final = 500
+
+# ASGI scope 键：承载「本轮请求最终解析出的会话 id」（跨任务可见的可变容器）。
+SESSION_HOLDER_KEY: Final = "srp_session_holder"
+
+# 当前请求的会话容器（ContextVar 指向共享的可变对象；见 `bind_resolved_session` 的 WHY）。
+_session_holder: ContextVar[_SessionHolder | None] = ContextVar("srp_session_holder", default=None)
+
+
+@dataclass
+class _SessionHolder:
+    """可变容器：让「路由解析出的会话 id」回传到中间件的收尾事件。
+
+    WHY 容器而非直接再绑一次 ContextVar：**asyncio 的 Context 是任务局部的** —— 路由
+    在请求任务里 set 的值不会回传给中间件（中间件在外层等待，看到的是自己的 Context）。
+    而容器对象是共享引用，路由往里写、中间件随后读，不受 Context 隔离影响。
+    """
+
+    session_id: str | None = None
+    resolved: bool = False
 
 
 def new_trace_id() -> str:
@@ -108,6 +129,22 @@ def elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
 
 
+def bind_resolved_session(session_id: str, *, user_id: str | None = None) -> None:
+    """把路由层解析出的会话 id 绑到日志上下文，并回传给中间件的收尾事件。
+
+    调用点：`_resolve_session`（发号/归属校验之后）与 `POST /sessions`（新建会话之后）。
+    调用之后本请求内（含 SSE 生成器）的日志都带 `session=`，中间件的 `request.finished`
+    也能带上会话维度 —— 否则「按会话排查」在入口事件上直接断链。
+    """
+    holder = _session_holder.get()
+    if holder is not None:
+        holder.session_id = session_id
+        holder.resolved = True
+    if user_id is None:
+        user_id = current_user_id()
+    bind_context(trace_id=current_trace_id(), session_id=session_id, user_id=user_id)
+
+
 class RequestContextMiddleware:
     """纯 ASGI 中间件：注入/透传 `X-Request-Id`，绑定日志上下文，回写响应头。
 
@@ -117,10 +154,11 @@ class RequestContextMiddleware:
 
     行为：
     - 请求头 `X-Request-Id` 有值 → 清洗后沿用（跨服务/前端串联）；否则服务端生成；
-    - 绑定 `trace_id` + `X-User-Id`（会话维度由路由层解析出 session 后经 `turn_context` 补绑）；
+    - 绑定 `trace_id` + `X-User-Id`；会话维度由路由层解析后经 `bind_resolved_session`
+      写进 scope 里的会话容器，收尾事件据此带上 `session_id`；
     - 记 `request.received`（method/path/source，**不含请求体**）；
     - 响应回写 `X-Request-Id`；
-    - 请求结束（含异常）后记 `request.finished`（状态码 + 端到端耗时）并复位上下文。
+    - 请求结束（含异常）后记 `request.finished`（状态码 + 端到端耗时 + 会话）并复位上下文。
     """
 
     def __init__(self, app: Any) -> None:
@@ -134,13 +172,18 @@ class RequestContextMiddleware:
 
         headers = _header_map(scope)
         trace_id = headers.get(REQUEST_ID_HEADER) or new_trace_id()
+        # 会话容器：先按可选 `X-Session-Id` 头预置，随后由路由层写入权威会话 id
+        # （auto-create 场景只有路由知道真实 session_id）。
+        holder = _SessionHolder(session_id=headers.get("x-session-id"))
+        scope[SESSION_HOLDER_KEY] = holder
         tokens = bind_context(
             trace_id=trace_id,
             # 会话头是可选扩展（存在则先绑上，让 received 事件也带会话维度）；
-            # 权威会话 id 仍由路由层解析后经 turn_context 覆盖。
-            session_id=headers.get("x-session-id"),
+            # 权威会话 id 仍由路由层解析后经 `bind_resolved_session` 覆盖。
+            session_id=holder.session_id,
             user_id=headers.get(USER_ID_HEADER) or current_user_id(),
         )
+        holder_token = _session_holder.set(holder)
         started = time.perf_counter()
         status_code = _STATUS_UNKNOWN
         try:
@@ -148,6 +191,7 @@ class RequestContextMiddleware:
                 logger,
                 "request.received",
                 status="received",
+                session_id=holder.session_id,  # 有头就带上；无头时由收尾事件补全
                 fields={
                     FIELD_METHOD: scope.get("method"),
                     FIELD_PATH: scope.get("path"),
@@ -162,6 +206,8 @@ class RequestContextMiddleware:
                 status=STATUS_COMPLETED if ok else STATUS_ERROR,
                 duration_ms=elapsed,
                 code=None if ok else f"status_{status_code}",
+                # 会话维度：路由解析后写入容器，此处显式带上（ContextVar 在任务间不回传）。
+                session_id=holder.session_id,
                 **{
                     FIELD_STATUS_CODE: status_code,
                     FIELD_METHOD: scope.get("method"),
@@ -169,6 +215,7 @@ class RequestContextMiddleware:
                 },
             )
             unbind_context(tokens)
+            _session_holder.reset(holder_token)
 
     async def _run(self, scope: dict[str, Any], receive: Any, send: Any, *, trace_id: str) -> int:
         """驱动下游 ASGI 调用，截下响应起始帧以回写 `X-Request-Id` 并记状态码。"""
@@ -209,11 +256,13 @@ __all__ = [
     "FIELD_STATUS_CODE",
     "REQUEST_ID_HEADER",
     "REQUEST_ID_HEADER_OUT",
+    "SESSION_HOLDER_KEY",
     "STATUS_COMPLETED",
     "STATUS_ERROR",
     "TRACE_ID_PREFIX",
     "USER_ID_HEADER",
     "RequestContextMiddleware",
+    "bind_resolved_session",
     "elapsed_ms",
     "finish_turn",
     "new_trace_id",

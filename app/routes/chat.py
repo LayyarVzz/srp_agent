@@ -37,6 +37,7 @@ from app.request_context import (
     FIELD_SOURCE,
     STATUS_COMPLETED,
     STATUS_ERROR,
+    bind_resolved_session,
     elapsed_ms,
     finish_turn,
     turn_context,
@@ -93,12 +94,17 @@ def _validate_voice_upload(audio: UploadFile | None, transcript: str | None) -> 
 
 
 async def _resolve_session(runtime: AgentRuntime, user_id: str, session_id: str | None) -> str:
-    """发号（缺省自动创建）+ 归属强校验（fail-fast）。
+    """发号（缺省自动创建）+ 归属强校验（fail-fast），并把会话绑进日志上下文。
 
     必须在返回 StreamingResponse 之前完成：流开始后不再产生 4xx。
+
+    WHY 顺带 `bind_resolved_session`：入口中间件早于本函数执行（那时还不知道会话 id），
+    绑定后本请求内所有日志/事件都带 `session=`，中间件的 `request.finished` 也能带上
+    —— 否则「按会话排查」在入口事件上直接断链。
     """
     sid = session_id or (await runtime.sessions.create(user_id=user_id)).session_id
     await runtime.sessions.resolve(user_id=user_id, session_id=sid)
+    bind_resolved_session(sid, user_id=user_id)
     return sid
 
 

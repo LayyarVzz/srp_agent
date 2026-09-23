@@ -2,6 +2,8 @@
 
 归属强校验经 `SessionManager.resolve/delete`（跨用户统一 404 `session_error.not_found`，
 防枚举）；`require_user_id` 同时供 chat 路由复用（MVP 身份约定，api.md §2.1）。
+
+发号后调用 `bind_resolved_session`：新建会话的请求自身也应能按会话检索日志/事件。
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from agent.runtime import AgentRuntime
 from app.deps import get_runtime
 from app.errors import AUTH_IDENTITY_REQUIRED, APIError
 from app.models import SessionCreated, SessionListResponse
+from app.request_context import bind_resolved_session
 
 router = APIRouter(tags=["sessions"])
 
@@ -40,6 +43,7 @@ async def create_session(
     """创建会话：服务端 uuid4 发号（`thread_id == session_id` 契约，api.md §3.1）。"""
     user_id = require_user_id(x_user_id)
     ctx = await runtime.sessions.create(user_id=user_id)
+    bind_resolved_session(ctx.session_id, user_id=user_id)
     return SessionCreated.from_context(ctx)
 
 

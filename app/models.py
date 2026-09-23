@@ -23,6 +23,7 @@ from agent.response.status import StatusEvent
 from agent.session.models import SessionContext
 from agent.share.models import Citation
 from agent.tools.models import ToolCallRecord
+from shared.events_store import EventRecord
 
 
 class Phase(StrEnum):
@@ -119,3 +120,26 @@ class SessionListResponse(BaseModel):
 
     ok: bool = True
     sessions: list[SessionContext] = Field(default_factory=list)
+
+
+class RecentLogsResponse(BaseModel):
+    """最近交互事件响应（`GET /api/v1/logs/recent`）。
+
+    WHY 直接下发 `EventRecord` 列表而非再包一层：事件字段就是排查时要看的东西，
+    二次包装只会让前端/CLI 多剥一层。`limit` 回显便于对账「请求的上限是否生效」。
+    """
+
+    ok: bool = True
+    limit: int
+    events: list[EventRecord] = Field(default_factory=list)
+
+
+class TraceEventsResponse(BaseModel):
+    """单条 trace 的全链路事件响应（`GET /api/v1/logs/trace/{trace_id}`）。
+
+    升序返回：读一条请求的完整链路时，时间顺序才是「故事」，倒序需要人脑重排。
+    """
+
+    ok: bool = True
+    trace_id: str
+    events: list[EventRecord] = Field(default_factory=list)

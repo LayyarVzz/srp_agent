@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Final, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -224,6 +225,9 @@ class LogEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     event: str
+    # 事件唯一标识：由生成端（本进程）分配，写入事件表作为主键。用 uuid4 而非自增：
+    # 多 worker / 多副本各自无协调地写同一张表，是「多 worker 语义正确性」的前提。
+    id: str = Field(default_factory=lambda: str(uuid4()))
     level: LogLevel = "INFO"
     service: str = ""
     ts: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -237,7 +241,11 @@ class LogEvent(BaseModel):
     fields: dict[str, Any] = Field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
-        """扁平摘要：`fields` 平铺进顶层（同名冲突以 fields 为准，事件属性更具体）。"""
+        """扁平摘要：`fields` 平铺进顶层（同名冲突以 fields 为准，事件属性更具体）。
+
+        不含 `id`（时间语义之外的实现细节）：摘要供「按语义 grep / 聚合」，id 只在
+        落库时作为主键使用；把它塞进摘要会让每个消费方都要跳过它。
+        """
         data: dict[str, Any] = {
             "event": self.event,
             "level": self.level,
@@ -686,6 +694,12 @@ def unsubscribe_events(listener: EventListener) -> None:
     """注销事件监听器（幂等；未注册时无操作）。"""
     if listener in _listeners:
         _listeners.remove(listener)
+
+
+def listener_count() -> int:
+    """当前已注册的监听器数量（测试断言「订阅未泄漏」；事件监听是**进程级全局**状态，
+    泄漏会让后一个用例的事件写进前一个用例的库，表现为「莫名多出别的事件」）。"""
+    return len(_listeners)
 
 
 def _service_name() -> str:

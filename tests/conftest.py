@@ -35,12 +35,29 @@ from agent.response.models import AgentResponse
 from agent.runtime import AgentRuntime
 from agent.session import build_session_backend
 from app.main import create_app
+from shared.events_sink import EventStoreSink
+from shared.events_store import build_event_repository
+from shared.logging import listener_count, unsubscribe_events
 
 # Windows 下 psycopg 异步驱动不兼容 ProactorEventLoop：pytest-asyncio 自动创建的事件循环
 # 必须是 SelectorEventLoop，Postgres 集成测试（test_postgres_integration.py）才能连通。
 # 须在任何事件循环创建之前设置，故放 conftest 模块导入期。
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+@pytest.fixture(autouse=True)
+def _no_event_listener_leak() -> Any:
+    """用例结束后断言「事件监听器订阅没有泄漏」。
+
+    WHY 全局守卫：事件监听器注册表是**进程级全局**的，订阅泄漏会让后一个用例产生的事件
+    继续写进前一个用例的事件库/记录器 —— 表现为「莫名多出别的 trace 的事件」这类
+    难以定位的偶发失败。宁可在这里硬失败，也不要留下顺序相关的 flake。
+    """
+    before = listener_count()
+    yield
+    leaked = listener_count() - before
+    assert leaked <= 0, f"事件监听器泄漏：用例结束时多出 {leaked} 个订阅（未 unsubscribe）"
 
 
 # fake 自报的模型名：`UsageMetadataCallbackHandler` 以 `response_metadata["model_name"]`
@@ -459,10 +476,16 @@ def api_runtime_factory(
 
 @pytest.fixture
 def api_app_factory(api_runtime_factory: Callable[..., Any]) -> Callable[..., Any]:
-    """构造注入 fake 组合根的 FastAPI 应用（lifespan 不跑，app.state.runtime 预置）。
+    """构造注入 fake 组合根 + 隔离事件库的 FastAPI 应用（lifespan 不跑）。
 
-    返回 (app, runtime)：测试负责在 finally 中 `await runtime.aclose()`。
+    WHY 注入隔离事件库：`create_app(event_repository=...)` 不传时会按 `settings.database_url`
+    建**真实**事件仓库（本地 .env 里常指向 Postgres）—— 测试会尝试连真库并污染它。
+    这里统一注入内存库（每个 app 一份，互不串数据），测试要验落库时再显式启动 sink。
+
+    返回 (app, runtime)：测试负责在 finally 中 `await runtime.aclose()`；
+    事件 sink / 事件库由本 fixture 在用例结束统一收尾（含连接池释放）。
     """
+    sinks: list[EventStoreSink] = []
 
     async def _make(
         messages: list[AIMessage],
@@ -470,7 +493,16 @@ def api_app_factory(api_runtime_factory: Callable[..., Any]) -> Callable[..., An
         tools: list[BaseTool] | None = None,
     ) -> tuple[Any, AgentRuntime]:
         runtime = await api_runtime_factory(messages, tools=tools)
-        app = create_app(runtime=runtime)
+        repository = build_event_repository(None)
+        await repository.setup()
+        sink = EventStoreSink(repository)
+        app = create_app(runtime=runtime, event_repository=repository, event_sink=sink)
+        sinks.append(sink)
         return app, runtime
 
-    return _make
+    yield _make
+    # 用例收尾：先注销订阅再关 sink —— 否则下一个用例的事件会继续写进本用例已关掉的
+    # 事件库（订阅是**进程级**全局表，跨用例残留会互相污染，表现为「莫名多出别的事件」）。
+    for sink in sinks:
+        unsubscribe_events(sink.send)
+        asyncio.run(sink.aclose())
