@@ -24,11 +24,15 @@
 #   LARK_APP_ID / LARK_APP_SECRET / LARK_TOKEN_KEY   # 飞书绑定闭环（三件套缺一即 fail-closed）
 #   MCP_TRANSPORT=streamable-http                    # 仅本机 uv 运行 Agent 时需要
 #   DATABASE_URL=postgresql://postgres:postgres@localhost:5432/srp_agent
+#   LOG_FORMAT=json                                  # 可选；接日志采集器时切 JSONL
 # 即可让Agent直连上面的 Postgres 与各 MCP 服务。
 name: srp-agent
 
 # 日志：统一走 stdout，聚合交 `docker compose logs`；轮转交 json-file driver。
 # WHY：容器内写文件在多 worker / 容器重建下必然丢（plan-docker §4），故不落盘、只轮转。
+# 形态由 `LOG_FORMAT` 决定（text=人眼可读带 trace= 前缀 / json=一行一条 JSONL）；
+# 结构化**事件**另有落库路径（`interaction_events` 表），用于跨进程/跨重启的回溯查询
+# （`GET /api/v1/logs/recent`）——stdout 与事件表互补，不是同一份数据写两遍。
 x-logging: &default-logging
   driver: json-file
   options:
@@ -72,6 +76,7 @@ services:
       MCP_STREAMABLE_HTTP_PATH: /mcp
       MCP_STATELESS_HTTP: "true"
       LOG_LEVEL: INFO
+      LOG_FORMAT: ${LOG_FORMAT:-text}
     ports:
       # 只绑回环：MCP 服务供 api 容器经 compose 网络访问，无需对整个局域网开放
       - "127.0.0.1:8100:8100"
@@ -119,6 +124,7 @@ services:
       # 配置态单用户回退路径（不配 LARK_TOKEN_KEY 时使用；多用户隔离不可用）
       LARK_USER_ACCESS_TOKEN: ${LARK_USER_ACCESS_TOKEN:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
     ports:
       # 只绑回环：api 容器经 compose 网络直连，本机联调时该映射已够用
       - "127.0.0.1:8101:8101"
@@ -151,6 +157,7 @@ services:
       A2A_MCP_AGENTS: ${A2A_MCP_AGENTS:-}
       A2A_MCP_PEER_ID: ${A2A_MCP_PEER_ID:-srp-agent}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
     ports:
       - "127.0.0.1:8102:8102"
     healthcheck:
@@ -207,13 +214,18 @@ services:
       EMBEDDING_DIMS: ${EMBEDDING_DIMS:-0}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      # —— 讯飞语音听写，
+      # —— 讯飞语音听写（未配置时语音接口返回 asr.missing_credentials，
       #    文本交互与 transcript 直传降级不受影响）——
       XF_IAT_APP_ID: ${XF_IAT_APP_ID:-}
       XF_IAT_API_KEY: ${XF_IAT_API_KEY:-}
       XF_IAT_API_SECRET: ${XF_IAT_API_SECRET:-}
       XF_IAT_URL: ${XF_IAT_URL:-wss://iat-api.xfyun.cn/v2/iat}
+      # —— 日志（容器内 stdout 形态 + 轮转；见文件顶部 x-logging）——
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # text（人眼可读，带 trace=/session= 前缀）| json（一行一条 JSONL，供采集器）。
+      # 4 个进程共用同一开关：日志格式必须在整套编排里一致，混合形态会让
+      # `docker compose logs` 里出现两种行格式（grep 与解析都要写两套）。
+      LOG_FORMAT: ${LOG_FORMAT:-text}
     ports:
       - "8000:8000"
     depends_on:
