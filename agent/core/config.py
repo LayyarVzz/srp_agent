@@ -50,10 +50,18 @@ _LLM_PROVIDER_PRESETS: dict[LLMProvider, _LLMProviderPreset] = {
     LLMProvider.OPENAI_COMPATIBLE: _LLMProviderPreset(base_url="", default_model=""),
 }
 
-# DeepSeek V4 系列（v4-flash / v4-pro）模型名标识：
-# V4 默认开启思考模式，而思考模式拒绝显式 tool_choice（HTTP 400 "Thinking mode does
-# not support this tool_choice"），与 function_calling 结构化输出冲突。
-_DEEPSEEK_V4_MODEL_HINT = "v4"
+# 关闭思考的两种参数口径（各兼容端点命名不一致，见 `structured_extra_body`）：
+# - `thinking`：DeepSeek 官方口径 `{"thinking": {"type": "disabled"}}`；
+# - `enable_thinking`：Qwen/DashScope 口径 `{"enable_thinking": false}`。
+# **不能按模型名猜口径**：MaaS 上托管的模型名与口径并不同源（如阿里云 MaaS 上
+# 跑 deepseek-v4.1-flash，模型名带 "v4" 却由 DashScope 兼容层解析）。
+# 故 `auto` 默认「两种都发」，由各端点忽略自己不认识的字段（实测两口径互不干扰）。
+_THINKING_PARAM_DEEPSEEK = "thinking"
+_THINKING_PARAM_ENABLE = "enable_thinking"
+_DEEPSEEK_THINKING_DISABLED: dict[str, object] = {"thinking": {"type": "disabled"}}
+_ENABLE_THINKING_DISABLED: dict[str, object] = {"enable_thinking": False}
+# 结构化输出的 completion 上限兜底：见 LLMBehaviorConfig.max_tokens 的 WHY。
+_DEFAULT_STRUCTURED_MAX_TOKENS = 2048
 
 
 class LLMBehaviorConfig(BaseModel):
@@ -61,13 +69,21 @@ class LLMBehaviorConfig(BaseModel):
 
     # 结构化输出更低温更稳；普通对话可由调用方按需覆盖。
     temperature: float = 0.0
-    max_tokens: int | None = None
+    # completion 上限兜底。WHY 不能留 None：部分兼容端点（实测阿里云 MaaS +
+    # deepseek-v4.1-flash）在特定 schema 形态下会**失控生成到端点默认上限 8192**，
+    # 单次请求耗时 60s+ 直接撞 `request_timeout` → 触发重试 → 单节点卡 120~180s。
+    # 结构化输出正常只需 ~100-400 token，2048 留足余量同时把失控代价压到秒级。
+    max_tokens: int | None = Field(default=_DEFAULT_STRUCTURED_MAX_TOKENS, ge=1)
     request_timeout: float = 60.0
     max_retries: int = Field(default=2, ge=0)
     # langchain-openai >= 0.3 默认 method 是 json_schema，DeepSeek 会拒绝
     # function_calling 是 DeepSeek / Qwen / 任意兼容端点最广的公共能力。
     structured_method: Literal["function_calling", "json_mode", "json_schema"] = "function_calling"
+    # 统一关闭思考模式（qwen / deepseek / 任意兼容端点一律适用，见 structured_extra_body）。
     disable_thinking: bool = True
+    # 关闭思考的参数口径：`auto`（默认，两种都发，最兼容）/ `thinking` / `enable_thinking`。
+    # 仅在显式知道端点只认某一种口径时收窄（发错口径的字段会被端点忽略，不会报错）。
+    thinking_param: Literal["auto", "thinking", "enable_thinking"] = "auto"
 
 
 class LLMConfig(LLMBehaviorConfig):
@@ -129,16 +145,26 @@ class LLMConfig(LLMBehaviorConfig):
 
     @property
     def structured_extra_body(self) -> dict[str, object] | None:
-        """结构化输出请求需附加的 provider 特定 body 参数。
-        这里先只处理deepseek
+        """请求需附加的「关闭思考」body 参数（provider 无关，统一适用）。
+
+        WHY 不再按 provider / 模型名分支：
+        旧实现用 `provider==deepseek 且 模型名含 "v4"` 判 DeepSeek 口径，这在两种现实下
+        都失效 —— ① `deepseek-flash` 这类名字不含 "v4"，条件不进、思考没关；
+        ② 阿里云 MaaS 上跑 `deepseek-v4.1-flash` 时 provider 填的是 `qwen`，
+        于是走 Qwen 口径。按模型名猜「该用哪家口径」本质不可靠：**托管平台与口径不同源**。
+
+        WHY 默认两种口径都发：各兼容端点会忽略自己不认识的字段（实测阿里云 MaaS 上
+        `enable_thinking` 与 `thinking` 互不干扰、均能关闭思考），所以「都发」是
+        最稳的默认；确知端点只认某一种时可用 `thinking_param` 收窄。
         """
-        if (
-            self.provider == LLMProvider.DEEPSEEK
-            and self.disable_thinking
-            and _DEEPSEEK_V4_MODEL_HINT in self.effective_model
-        ):
-            return {"thinking": {"type": "disabled"}}
-        return None
+        if not self.disable_thinking:
+            return None
+        if self.thinking_param == _THINKING_PARAM_DEEPSEEK:
+            return dict(_DEEPSEEK_THINKING_DISABLED)
+        if self.thinking_param == _THINKING_PARAM_ENABLE:
+            return dict(_ENABLE_THINKING_DISABLED)
+        # auto：两种口径合并下发（互斥字段名，不会互相覆盖）。
+        return {**_ENABLE_THINKING_DISABLED, **_DEEPSEEK_THINKING_DISABLED}
 
 
 class AgentGraphConfig(BaseModel):

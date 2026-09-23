@@ -100,9 +100,13 @@ docx:document:readonly
 
 ## 运行与装配
 
-- Agent 侧门控登记（`agent/runtime.py::_build_mcp_servers`）：`cfg.lark.enabled`
-  **且** `LARK_CLI_ENABLED` **且** 命令探测成功（`resolve_lark_cli_command`）才注册
-  `lark_mcp` 服务；否则跳过并记日志——**无 CLI 环境零回归**。
+- Agent 侧门控登记（`agent/runtime.py::_build_lark_connection`），**按传输方式分两路**：
+  - **stdio（本机默认）**：`cfg.lark.enabled` **且** `LARK_CLI_ENABLED` **且** 命令探测成功
+    （`resolve_lark_cli_command`）才注册 `lark_mcp` 服务；否则跳过并记日志
+    ——**无 CLI 环境零回归**；
+  - **streamable-http（容器部署）**：由 `LARK_MCP_TRANSPORT=streamable-http` 决定，
+    **不做本地命令探测** —— lark-cli 住在 lark_mcp 容器内，api 侧探测的是本机 PATH，
+    与远端容器能力无关（探测必失败，且失败会静默丢掉整个飞书工具面）。
 - 服务侧装配（`services/lark_mcp/server.py::_build_binding_pieces`）：有应用凭据 +
   `lark_token_key` → 构造 `BindingCredentialProvider`（按用户隔离）；否则 →
   `ConfigCredentialProvider`（配置态单用户）。
@@ -112,6 +116,81 @@ docx:document:readonly
   - `uv run python -m scripts.demo_lark` —— 业务工具面；
   - `uv run python -m scripts.demo_lark_binding` —— **多用户绑定全链路**（默认离线，
     零网络零真实应用；`--live` 用真实飞书应用并人工扫码）。
+
+## 容器化（独立 `lark_mcp` 容器）
+
+以 streamable-http 运行在 8101，api 经 `LARK_MCP_TRANSPORT/HOST/PORT` 连过来
+（决策与差异见 `docs/plan-docker-observability.md` §2.1）：
+
+```bash
+# 仓库根目录；凭据从宿主 .env 注入（LARK_APP_ID / LARK_APP_SECRET / LARK_TOKEN_KEY）
+docker compose up -d --build lark_mcp
+docker compose logs -f lark_mcp
+curl -s http://127.0.0.1:8101/health        # {"status":"ok"}
+docker compose exec lark_mcp lark-cli --version   # 1.0.95
+```
+
+**镜像形态（`Dockerfile.lark_mcp`）**：node 阶段只用于取 `@larksuite/cli` 的**独立
+二进制**（npm 包只是下载器 + 垫片），运行期是**纯 python-slim，镜像内无 node**。
+
+> 构建期提示：npm 包的 postinstall 用 `spawnSync curl` 下载平台二进制，而
+> `node:*-slim` 基底**不含 curl** → 构建阶段必须先 `apt-get install curl`
+> （实测报错 `Failed to install lark-cli: spawnSync curl ENOENT`，是缺工具不是网络问题）。
+> 该二进制实测为**静态链接**（`ldd` 报 not a dynamic executable），故不依赖基底 libc 版本。
+
+### 三个容器化陷阱（踩过，勿改）
+
+1. **`LARKSUITE_CLI_CONFIG_DIR` 必须显式给出**（镜像内已固化 `/tmp/lark-cli`）：
+   `services/lark_mcp/cli.py` 的 `_ENV_ALLOWLIST` 刻意剔掉 `HOME`/`USERPROFILE`/`APPDATA`
+   （设计意图：身份不得回落本机既有登录），容器内若无可写 config 目录，部分命令会失败。
+2. **`LARK_DATABASE_URL` 必须指向编排内的 postgres**：缺 DSN 时绑定域退化为
+   `sqlite+aiosqlite:///:memory:` ——「看着成功、实际无效」。HTTP 形态下虽然进程常驻，
+   容器重建 / 多副本仍各库各的；**且 `lark_bind_start`（写待定态）与 `lark_bind_complete`
+   （读回）是两次独立工具调用**，内存库会让对话内绑定闭环静默断链（表现为误导性的
+   「还没检测到授权」）。compose 已注入
+   `postgresql://postgres:postgres@postgres:5432/srp_agent`（与记忆/会话同库）。
+3. **`LARK_TOKEN_KEY` 必须与 api 容器同值**：密文由 lark_mcp 写入
+   （`shared/lark/repository.py`），api 侧要解密取用；不同值 = 绑定链路静默失败。
+
+### 容器内联调（不经 compose）
+
+```bash
+docker run --rm -p 127.0.0.1:8101:8101 \
+  -e MCP_TRANSPORT=streamable-http -e MCP_HOST=0.0.0.0 -e MCP_PORT=8101 \
+  -e LARK_CLI_COMMAND=/usr/local/bin/lark-cli \
+  -e LARK_DATABASE_URL='sqlite+aiosqlite:///:memory:' \
+  srp-agent-lark-mcp:latest
+```
+
+> 绑定域的真实闭环（写密文 → 读回）**必须**用 Postgres：内存库只够冒烟探活。
+
+### 镜像瘦身与裁剪边界（Phase B）
+
+本镜像不是「装齐 `uv.lock` 的全部依赖」，而是按**本服务真实 import 面**裁剪
+（plan-docker-observability.md §3）：
+
+| 手段 | 效果（本机实测） |
+|---|---|
+| 多阶段（builder → runtime）+ `--mount=type=cache,target=/root/.cache/uv` + 显式 `UV_CACHE_DIR` | 镜像内**零 uv 缓存残留**（原来每镜像残留 **241 MB**） |
+| uv 钉 `0.11.28`（原 `:latest`）+ `UV_PYTHON_DOWNLOADS=never` | 不自下载 CPython；构建可复现 |
+| 构建期不编译字节码 + runtime `PYTHONDONTWRITEBYTECODE=1` | `.pyc` 归零（api/tools 各省 **88 MB**；lark/a2a 本就没有） |
+| `uv sync --no-install-package …`（见 `Dockerfile.lark_mcp`） | `.venv` **240 MB → 136 MB**；镜像 946 MB → 417 MB |
+
+**裁剪边界（改动本服务代码后必须复核）**：本镜像的第三方 import 面 =
+`fastmcp` / `starlette`（服务与 `/health`）+ `pydantic` + `pydantic-settings` +
+`sqlalchemy` + `aiosqlite` + **`psycopg[binary]`**（绑定域仓库建表与读写）+
+`cryptography`（Fernet）+ `httpx`（OAuth）+ `langchain-mcp-adapters`。
+
+> ⚠️ **`psycopg` 不可裁（实测踩过）**：绑定域仓库把 DSN 改写成
+> `postgresql+psycopg://`（`shared/lark/repository.py::_build_engine`），而 SQLAlchemy
+> 的方言是**运行期按 URL 惰性导入**的 —— 裁掉后构建期不报错，启动建表阶段才
+> `ModuleNotFoundError`。容器内 compose 恒注入 Postgres DSN，故必须保留。
+> 同理 `langchain-mcp-adapters` 来自 `client_config.py` 的 `StdioConnection` 导入，也不可裁。
+
+**复核方式（零成本）**：
+`docker run --rm srp-agent-lark-mcp:latest /app/.venv/bin/python -c "import services.lark_mcp.server"`。
+**本裁剪方式的已知代价**：新增 import 时构建期不报错、运行期才报 —— 因此给本服务加依赖
+必须同步更新 Dockerfile 的排除清单。
 
 ## 数据模型
 
@@ -130,7 +209,10 @@ docx:document:readonly
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `LARK_CLI_ENABLED` | `true` | Agent 侧登记总开关（settings.py） |
-| `LARK_CLI_COMMAND` | 空 | 显式指定 CLI 路径（相对路径按仓库根解析）；空则探测 PATH |
+| `LARK_CLI_COMMAND` | 空 | 显式指定 CLI 路径（相对路径按仓库根解析）；空则探测 PATH；容器内为 `/usr/local/bin/lark-cli` |
+| `LARK_MCP_TRANSPORT` | `stdio` | **客户端**连接方式（settings.py）；容器部署 = `streamable-http` |
+| `LARK_MCP_HOST` / `LARK_MCP_PORT` | `127.0.0.1` / `8101` | **客户端**连接地址；容器部署 = 服务名 `lark_mcp` / `8101` |
+| `LARK_DATABASE_URL` | 空 | 绑定域库（**优先于 `DATABASE_URL`**）；容器部署必须指向编排内 Postgres |
 | `LARK_CLI_TIMEOUT_S` | `30` | 单次 CLI 子进程超时 |
 | `LARK_OUTPUT_MAX_CHARS` | `10000` | 工具输出长度上限 |
 | `LARK_APP_ID` / `LARK_APP_SECRET` | 空 | 飞书应用（OAuth 客户端） |

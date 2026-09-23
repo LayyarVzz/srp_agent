@@ -109,11 +109,13 @@ class QueryRewriter:
             # 裸 Exception：改写是主链路上的增益能力，失败即回退原始输入。
             logger.warning("查询理解失败（回退原始输入）：%s", exc)
             return None
-        if not isinstance(result, QueryUnderstandingResult) or result.understanding is None:
-            # 无工具调用时 with_structured_output 返回 None 而非抛错，必须显式守卫。
-            logger.warning("查询理解返回空结果（模型未产出结构化输出），回退原始输入")
+        if not isinstance(result, QueryUnderstandingResult) or not result.main_query.strip():
+            # 模型未产出结构化输出时 with_structured_output 返回 None 而非抛错，必须显式守卫；
+            # 「产出了但主改写为空」同样按无产出处理（下游 `ranked_queries` 对空主改写
+            # 本就返回空池，这里提前收敛以保持「空结果 → 回退原始输入」语义不变）。
+            logger.warning("查询理解返回空结果（模型未产出有效主改写），回退原始输入")
             return None
-        return result.understanding
+        return result
 
     def _hypothetical_allowed(self, text: str) -> bool:
         """HyDE 双门控：总开关开启 **且** 查询足够短（§2.6 范围限制）。"""

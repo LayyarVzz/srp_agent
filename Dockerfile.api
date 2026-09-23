@@ -1,22 +1,54 @@
 # API 服务（FastAPI + Agent）镜像
 # Linux 容器内 uvicorn 默认 SelectorEventLoop，天然规避 Windows ProactorEventLoop
 # 问题（无需 run_api.py / app/uvicorn_loop.py；二者仅 Windows 本地开发使用）。
-FROM python:3.12-slim
+#
+# 瘦身要点（plan-docker-observability.md §3）见各段注释；核心是「构建期与运行期分离」：
+# 依赖只装进 builder 的 /app/.venv，uv 缓存留在 cache mount 里，运行期只拿 .venv。
 
-ENV PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy \
-    UV_COMPILE_BYTECODE=1 \
-    PYTHONPATH=/app
+# ---------- 构建期：只负责产出 /app/.venv ----------
+FROM python:3.12-slim AS builder
 
-# 安装 uv（官方 uv 镜像提供现成二进制）
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# uv 钉版本：`:latest` 会让同一份 Dockerfile 在不同时间构建出不同依赖行为（不可复现）。
+# 变体 libc 须与基底一致（python:3.12-slim = Debian/glibc → 用默认的 non-musl uv 镜像）。
+COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /uvx /bin/
+
+# UV_LINK_MODE=copy：不依赖硬链接（cache mount 与工作目录可能跨文件系统）。
+# UV_CACHE_DIR **必须显式声明**：`--mount` 挂的是这个目录，而 uv 默认找 $HOME/.cache/uv
+# —— 两者不一致时缓存会落到镜像层里（实测每镜像残留 241 MB）。
+# UV_PYTHON_DOWNLOADS=never：否则 uv 可能自下载一份 CPython（镜像翻倍，且该解释器
+# 路径在 runtime 阶段不存在）。
+ENV UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_CACHE_DIR=/root/.cache/uv
 
 WORKDIR /app
 
-# 先复制依赖清单并同步依赖（利用 Docker 层缓存：源码改动不触发重新解析依赖）
-# --no-install-project：只装依赖、不装本项目包（运行靠源码目录，见 CMD）
-COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-install-project
+# --mount=type=bind（而非 COPY 清单）：依赖层不再随源码改动失效；
+# 配合下方 cache mount，uv 缓存**永远不进镜像层**（只留在宿主机构建缓存里）。
+# --no-install-project：只装依赖、不装本项目包（运行靠源码目录 + PYTHONPATH=/app）。
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=README.md,target=README.md \
+    uv sync --frozen --no-dev --no-install-project
+
+# ---------- 运行期：干净基底 + 只搬 .venv 与源码 ----------
+FROM python:3.12-slim AS runtime
+
+# PYTHONDONTWRITEBYTECODE=1 + 构建期不编译字节码：实测 .venv 328 → 240 MB、镜像 -88 MB。
+# 取舍留痕：不预编译 .pyc 的代价是冷启动 import 变慢（实测 `import main` 4.4s vs 有 .pyc 的 2.1s，
+# 首跑后运行时仍会写缓存目录外的 .pyc 则不再计入）。若将来冷启动比体积更重要，
+# 只需在构建期（builder 阶段，而非 runtime）重新打开 UV_COMPILE_BYTECODE=1。
+# PYTHONPATH=/app：源码目录即运行单元（与 --no-install-project 配套）。
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# .venv 路径必须保持 /app/.venv：pyvenv.cfg 与 bin/ 脚本内是绝对路径，
+# 且两阶段同一 base（否则解释器与扩展模块 ABI 可能不匹配）。
+COPY --from=builder /app/.venv /app/.venv
 
 # 复制全部源码（agent / app / services / shared / 根模块）
 COPY agent ./agent
@@ -24,6 +56,13 @@ COPY app ./app
 COPY services/__init__.py ./services/__init__.py
 COPY services/tools_mcp ./services/tools_mcp
 COPY services/rag_mcp ./services/rag_mcp
+# lark_mcp / a2a_mcp 必须一并复制：agent/runtime.py 硬 import 二者的 client_config
+# （rag_mcp 的 stdio 子进程 + lark/a2a 的 HTTP 连接配置构造都在 api 进程内完成），
+# 漏掉即容器启动 ModuleNotFoundError（plan-docker §1.1 缺陷 B1）。
+# WHY 仍复制 services 目录而非整包安装：源码目录即运行单元（PYTHONPATH=/app），
+# 与 `uv sync --no-install-project` 配套，见 Dockerfile.tools_mcp 同款说明。
+COPY services/lark_mcp ./services/lark_mcp
+COPY services/a2a_mcp ./services/a2a_mcp
 COPY shared ./shared
 COPY settings.py main.py ./
 

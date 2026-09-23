@@ -73,8 +73,8 @@ class LLMService:
     def chat_model(self) -> BaseChatModel:
         """返回底层聊天模型，未注入时按配置懒构造真客户端。
 
-        WHY 统一关闭思考：懒构造即带 `structured_extra_body`（DeepSeek V4 →
-        `thinking=disabled`），text/tool/structured 三条路径共用同一模型，
+        WHY 统一关闭思考：懒构造即带 `structured_extra_body`（provider 无关，
+        qwen/deepseek 两口径同时下发），text/tool/structured 三条路径共用同一模型，
         不再存在「普通对话保留思考 / 结构化关闭思考」的双模型切换。
         """
         if self._chat_model is None:
@@ -127,8 +127,8 @@ class LLMService:
     def tool_model(self, tools: Sequence[BaseTool]) -> Runnable:
         """把工具列表绑定到模型，返回可产出 `AIMessage.tool_calls` 的 Runnable。
 
-        WHY 复用 `chat_model`：懒构造时已统一关闭思考（DeepSeek V4 下带
-        `thinking=disabled`），`bind_tools` 可直接使用，无需再构造专用模型。
+        WHY 复用 `chat_model`：懒构造时已统一关闭思考（`structured_extra_body`，
+        qwen/deepseek 两口径同时下发），`bind_tools` 可直接使用，无需再构造专用模型。
         """
         return self.chat_model.bind_tools(tools)
 

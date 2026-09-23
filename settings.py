@@ -54,6 +54,14 @@ class RuntimeSettings(BaseSettings):
     # services/lark_mcp/config.py。命令探测失败时 lark_mcp 不登记，Agent 照常服务（零回归）——
     lark_cli_enabled: bool = True
     lark_cli_command: str | None = None  # LARK_CLI_COMMAND 显式覆盖；空则探测 PATH
+    # —— lark_mcp 客户端连接（容器/远程形态）：与 tools_mcp 的 `mcp_*` **刻意分离** ——
+    # WHY 独立三项而非复用 `MCP_TRANSPORT/HOST/PORT`：`MCP_*` 是 tools_mcp 的地址
+    # （端口 8100），lark_mcp 在独立容器里监听 8101；共用一个环境项会让 api 把
+    # lark 请求打到 tools_mcp 上（或反之），表现为「连上了但工具列表不对」。
+    # 命名与 `A2A_MCP_*` 同构：一个远端 MCP 服务 = 一组独立连接项。
+    lark_mcp_transport: MCPTransport = MCPTransport.STDIO  # streamable-http = 连远端容器
+    lark_mcp_host: str = "127.0.0.1"  # 容器部署 = compose 服务名 lark_mcp
+    lark_mcp_port: int = 8101  # 避开 API 8000 / tools_mcp 8100 / a2a_mcp 8102
     # —— A2A 智能体互联（T5 Server 入站；T6 Client 环境项见下）——
     # 环境变量约定 A2A_ENABLED / A2A_PEER_MAP（pydantic-settings 大小写不敏感匹配）。
     a2a_enabled: bool = True  # 关闭时所有入站 A2A 请求拒绝（AgentCard 发现不受影响）

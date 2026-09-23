@@ -1,5 +1,14 @@
-# tools_mcp 独立运行镜像
-# 仅用于 compose 中以 streamable-http 方式跑工具服务；Agent 本体仍在本机 uv 环境运行。
+# a2a_mcp 独立运行镜像（把远端智能体封装为 MCP 工具）
+#
+# 与 Dockerfile.tools_mcp 同构：服务自包含（只依赖本包 + config），
+# 不 import agent 包、不读项目根 settings.py，可独立打包部署。
+#
+# 构建：
+#   docker build -f Dockerfile.a2a_mcp -t srp-agent-a2a-mcp:latest .
+#
+# 注册表门控（零回归）：env `A2A_MCP_AGENTS`（JSON {"<agent_id>": "<base_url>"}）
+# 为空时，服务照常在端口上跑、但 Agent 侧不登记该服务（settings.a2a_mcp_agents 空
+# → runtime 门控跳过），工具集与既有完全一致（见 services/a2a_mcp/README.md）。
 #
 # 瘦身要点（plan-docker-observability.md §3）：构建期/运行期分离 + cache mount + 裁剪。
 
@@ -15,11 +24,11 @@ ENV UV_LINK_MODE=copy \
 
 WORKDIR /app
 
-# 先复制依赖清单并同步依赖（利用 Docker 层缓存：源码改动不触发重新解析依赖）。
-# --no-install-project：只装依赖、不装本项目包（运行靠源码目录 + PYTHONPATH=/app）。
-# 依赖裁剪（见文件末尾「裁剪边界」）：本服务只用 fastmcp + starlette + pydantic-settings，
+# --no-install-project：只装依赖、不装本项目包（运行靠源码目录，见 CMD）。
+# 依赖裁剪（见文件末尾「裁剪边界」）：本服务需要 fastmcp + starlette + pydantic(+settings)
+# + httpx（调远端 A2A）+ langchain-mcp-adapters（client_config 的 StdioConnection，实测必需）；
 # 其余重依赖（numpy / sqlalchemy / psycopg / langchain 全家 / openai）一概不装。
-# 实测 .venv 240 MB → 104 MB、镜像 490 → 312 MB，且 calculate / current_datetime 实调通过。
+# 实测 .venv 240 MB → 104 MB，且 /health 与工具错误契约均正常。
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
@@ -43,7 +52,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package regex \
         --no-install-package sentry-sdk \
         --no-install-package openai \
-        --no-install-package zstandard
+        --no-install-package zstandard \
+        --no-install-package fastapi-cli \
+        --no-install-package fastapi-cloud-cli
 
 # ---------- 运行期：干净基底 + 只搬 .venv 与源码 ----------
 FROM python:3.12-slim AS runtime
@@ -55,19 +66,20 @@ WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
 
-# 只复制 tools_mcp 及其包结构（services/__init__.py 提供 services 命名空间包）
+# 只复制本服务及其包结构（services/__init__.py 提供 services 命名空间包）
 COPY services/__init__.py ./services/__init__.py
-COPY services/tools_mcp ./services/tools_mcp
+COPY services/a2a_mcp ./services/a2a_mcp
 
 # streamable-http 默认端口；host/port/path 由 compose 的 MCP_* 环境变量覆盖
-EXPOSE 8100
+EXPOSE 8102
 
-CMD [".venv/bin/python", "-m", "services.tools_mcp"]
+CMD [".venv/bin/python", "-m", "services.a2a_mcp"]
 
 # —— 裁剪边界（改动本服务代码后请复核）——
-# 本镜像只运行 services/tools_mcp（server / datetime_tool / calculator_tool / config /
-# client_config / __main__），其第三方 import 仅有：fastmcp、starlette、pydantic、
-# pydantic-settings、langchain-mcp-adapters（client_config 的 StdioConnection）。
-# 若将来给本服务加了新依赖（例如直接读库 / 调 LLM），必须同步从上表去掉对应排除项，
-# 否则运行期才会 ModuleNotFoundError（构建期不报错 —— 这是本裁剪方式的已知代价）。
-# 复核方式：docker run --rm <img> /app/.venv/bin/python -c "import services.tools_mcp.server"
+# 本镜像只运行 services/a2a_mcp/*，第三方 import 面为：fastmcp / starlette / httpx /
+# pydantic + pydantic-settings，以及 **langchain-mcp-adapters**
+# （client_config.py 的 `from langchain_mcp_adapters.sessions import StdioConnection`，
+#  实测裁掉即 ModuleNotFoundError，故不可进入排除清单）。
+# 若将来给本服务加了新依赖，必须同步去掉对应排除项；
+# 否则运行期才会 ModuleNotFoundError（构建期不报错 —— 本裁剪方式的已知代价）。
+# 复核方式：docker run --rm <img> /app/.venv/bin/python -c "import services.a2a_mcp.server"
