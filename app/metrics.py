@@ -41,6 +41,9 @@ SOURCE_HTTP: Final = "http"
 # 工具/请求的成功标记。
 STATUS_OK: Final = "ok"
 
+# 终态缺失时的归一桶名（见 `_on_answer_generated`：复用路径的事件可能不带终态）。
+UNSPECIFIED: Final = "unspecified"
+
 # 耗时样本窗口容量：长期运行进程不得无限增长。窗口外的样本仍计入 count/sum（累计精确），
 # 只有百分位是按最近 `_WINDOW` 条计算的 —— 对「最近表现」而言这恰恰是想要的口径。
 _WINDOW: Final = 2048
@@ -175,8 +178,12 @@ class MetricsRegistry:
 
     def _on_answer_generated(self, event: LogEvent) -> None:
         # `answer.generated` 的 status 即 finished_reason（见 log_answer_generated）。
+        # 空串归一到 `unspecified`：`generate_answer` 的**复用路径**（call_model 已直接产出
+        # 文本 → 早返回）不重算终态，事件里 `finished_reason` 可能为空。不归一的话，分布里会
+        # 出现一个名为 "" 的桶 —— 看板上读不出它是什么，而它其实是「终态由上游决定」
+        # （响应侧此时为 completed）。C4 侧的补全留作后续；这里先保证指标可读。
         reason = str(event.fields.get("finished_reason") or event.status or "")
-        self.finished_reasons[reason] += 1
+        self.finished_reasons[reason or UNSPECIFIED] += 1
 
     def _on_memory_saved(self, event: LogEvent) -> None:
         self.memory_by_action[str(event.fields.get("action") or event.status or "")] += 1
@@ -247,6 +254,7 @@ __all__ = [
     "SOURCE_AGENT",
     "SOURCE_HTTP",
     "STATUS_OK",
+    "UNSPECIFIED",
     "DurationWindow",
     "MetricsRegistry",
 ]

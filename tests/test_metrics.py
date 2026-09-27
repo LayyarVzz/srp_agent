@@ -142,6 +142,19 @@ def test_unknown_event_is_ignored() -> None:
     assert registry.snapshot()["requests"] == 0
 
 
+def test_answer_without_finished_reason_buckets_as_unspecified() -> None:
+    """事件缺终态时归一为 `unspecified`（不留下读不懂的空串桶）。
+
+    WHY：`generate_answer` 的复用路径早返回、不重算终态，事件里 `finished_reason` 可能为空。
+    指标若原样落成 "" 桶，看板会多出一个无名分类，排查时容易误判成「解析坏了」。
+    """
+    from app.metrics import UNSPECIFIED
+
+    registry = MetricsRegistry()
+    registry.observe(LogEvent(event=EVENT_ANSWER_GENERATED, status="", fields={}))
+    assert registry.snapshot()["finished_reasons"] == {UNSPECIFIED: 1}
+
+
 def test_observe_never_raises_on_broken_payload() -> None:
     """折叠过程出错**不得外抛**（可观测性不得反噬主链路），且不影响后续事件折叠。"""
     registry = MetricsRegistry()
