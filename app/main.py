@@ -11,6 +11,9 @@ Windows 注意：`ensure_selector_event_loop()` 必须在任何事件循环创�
 （不阻塞请求）；`/api/v1/logs/recent` 与 sink 共享同一仓库实例，故接口读到的事件与
 stdout 日志是同一份事实。
 
+指标（Phase D）：`MetricsRegistry` 订阅**同一条事件总线**、在内存里折叠成计数与分布
+（`/metrics`）—— 与事件字段同名同源，不引入第二套口径。
+
 根 `main.py` 仅 re-export 本模块的 `app`（保持 `uvicorn main:app` 兼容）。
 """
 
@@ -28,12 +31,19 @@ from agent.runtime import AgentRuntime
 from agent.share.eventloop import ensure_selector_event_loop
 from app.a2a import routes as a2a
 from app.errors import register_exception_handlers
+from app.metrics import MetricsRegistry
 from app.request_context import REQUEST_ID_HEADER_OUT, RequestContextMiddleware
-from app.routes import chat, health, logs, sessions
+from app.routes import chat, health, logs, metrics, sessions
 from settings import get_settings
 from shared.events_sink import EventStoreSink, build_event_sink
 from shared.events_store import EventRepository
-from shared.logging import LoggingConfig, ServiceName, configure_logging, subscribe_events
+from shared.logging import (
+    LoggingConfig,
+    ServiceName,
+    configure_logging,
+    subscribe_events,
+    unsubscribe_events,
+)
 
 # Windows：psycopg 异步需 SelectorEventLoop，须在 uvicorn 建 loop 之前设置（模块导入期）。
 ensure_selector_event_loop()
@@ -67,12 +77,15 @@ def create_app(
         sink, repository = build_event_sink(settings.database_url)
     app_state_event_repository = repository
     app_state_event_sink = sink
+    # 指标注册表（进程级）：与事件 sink 吃同一条事件总线（口径同源，见 app/metrics.py）。
+    app_state_metrics = MetricsRegistry(service=ServiceName.API)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # 建表（幂等）+ 启动带外写线程 + 订阅事件：装配期完成，避免首个请求时踩空表。
         await app_state_event_repository.setup()
         subscribe_events(app_state_event_sink.send)
+        subscribe_events(app_state_metrics.observe)
         app_state_event_sink.start()
         app.state.runtime = runtime or await AgentRuntime.create()
         try:
@@ -84,6 +97,9 @@ def create_app(
             await wait_pending_saves()
             await app.state.runtime.aclose()
             await app_state_event_sink.aclose()
+            # 注销订阅：监听器注册表是**进程级全局**的，残留会让下一个 app（测试/重启）
+            # 继续把事件写进已关停的注册表（与 sink 同一口径）。
+            unsubscribe_events(app_state_metrics.observe)
 
     # 日志单点配置：service=api（事件按进程归属），格式/级别来自 LOG_* 环境项。
     configure_logging(LoggingConfig.from_settings(settings, service=ServiceName.API))
@@ -96,6 +112,7 @@ def create_app(
     # 事件仓库挂在 state 上（路由依赖读它；测试直接覆盖该属性即可换库）。
     app.state.event_repository = app_state_event_repository
     app.state.event_sink = app_state_event_sink
+    app.state.metrics = app_state_metrics
     # 中间件决策：CORS 必须、TrustedHost 推荐；
     # GZip 不用（SSE 流式不该压缩，会缓冲破坏实时性）。
     app.add_middleware(
@@ -115,6 +132,8 @@ def create_app(
     app.include_router(sessions.router, prefix="/api/v1")
     app.include_router(chat.router, prefix="/api/v1")
     app.include_router(logs.router, prefix="/api/v1")
+    # 指标走根路径（运维/答辩视图，与 /healthz 同族；见 app/routes/metrics.py）。
+    app.include_router(metrics.router)
     # A2A 端点挂根路径（/.well-known/agent.json 与 /a2a，协议约定的绝对路径）。
     app.include_router(a2a.router)
     if runtime is not None:
