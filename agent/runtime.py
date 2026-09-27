@@ -244,9 +244,15 @@ class AgentRuntime:
 
         WHY 顺序：带外保存任务写 memory store、读 LLMService，必须先
         `wait_pending_saves()` 排干再关后端，否则保存静默失败（langgraph#6367 同因）；
-        观测 flush 紧随其后 —— 带外保存是**在图运行之外**发生的最后一个可能产出 span 的
-        动作，flush 插在它之前会把最后一批 span 留在缓冲区（进程退出即丢）。
-        其余按装配逆序（tools → session → memory）关闭，句柄置 None 保证幂等。
+        观测 flush 紧随其后（代价为零，且覆盖「带外保存期间仍在缓冲的最后一批**图内**
+        span」）。其余按装配逆序（tools → session → memory）关闭，句柄置 None 保证幂等。
+
+        **实测修正（Phase D）**：plan §5.2 曾把 flush 排在此处的理由写成「否则带外保存
+        的 LLM span 会丢在缓冲区」—— 该理由已被实测证伪：带外抽取走
+        `persist.submit_memory_save` 的 `asyncio.create_task`，其 context 是 `chat_stream`
+        **调用方**的（不是图运行时的），故 langchain 回调上下文不继承
+        → 带外抽取调用既不产生观测 span、也不计入 C4 的 token 累计。
+        顺序保持不变（无副作用；若将来把回调显式传进带外路径，此处即为正确位置）。
         """
         await wait_pending_saves()
         if self.observability is not None:
