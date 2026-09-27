@@ -16,9 +16,11 @@ import json
 from typing import Any
 
 import pytest
-from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.callbacks import AsyncCallbackHandler, BaseCallbackHandler
+from langchain_core.callbacks.usage import UsageMetadataCallbackHandler
 from pydantic import SecretStr, ValidationError
 
+from agent.intent.models import Intent
 from settings import RuntimeSettings
 from shared.logging import MASKED
 from shared.observability import (
@@ -32,6 +34,7 @@ from shared.observability import (
     mask_payload,
     reset_observability,
 )
+from tests.conftest import chat_turn_messages, make_fake_tool, tool_call_messages
 
 # —— 测试替身（**禁止真连云端**：CI 无凭据、无外网）——
 
@@ -406,3 +409,182 @@ def test_install_singleton_and_rebuild_after_close(
 def test_install_disabled_returns_none(clean_langfuse_env: None) -> None:
     """未配置 → 单例为 `None`（调用方据此不给图挂任何观测键）。"""
     assert install_observability(RuntimeSettings(_env_file=None)) is None
+
+
+# —— 注入点（agent/runtime.py）：图 config 挂回调 + 归因，一处注入覆盖全图 ——
+
+
+class RecordingHandler(AsyncCallbackHandler):
+    """记录回调事件的假 handler（**真实 langchain 回调协议**，不连云端）。
+
+    WHY 用真 AsyncCallbackHandler 而非打桩：这一节要验的正是「回调是否真的随 graph
+    config 传播到节点内的 LLM / ToolNode」（plan §7.5 不确定项 5 —— `agent/llm.py`
+    不传 config，全靠 langchain 的回调上下文继承）。打桩就验不到传播。
+    """
+
+    def __init__(self) -> None:
+        self.llm_starts = 0
+        self.chain_runs: list[str] = []
+        self.tool_runs: list[str] = []
+        self.tool_ends: list[Any] = []
+
+    async def on_llm_start(self, serialized: Any, prompts: Any, **kwargs: Any) -> None:
+        self.llm_starts += 1
+
+    async def on_chat_model_start(self, serialized: Any, messages: Any, **kwargs: Any) -> None:
+        self.llm_starts += 1
+
+    async def on_chain_start(self, serialized: Any, inputs: Any, **kwargs: Any) -> None:
+        name = (serialized or {}).get("name") or kwargs.get("name") or ""
+        self.chain_runs.append(str(name))
+
+    async def on_tool_start(self, serialized: Any, input_str: Any, **kwargs: Any) -> None:
+        self.tool_runs.append(str((serialized or {}).get("name") or ""))
+
+    async def on_tool_end(self, output: Any, **kwargs: Any) -> None:
+        self.tool_ends.append(output)
+
+
+class _CapturingGraph:
+    """包一层真图，捕获 `chat_stream` 实际交给 `astream` 的 config。"""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.configs: list[dict[str, Any]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def astream(self, *args: Any, **kwargs: Any) -> Any:
+        self.configs.append(dict(kwargs.get("config") or {}))
+        async for item in self._inner.astream(*args, **kwargs):
+            yield item
+
+
+@pytest.fixture
+def runtime_factory(build_graph: Any) -> Any:
+    """构造注入 fake LLM 的 AgentRuntime（可挂观测句柄；会话用 SQLite memory 后端）。"""
+
+    async def _make(
+        messages: list[Any],
+        *,
+        tools: list[Any] | None = None,
+        observability: Any = None,
+    ) -> Any:
+        from langgraph.store.memory import InMemoryStore
+
+        from agent.core.config import AgentFrameworkConfig
+        from agent.memory import MemoryStore
+        from agent.runtime import AgentRuntime
+        from agent.session import build_session_backend
+
+        backend = await build_session_backend(None)
+        return AgentRuntime(
+            graph=_CapturingGraph(build_graph(messages, tools=tools)),
+            sessions=backend.manager,
+            memory_store=MemoryStore(InMemoryStore()),
+            cfg=AgentFrameworkConfig.get_default(),
+            _session_backend=backend,
+            observability=observability,
+        )
+
+    return _make
+
+
+async def test_disabled_keeps_graph_config_byte_identical(runtime_factory: Any) -> None:
+    """**零回归判据**：未配置观测 → 图 config 只有 C4 的 `[usage]`，且没有 metadata 键。
+
+    注：plan §5.2 原话是「未配置 → 图 config 不含 callbacks 键」——该措辞在 C4 落地后
+    已不成立（token 累计 handler 一直占着这个键）。可验证的等价口径是：观测对 config
+    **零贡献**（callbacks 逐字等于 C4 时期、不新增 metadata 键）。
+    """
+    runtime = await runtime_factory(chat_turn_messages(Intent.CHAT, "你好"), observability=None)
+    try:
+        async for _ in runtime.chat_stream(user_id="u1", session_id="s1", text="你好"):
+            pass
+        config = runtime.graph.configs[0]
+        assert "metadata" not in config
+        callbacks = config["callbacks"]
+        assert len(callbacks) == 1
+        assert isinstance(callbacks[0], UsageMetadataCallbackHandler)
+    finally:
+        await runtime.aclose()
+
+
+async def test_enabled_attaches_callbacks_and_attribution(runtime_factory: Any) -> None:
+    """配置观测 → 图 config 同时带 token handler + 观测 handler + 归因 metadata。"""
+    obs = Observability(
+        ObservabilityConfig(enabled=True, environment="dev"),
+        client=FakeClient(),
+        handler_factory=lambda _config: RecordingHandler(),
+    )
+    runtime = await runtime_factory(chat_turn_messages(Intent.CHAT, "你好"), observability=obs)
+    try:
+        async for _ in runtime.chat_stream(user_id="u1", session_id="s1", text="你好"):
+            pass
+        config = runtime.graph.configs[0]
+        assert len(config["callbacks"]) == 2
+        assert isinstance(config["callbacks"][0], UsageMetadataCallbackHandler)
+        assert isinstance(config["callbacks"][1], RecordingHandler)
+        metadata = config["metadata"]
+        assert metadata["langfuse_session_id"] == "s1"
+        assert metadata["langfuse_user_id"] == "u1"
+        assert metadata["langfuse_trace_name"] == TRACE_NAME
+    finally:
+        await runtime.aclose()
+
+
+async def test_callbacks_reach_node_level_llm_and_tools(runtime_factory: Any) -> None:
+    """**实测 §7.5-5**：handler 挂在 graph config 上，是否真能收到节点内 LLM / 工具回调。
+
+    `agent/llm.py` 与图节点都不传 config（全靠 langchain 的回调上下文继承）—— 这条不实测
+    就只能假设；一旦不继承，trace 会退化成「只有一条根 span」，且没有任何报错。
+    """
+    handler = RecordingHandler()
+    obs = Observability(
+        ObservabilityConfig(enabled=True),
+        client=FakeClient(),
+        handler_factory=lambda _config: handler,
+    )
+    messages = tool_call_messages([[{"name": "clock", "args": {}, "id": "call_1"}]], "现在十点")
+    runtime = await runtime_factory(
+        messages, tools=[make_fake_tool("clock", content="10:00")], observability=obs
+    )
+    try:
+        async for _ in runtime.chat_stream(user_id="u1", session_id="s1", text="现在几点"):
+            pass
+    finally:
+        await runtime.aclose()
+
+    assert handler.llm_starts > 0, "节点内 LLM 调用未收到回调（trace 会退化成单 span）"
+    assert handler.tool_runs == ["clock"], f"ToolNode 工具调用未收到回调：{handler.tool_runs}"
+    # on_tool_end 收到的是 ToolMessage 对象（Langfuse handler 正是据此把
+    # `status == "error"` 的工具结果自动置 span level=ERROR）——故这里按 content 断言。
+    assert [getattr(item, "content", item) for item in handler.tool_ends] == ["10:00"]
+    assert any(handler.chain_runs), "未收到任何 chain 回调（节点名无从归因）"
+
+
+async def test_aclose_flushes_after_pending_saves(runtime_factory: Any, monkeypatch: Any) -> None:
+    """关闭顺序：排干带外保存 → **flush 观测** → 其余后端（顺序反了会丢最后一批 span）。"""
+    order: list[str] = []
+
+    class _Client(FakeClient):
+        def flush(self) -> None:
+            order.append("observability.flush")
+            super().flush()
+
+    class _Backend:
+        async def aclose(self) -> None:
+            order.append("session")
+
+    async def _fake_wait_pending_saves() -> None:
+        order.append("pending_saves")
+
+    import agent.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "wait_pending_saves", _fake_wait_pending_saves)
+    obs = Observability(ObservabilityConfig(enabled=True), client=_Client())
+    runtime = await runtime_factory(chat_turn_messages(Intent.CHAT, "你好"), observability=obs)
+    runtime._session_backend = _Backend()
+    await runtime.aclose()
+    assert order == ["pending_saves", "observability.flush", "session"]

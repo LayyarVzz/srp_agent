@@ -9,6 +9,10 @@ WHY 组合根：Agent 的多个模块（LLM / 记忆 / 会话 / MCP 工具 / 图
 （端到端耗时、LLM token 累计）在这里采集并记 `request.finished`；
 token 经 langchain `UsageMetadataCallbackHandler` 随 graph config 的 callbacks 传播
 （图内各节点的 LLM 调用自动汇入同一实例）。
+
+观测（Phase D）：同一处 config 再挂 Langfuse 回调（**每请求新建 handler**）与归因 metadata，
+一处注入覆盖全图 —— 图节点与 `agent/llm.py` **零改动**。未配置 `LANGFUSE_*` 时句柄为 None，
+config 与 C4 时期**逐字相同**（零回归）。
 """
 
 from __future__ import annotations
@@ -69,7 +73,8 @@ from services.tools_mcp.config import MCPTransport
 from settings import RuntimeSettings, get_settings
 from shared.embeddings import EmbeddingConfig
 from shared.lark import LARK_MCP_SERVER_NAME
-from shared.logging import EVENT_LOGGER_NAME, log_request_finished
+from shared.logging import EVENT_LOGGER_NAME, current_trace_id, log_request_finished
+from shared.observability import Observability, install_observability
 
 logger = logging.getLogger(__name__)
 # 结构化事件专用 logger（与业务日志分开：便于只过滤事件流；口径与 api/MCP 侧一致）。
@@ -130,6 +135,9 @@ class AgentRuntime:
     _tools_cm: AbstractAsyncContextManager[list[BaseTool]] | None = None
     _memory_backends: MemoryBackends | None = None
     _session_backend: SessionBackend | None = None
+    # 观测句柄（Phase D）：进程级单例，未配置 `LANGFUSE_*` 时为 None（图零观测回调）。
+    # 与其余句柄不同，它**不随装配失败回滚**（进程级、不持有 runtime 资源）。
+    observability: Observability | None = None
     # A2A 入站任务注册表（task↔session 一一对应；随进程生命周期，无持久化）。
     a2a_tasks: A2ATaskRegistry = field(default_factory=A2ATaskRegistry)
 
@@ -166,6 +174,14 @@ class AgentRuntime:
             behavior=cfg.llm_behavior,
         )
         llm = LLMService(config=llm_config)
+
+        # 观测装配（Phase D）：进程级单例；**失败不得阻断装配** —— 观测是外挂能力，
+        # 装不上就按「未配置」继续（与「未配置即降级」同一口径：Langfuse 挂了 Agent 照常回答）。
+        try:
+            observability = install_observability(settings)
+        except Exception as exc:
+            logger.warning("观测装配失败，本轮按未配置继续（零回调）：%s", exc)
+            observability = None
 
         database_url = settings.database_url.get_secret_value() if settings.database_url else None
         # acquired 记录已获取资源的关闭函数；失败时逆序执行（先拿到的后关）。
@@ -220,16 +236,21 @@ class AgentRuntime:
             _tools_cm=tools_cm,
             _memory_backends=memory_backends,
             _session_backend=session_backend,
+            observability=observability,
         )
 
     async def aclose(self) -> None:
-        """按逆序关闭生命周期资源：先排干带外保存，再关 MCP 工具、会话、记忆后端。
+        """按逆序关闭生命周期资源：先排干带外保存，再 flush 观测，最后关其余后端。
 
         WHY 顺序：带外保存任务写 memory store、读 LLMService，必须先
         `wait_pending_saves()` 排干再关后端，否则保存静默失败（langgraph#6367 同因）；
+        观测 flush 紧随其后 —— 带外保存是**在图运行之外**发生的最后一个可能产出 span 的
+        动作，flush 插在它之前会把最后一批 span 留在缓冲区（进程退出即丢）。
         其余按装配逆序（tools → session → memory）关闭，句柄置 None 保证幂等。
         """
         await wait_pending_saves()
+        if self.observability is not None:
+            await self.observability.aclose()
         if self._tools_cm is not None:
             await self._tools_cm.__aexit__(None, None, None)
             self._tools_cm = None
@@ -258,7 +279,22 @@ class AgentRuntime:
         # （意图/查询理解/回答/记忆抽取等）的 usage 自动汇入同一实例；未产生 LLM 调用
         # 时留在 finally 里读到的就是空表（如实反映「这轮没花钱」）。
         usage = UsageMetadataCallbackHandler()
-        config["callbacks"] = [usage]  # type: ignore[dict-item]  # RunnableConfig 允许 callbacks
+        callbacks: list[Any] = [usage]
+        # 观测（Phase D）：同一处 config 追加 Langfuse 回调 + 归因 metadata（一处注入覆盖
+        # 全图：节点内 LLM / ToolNode / 子图经 langchain 回调上下文继承）。
+        # **未配置观测时不写 metadata 键、callbacks 逐字仍是 `[usage]`** —— 零回归判据。
+        if self.observability is not None:
+            observed = self.observability.langchain_callbacks()
+            if observed:
+                callbacks.extend(observed)
+                config["metadata"] = self.observability.trace_metadata(  # type: ignore[assignment]
+                    session_id=session_id,
+                    user_id=user_id,
+                    # 本地 trace_id 作为 span metadata 带上：云端的 trace id 由 SDK 自己生成，
+                    # 不带这个键，「事件表 ↔ 云端 trace」就只能靠 session/时间对齐。
+                    trace_id=current_trace_id(),
+                )
+        config["callbacks"] = callbacks  # type: ignore[dict-item]  # RunnableConfig 允许 callbacks
         started = time.perf_counter()
         status = "completed"
         code: str | None = None
