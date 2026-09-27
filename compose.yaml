@@ -226,6 +226,17 @@ services:
       # 4 个进程共用同一开关：日志格式必须在整套编排里一致，混合形态会让
       # `docker compose logs` 里出现两种行格式（grep 与解析都要写两套）。
       LOG_FORMAT: ${LOG_FORMAT:-text}
+      # —— 观测（Langfuse Cloud；SDK 直连）——
+      # 默认不注入真实凭据（宿主 .env 不配 → 容器内观测关闭、图零观测回调，逐字零回归）。
+      # 只有 api 进程需要观测：MCP 服务容器的工具 span 由 api 侧回调统一产出，故意不注入。
+      # 密钥按容器惯例走宿主 .env → compose 注入，不进镜像（见 .env.example「观测」段）。
+      LANGFUSE_TRACING_ENABLED: ${LANGFUSE_TRACING_ENABLED:-false}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
+      LANGFUSE_TRACING_ENVIRONMENT: ${LANGFUSE_TRACING_ENVIRONMENT:-}
+      LANGFUSE_RELEASE: ${LANGFUSE_RELEASE:-}
+      LANGFUSE_SAMPLE_RATE: ${LANGFUSE_SAMPLE_RATE:-1.0}
     ports:
       - "8000:8000"
     depends_on:

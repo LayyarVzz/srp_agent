@@ -113,20 +113,33 @@ _VALUE_SANITIZE_RE: Final = re.compile(r"[\r\n\t\[\]()|]")
 
 # —— 脱敏规则（有序：先特化后一般；`(?!)` 组回填 key，保留可读性）——
 
-# ① 已知字段名 + 值：JSON（`"k": "v"`）与 key=value（`k=v` / `k: v`）两种书写。
-#    值边界刻意保守（`[^\s"',;)}\]]*`）：宁可少吞几个字符，也不跨键吃掉正文。
-_FIELD_MASK_RE: Final = re.compile(
-    r"(?i)(?P<key>"
+# 敏感字段名（脱敏键口径的**唯一定义**）。
+# WHY 抽成常量：日志 Filter 与**观测 mask**（shared/observability.py，结构化 payload 的
+# 键级掩码）必须判同一批键 —— 两处各写一份，分叉的那一侧就是泄漏点。
+_SENSITIVE_FIELD_NAMES: Final = (
     r"api[_-]?key|authorization|proxy[_-]?authorization|access[_-]?token|"
     r"refresh[_-]?token|user[_-]?access[_-]?token|tenant[_-]?access[_-]?token|"
     r"lark[_-]?token[_-]?key|client[_-]?secret|app[_-]?secret|secret|password|passwd|"
     r"credential|private[_-]?key|session[_-]?key"
-    r")(?P<sep>[\"']?\s*[:=]\s*[\"']?)"
+)
+
+# 整键匹配版（判定「这个 key 是不是敏感键」；`^...$` 锚定，避免把 `secretsauce` 判成敏感）。
+_SENSITIVE_FIELD_NAME_RE: Final = re.compile(rf"(?i)^(?:{_SENSITIVE_FIELD_NAMES})$")
+
+# ① 已知字段名 + 值：JSON（`"k": "v"`）与 key=value（`k=v` / `k: v`）两种书写。
+#    值边界刻意保守（`[^\s"',;)}\]]*`）：宁可少吞几个字符，也不跨键吃掉正文。
+_FIELD_MASK_RE: Final = re.compile(
+    r"(?i)(?P<key>" + _SENSITIVE_FIELD_NAMES + r")(?P<sep>[\"']?\s*[:=]\s*[\"']?)"
     # 认证方案前缀（`Bearer ` / `Basic `）随值一起吞掉：否则空格会把值截成
     # 「Bearer」，真正的 token 反而留在日志里（最危险的半脱敏）。
     r"(?P<scheme>(?:bearer|basic)\s+)?"
     r"(?P<value>[^\s\"',;)}\]]*)"
 )
+
+
+def is_sensitive_field(name: object) -> bool:
+    """字段名是否属敏感键（**唯一判定点**：日志脱敏与观测 mask 共用同一份键口径）。"""
+    return bool(_SENSITIVE_FIELD_NAME_RE.match(str(name)))
 
 
 def _mask_field_match(match: re.Match[str]) -> str:
@@ -1021,6 +1034,7 @@ __all__ = [
     "current_session_id",
     "current_trace_id",
     "current_user_id",
+    "is_sensitive_field",
     "log_answer_generated",
     "log_event",
     "log_intent_classified",
