@@ -23,6 +23,7 @@ from agent.response.status import StatusEvent
 from agent.session.models import SessionContext
 from agent.share.models import Citation
 from agent.tools.models import ToolCallRecord
+from shared.events_store import EventRecord
 
 
 class Phase(StrEnum):
@@ -119,3 +120,89 @@ class SessionListResponse(BaseModel):
 
     ok: bool = True
     sessions: list[SessionContext] = Field(default_factory=list)
+
+
+class RecentLogsResponse(BaseModel):
+    """最近交互事件响应（`GET /api/v1/logs/recent`）。
+
+    WHY 直接下发 `EventRecord` 列表而非再包一层：事件字段就是排查时要看的东西，
+    二次包装只会让前端/CLI 多剥一层。`limit` 回显便于对账「请求的上限是否生效」。
+    """
+
+    ok: bool = True
+    limit: int
+    events: list[EventRecord] = Field(default_factory=list)
+
+
+class TraceEventsResponse(BaseModel):
+    """单条 trace 的全链路事件响应（`GET /api/v1/logs/trace/{trace_id}`）。
+
+    升序返回：读一条请求的完整链路时，时间顺序才是「故事」，倒序需要人脑重排。
+    """
+
+    ok: bool = True
+    trace_id: str
+    events: list[EventRecord] = Field(default_factory=list)
+
+
+class LatencyStats(BaseModel):
+    """耗时分布（`count/avg/max` 为**全局精确累计**，百分位取最近采样窗口）。
+
+    WHY 两套口径并存：只留窗口会丢失「历史最慢」（答辩最想看的一条），
+    全量留样本则是内存泄漏；故累计量精确、百分位取窗口（见 app/metrics.py）。
+    """
+
+    count: int
+    avg_ms: float
+    p50_ms: float
+    p95_ms: float
+    max_ms: int
+    window: int  # 百分位取样窗口内的样本数（<= count）
+
+
+class ToolMetrics(BaseModel):
+    """工具调用指标（口径同 `tool.called` 事件字段：status / tool_name / duration_ms）。"""
+
+    total: int
+    by_status: dict[str, int] = Field(default_factory=dict)
+    by_name: dict[str, int] = Field(default_factory=dict)
+    success_rate: float
+    latency: LatencyStats | None = None
+
+
+class MemoryMetrics(BaseModel):
+    """长期记忆写入指标（口径同 `memory.saved` 事件字段：action / kind）。"""
+
+    saved: int
+    by_action: dict[str, int] = Field(default_factory=dict)
+
+
+class MetricsResponse(BaseModel):
+    """进程内轻量指标响应（`GET /metrics`）。
+
+    WHY 进程内而非 Prometheus：单实例演示规模下时序库属过度工程（plan §5.4）。
+    代价必须**显著标注**：多副本时 `pid` 与 `service` 说明「这只是本进程的数」。
+    """
+
+    ok: bool = True
+    service: str
+    pid: int
+    started_at: datetime
+    uptime_s: float
+    requests: int
+    requests_by_source: dict[str, int] = Field(default_factory=dict)
+    responses: int
+    responses_by_source: dict[str, int] = Field(default_factory=dict)
+    responses_by_status: dict[str, int] = Field(default_factory=dict)
+    errors: int
+    error_rate: float
+    finished_reasons: dict[str, int] = Field(default_factory=dict)
+    # 交互往返（source=agent，即「一轮对话」）与 HTTP 往返分列：混在一起会把
+    # SSE 下发开销算进 Agent 延迟（C 阶段实施中确认的双事件口径）。
+    latency: LatencyStats | None = None
+    http_latency: LatencyStats | None = None
+    interactions: int
+    tools: ToolMetrics
+    intents: dict[str, int] = Field(default_factory=dict)
+    tokens: dict[str, int] = Field(default_factory=dict)
+    memory: MemoryMetrics

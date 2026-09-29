@@ -7,11 +7,12 @@
 
 from __future__ import annotations
 
-import logging
 from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from shared.logging import LoggingConfig, ServiceName
 
 
 class MCPTransport(StrEnum):
@@ -45,6 +46,9 @@ class MCPRuntimeSettings(BaseSettings):
     mcp_streamable_http_path: str = "/mcp"  # 与 fastmcp 默认一致，客户端连接地址即该路径
     mcp_stateless_http: bool = True  # 工具纯函数无会话 → 默认无状态，支持水平扩展
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # 日志形态与 api 同一开关（env LOG_FORMAT）：容器里 4 个进程必须能切到同一形态，
+    # 否则采集端要为每种格式各写一条解析规则。
+    log_format: Literal["text", "json"] = "text"
 
 
 def build_run_params(settings: MCPRuntimeSettings) -> dict[str, Any]:
@@ -65,9 +69,10 @@ def build_run_params(settings: MCPRuntimeSettings) -> dict[str, Any]:
     return params
 
 
-def configure_logging(settings: MCPRuntimeSettings) -> None:
-    """集中配置 tools_mcp 的 root logger 级别（入口层调用一次）。"""
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+def build_logging_config(settings: MCPRuntimeSettings) -> LoggingConfig:
+    """把本服务运行环境投影为日志底座配置（入口层调 `shared.logging.configure_logging`）。
+
+    WHY 不再由本模块自己 `logging.basicConfig`：格式/脱敏/关联标识必须与 api 一致，
+    否则 MCP 侧日志没有 `trace_id`，api→agent→MCP 的全链路就在最后一跳断掉。
+    """
+    return LoggingConfig.from_settings(settings, service=ServiceName.TOOLS_MCP)

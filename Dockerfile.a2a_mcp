@@ -69,7 +69,7 @@ COPY --from=builder /app/.venv /app/.venv
 # 只复制本服务及其包结构（services/__init__.py 提供 services 命名空间包）
 COPY services/__init__.py ./services/__init__.py
 COPY services/a2a_mcp ./services/a2a_mcp
-
+COPY shared ./shared
 # streamable-http 默认端口；host/port/path 由 compose 的 MCP_* 环境变量覆盖
 EXPOSE 8102
 

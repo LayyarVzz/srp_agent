@@ -13,12 +13,14 @@ from __future__ import annotations
 
 from services.a2a_mcp.config import (
     A2AMCPRuntimeSettings,
+    build_logging_config,
     build_run_params,
-    configure_logging,
 )
 from services.a2a_mcp.server import mcp
+from shared.logging import configure_logging
 
 if __name__ == "__main__":
     settings = A2AMCPRuntimeSettings()
-    configure_logging(settings)
+    # 日志形态与 api 统一（同一 formatter / 脱敏 / 关联标识口径）；容器内走 stdout。
+    configure_logging(build_logging_config(settings))
     mcp.run(**build_run_params(settings))

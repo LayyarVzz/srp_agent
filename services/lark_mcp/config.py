@@ -12,12 +12,13 @@ lark-cli 凭据说明：token 存于 CLI 自身的 OS 钥匙串（Windows 凭据
 
 from __future__ import annotations
 
-import logging
 from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from shared.logging import LoggingConfig, ServiceName
 
 
 class MCPTransport(StrEnum):
@@ -52,6 +53,8 @@ class LarkMCPRuntimeSettings(BaseSettings):
     mcp_streamable_http_path: str = "/mcp"  # 与 fastmcp 默认一致，客户端连接地址即该路径
     mcp_stateless_http: bool = True  # 工具无会话状态 → 默认无状态，支持水平扩展
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # 日志形态与 api 同一开关（env LOG_FORMAT）：容器里 4 个进程必须能切到同一形态。
+    log_format: Literal["text", "json"] = "text"
 
     # —— lark-cli 子进程参数 ——
     lark_cli_command: str | None = None  # LARK_CLI_COMMAND 显式覆盖；空则按 PATH 探测
@@ -117,9 +120,10 @@ def build_run_params(settings: LarkMCPRuntimeSettings) -> dict[str, Any]:
     return params
 
 
-def configure_logging(settings: LarkMCPRuntimeSettings) -> None:
-    """集中配置 lark_mcp 的 root logger 级别（入口层调用一次）。"""
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+def build_logging_config(settings: LarkMCPRuntimeSettings) -> LoggingConfig:
+    """把本服务运行环境投影为日志底座配置（入口层调 `shared.logging.configure_logging`）。
+
+    与 api / 其余 MCP 服务共用同一 formatter、脱敏规则与关联标识口径；MCP 侧不再
+    自行 `basicConfig`（否则 MCP 日志缺 `trace_id`，全链路观测断在最后一跳）。
+    """
+    return LoggingConfig.from_settings(settings, service=ServiceName.LARK_MCP)

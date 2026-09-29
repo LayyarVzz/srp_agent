@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Coroutine, Iterable, Sequence
 from typing import Any
@@ -92,8 +93,18 @@ from agent.tools.models import (
     ToolResult,
 )
 from shared.lark.errors import LARK_UNBOUND_GUIDE, extract_binding_link
+from shared.logging import (
+    EVENT_LOGGER_NAME,
+    EVENT_TOOL_CALLED,
+    log_answer_generated,
+    log_event,
+    log_intent_classified,
+    summarize_text,
+)
 
 logger = logging.getLogger(__name__)
+# 结构化事件专用 logger：与业务日志分开，便于按 logger 名过滤出全部事件（Phase C/C3）。
+event_logger = logging.getLogger(EVENT_LOGGER_NAME)
 
 # 助理人设（P1 固定；后续可按会话配置化）。
 SYSTEM_PROMPT = (
@@ -171,6 +182,10 @@ _SUBAGENT_SUMMARY_MAX_CHARS = 2000
 
 # 子代理无文本产出时的确定性摘要占位（达到迭代上限等场景，整合阶段可辨识）。
 _SUBAGENT_NO_TEXT_SUMMARY = "（子任务已完成，无文本产出）"
+
+# 工具实参摘要的「原样入日志」阈值：短实参可读（调试价值高），超过则只留 len + sha256
+# （长文本往往是用户原话/检索 query，属禁止落盘的会话明文内容）。
+_ARG_INLINE_MAX_CHARS = 64
 
 # 任务规划提示词模板（plan_task / replan_task 共用同一约束）。
 _PLAN_PROMPT_TEMPLATE = (
@@ -335,6 +350,7 @@ def _records_from_tool_calls(
     *,
     known_tools: set[str],
     max_content_chars: int,
+    duration_ms: int = 0,
 ) -> tuple[list[ToolCallRecord], ToolError | None]:
     """把 AIMessage.tool_calls × ToolMessage 配对成 ToolCallRecord（主图/子代理共用口径）。
 
@@ -342,6 +358,9 @@ def _records_from_tool_calls(
     （服务侧 `tool_error.lark_unbound` 前缀）→ lark_unbound（引导绑定而非降级）；
     参数校验失败（ToolNode 的 ToolInvocationError）→ missing_argument；其余 → execution。
     返回 (记录列表, 首个错误)——首个错误为 None 即全部成功。
+
+    `duration_ms` 为**派发级**耗时（ToolNode 并行跑本批全部 tool_calls，逐条计时需另路
+    拦截）：每条记录带同一值，读轨迹的人能看出「这是并行批的总耗时」而非单条耗时。
     """
     records: list[ToolCallRecord] = []
     first_error: ToolError | None = None
@@ -369,7 +388,9 @@ def _records_from_tool_calls(
                     tool_name=name,
                     arguments=args,
                     status="error",
-                    result=ToolResult(tool_name=name, ok=False, error=terr),
+                    result=ToolResult(
+                        tool_name=name, ok=False, error=terr, duration_ms=duration_ms
+                    ),
                 )
             )
             first_error = first_error or terr
@@ -383,6 +404,7 @@ def _records_from_tool_calls(
                         tool_name=name,
                         ok=True,
                         data={"content": str(tm.content or "") if tm else ""},
+                        duration_ms=duration_ms,
                     ),
                 )
             )
@@ -408,6 +430,53 @@ def _ready_steps(state: AgentState, plan: PlanResult) -> list[int]:
         for i, step in enumerate(plan.steps)
         if i not in done and all(dep in done for dep in step.depends_on)
     ]
+
+
+def _elapsed_ms(started: float) -> int:
+    """耗时（毫秒，整型）：`duration_ms` 的类型契约（ToolResult / 事件 / 指标共用）。"""
+    return int((time.perf_counter() - started) * 1000)
+
+
+def _emit_tool_events(records: Sequence[ToolCallRecord], *, duration_ms: int) -> None:
+    """为一次工具派发的每条调用记 `tool.called`（实参只留摘要，禁止原文）。
+
+    WHY 耗时是**派发级**的（ToolNode 内并行执行全部 tool_calls，逐条计时需另路拦截）：
+    在同一批内按条数均摊只会制造假精度，故每条记录都带同一 `duration_ms` 并另记
+    `batch_size`，读日志的人能一眼看出「这是一批并行调用的总耗时」。
+    """
+    for record in records:
+        log_event(
+            event_logger,
+            EVENT_TOOL_CALLED,
+            level="INFO" if record.status == "ok" else "WARNING",
+            status=record.status,
+            tool_name=record.tool_name,
+            duration_ms=duration_ms,
+            code=record.result.error.code if record.result and record.result.error else None,
+            fields={
+                "batch_size": len(records),
+                "args": _summarize_arguments(record.arguments),
+                "citations": len(record.result.citations) if record.result else 0,
+            },
+        )
+
+
+def _summarize_arguments(args: dict[str, Any]) -> str:
+    """实参摘要：短标量原样、长串只留 `len=.. sha256=..`（可对齐、不可还原）。
+
+    WHY 不整体哈希：`{"expression": "1+1"}` 这类短实参是可读的调试信息，全哈希等于
+    把日志变成密文；而长文本（用户原话、检索 query）必须走摘要，避免原文落盘。
+    """
+    parts: list[str] = []
+    for key in sorted(args):
+        value = args[key]
+        if isinstance(value, (bool, int, float)) or value is None:
+            parts.append(f"{key}={value}")
+        elif isinstance(value, str) and len(value) <= _ARG_INLINE_MAX_CHARS:
+            parts.append(f"{key}={value}")
+        else:
+            parts.append(f"{key}[{summarize_text(value)}]")
+    return ", ".join(parts)
 
 
 def _render_tool_summary(records: Sequence[ToolCallRecord]) -> str:
@@ -936,6 +1005,13 @@ def build_agent_graph(
         updates["intent"] = result.intent
         updates["intent_meta"] = result
         logger.info("置信度：%s", result.confidence)
+        # 结构化事件（C3）：意图是后续所有分支的依据，事件里带判定理由摘要便于复盘误判。
+        log_intent_classified(
+            event_logger,
+            intent=str(result.intent),
+            confidence=result.confidence,
+            reason=summarize_text(result.reason),
+        )
         return updates
 
     # —— 长期记忆召回（P4-3 语义召回；v6.0 T2 起统一承载 preference 预加载 + fact/episode）——
@@ -1147,6 +1223,7 @@ def build_agent_graph(
         # WHY 随输入带 user_id：ToolNode 对普通 dict 输入原样透传（`_extract_state` 对
         # dict 直接 return input），故额外键会存进 `ToolRuntime.state` —— 飞书工具作用域
         # 拦截器（LarkScopeInterceptor）据此把「谁在调用」注入 MCP 实参（v5.1 §5）。
+        tool_started = time.perf_counter()
         result = await tool_node.ainvoke(
             {
                 "messages": messages,
@@ -1159,13 +1236,18 @@ def build_agent_graph(
         )
         new_messages = result["messages"]
         tool_msgs = {tm.tool_call_id: tm for tm in new_messages}
+        # 工具耗时（C4）：ToolNode 同时执行本批全部 tool_calls，故这是**批量**耗时；
+        # 逐条均摊只会制造假精度，事件与轨迹另带同一值 + batch_size 指明口径。
+        elapsed = _elapsed_ms(tool_started)
         records, first_error = _records_from_tool_calls(
             calls,
             tool_msgs,
             known_tools={t.name for t in tools},
             max_content_chars=cfg.tools.mcp_max_content_chars,
+            duration_ms=elapsed,
         )
         all_ok = first_error is None
+        _emit_tool_events(records, duration_ms=elapsed)
         updates["messages"] = new_messages
         updates["tool_calls"] = records
         updates["tool_result"] = ToolResult(
@@ -1385,6 +1467,10 @@ def build_agent_graph(
         子图自有 messages 轨迹；本节点把子图终态转成 `SubagentResult`（含工具记录，
         经 tool_calls reducer 透出为并行 tool 事件）后合并回主图。
 
+        耗时口径（C4）：子图内的工具调用与主图不同源（`ToolNode` 在子图内独立运行，
+        主图无法逐批拦到），故这里取**整个子图调用**的耗时并写入工具记录 —— 与主图
+        「派发级耗时」同为「这一批工具实际花了多久」的量级口径，不是单条工具的精确值。
+
         v5.1：子图输入同样携带 `user_id`（子代理也要带用户身份调飞书工具 —— 否则
         并行分支的工具调用会落到「未知作用域」而被判未绑定）。
         """
@@ -1392,7 +1478,9 @@ def build_agent_graph(
             "messages": [SystemMessage(content=_subagent_prompt(payload))],
             "user_id": payload.get("user_id"),
         }
+        sub_started = time.perf_counter()
         sub_out = await subgraph.ainvoke(sub_input, config=config)
+        sub_elapsed = _elapsed_ms(sub_started)
         messages = sub_out.get("messages") or []
         calls = [
             call for m in messages if isinstance(m, AIMessage) for call in (m.tool_calls or [])
@@ -1403,6 +1491,7 @@ def build_agent_graph(
             tool_msgs,
             known_tools={t.name for t in tools},
             max_content_chars=cfg.tools.mcp_max_content_chars,
+            duration_ms=sub_elapsed,
         )
         llm_error = sub_out.get("error")
         failed = bool(llm_error) or first_error is not None
@@ -1575,6 +1664,7 @@ def build_agent_graph(
         # 兜底优先用 LLM 自身知识作答（§3.2「道歉/知识回答/澄清提问」），
         # 系统统一追加免责声明；LLM 失败/空回复时回落到确定性话术，不比现状更差。
         updates = set_status(Status.SPEAKING, message="正在生成兜底回答")
+        started = time.perf_counter()
         messages = state.get("messages") or []
         # 回答节点 live 事件：speaking 先于 token 实时外发（writer 未启用 custom
         # 通道时是 no-op，零回归）；updates 中的同值状态帧由 runtime 去重，
@@ -1603,15 +1693,36 @@ def build_agent_graph(
         updates["final_answer"] = reply
         updates["finished_reason"] = FINISHED_REASON_FALLBACK
         updates["messages"] = [AIMessage(content=reply, id=_new_message_id("a"))]
+        # 降级回答也记事件（phase=fallback）：这是「答不上来」的轮次，事件表里缺了它
+        # 就没法统计降级率 —— 降级恰恰是最需要被看见的路径。
+        log_answer_generated(
+            event_logger,
+            answer=reply,
+            finished_reason=FINISHED_REASON_FALLBACK,
+            duration_ms=_elapsed_ms(started),
+            phase="fallback",
+            degraded=True,
+        )
         return updates
 
     async def generate_answer(state: AgentState, *, writer: StreamWriter) -> dict[str, Any]:
         updates = set_status(Status.SPEAKING, message="正在生成回答")
+        started = time.perf_counter()
         # 双模式：call_model 已直接产出文本（模型直接回答路径）→ 复用，不二次调用 LLM；
         # 否则（chat 直接路径 / tool_limit 收尾路径 / plan 整合路径）→ 调用 LLM 生成最终回答。
         final = (state.get("final_answer") or "").strip()
         if final:
             updates["final_answer"] = final
+            # 复用路径同样记事件：不记会让「模型直接回答」的轮次在事件表里缺答案行，
+            # 按事件统计答率时凭空少一截（口径必须覆盖全部收尾路径）。
+            log_answer_generated(
+                event_logger,
+                answer=final,
+                finished_reason=state.get("finished_reason") or "",
+                duration_ms=_elapsed_ms(started),
+                phase="reused",
+                plan=(state.get("plan") is not None),
+            )
             return updates
         failed = False
         # 统一 prompt 组装：plan 模式注入计划块（整合时展示各步状态），chat 直接路径
@@ -1637,20 +1748,34 @@ def build_agent_graph(
             reply = _FALLBACK_GENERIC_TEXT
             failed = True
         updates["final_answer"] = reply
+        reason: str | None = None
         if failed:
-            updates["finished_reason"] = FINISHED_REASON_ERROR
+            reason = FINISHED_REASON_ERROR
         elif (plan := state.get("plan")) is not None:
             # plan 模式收尾：全部步骤完成 → completed；否则（失败/预算中断）→ partial
             # （部分成功：≥1 步有产出，回答整合已得结果并说明失败步）。
-            if (state.get("plan_step") or 0) >= len(plan.steps):
-                updates["finished_reason"] = FINISHED_REASON_COMPLETED
-            else:
-                updates["finished_reason"] = FINISHED_REASON_PARTIAL
+            reason = (
+                FINISHED_REASON_COMPLETED
+                if (state.get("plan_step") or 0) >= len(plan.steps)
+                else FINISHED_REASON_PARTIAL
+            )
         elif state.get("finished_reason") is None:
-            # tool_limit 已由 dispatch_tool 设置，此处不覆盖。
-            updates["finished_reason"] = FINISHED_REASON_COMPLETED
+            # tool_limit 已由 dispatch_tool 设置，此处不覆盖（故只在缺省时补 completed）。
+            reason = FINISHED_REASON_COMPLETED
+        if reason is not None:
+            updates["finished_reason"] = reason
         # 生成分支追加 AI 消息：空回复路径下历史末条即为固定话术，与最终回复一致
         updates["messages"] = [AIMessage(content=reply, id=_new_message_id("a"))]
+        log_answer_generated(
+            event_logger,
+            answer=reply,
+            # 事件口径 = 本轮最终终态（可能由上游节点设定），而非本节点的增量。
+            finished_reason=reason or state.get("finished_reason") or FINISHED_REASON_COMPLETED,
+            duration_ms=_elapsed_ms(started),
+            phase="generated",
+            degraded=failed,
+            plan=(state.get("plan") is not None),
+        )
         return updates
 
     # —— 护栏与输出 ——

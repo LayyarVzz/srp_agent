@@ -36,5 +36,9 @@ logs/
 # 本地测试临时目录（受限沙箱下 pytest basetemp 的落点）
 .testtmp/
 
+# 评测报告（Phase D：`scripts/eval_run.py` 的产物 —— 每次运行都不同，
+# 属于**运行结果**而非源码；趋势对比靠本地历史文件，不入库）
+eval_reports/
+
 /scripts
 /tests
