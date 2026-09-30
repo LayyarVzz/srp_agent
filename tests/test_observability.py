@@ -300,6 +300,18 @@ def test_trace_metadata_keys() -> None:
     assert "request_trace_id" not in obs.trace_metadata(session_id="s", user_id="u")
 
 
+def test_trace_metadata_name_override_for_out_of_band() -> None:
+    """`name` 覆盖 trace 展示名（O3 带外用 memory.out_of_band_save），其余归因键不变。"""
+    obs = Observability(ObservabilityConfig(enabled=True), client=FakeClient())
+    metadata = obs.trace_metadata(
+        session_id="s-1", user_id="u-1", trace_id="req_abc", name=OUT_OF_BAND_TRACE_NAME
+    )
+    assert metadata["langfuse_trace_name"] == OUT_OF_BAND_TRACE_NAME
+    assert metadata["langfuse_session_id"] == "s-1"
+    assert metadata["langfuse_user_id"] == "u-1"
+    assert metadata["request_trace_id"] == "req_abc"
+
+
 def test_mask_recurses_and_keeps_json_serializable() -> None:
     """掩码递归生效且结果可 JSON 序列化（SDK 对 mask 返回值的硬要求）。"""
     payload = {
