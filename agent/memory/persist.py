@@ -22,10 +22,17 @@ from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 
 from agent.core.config import DedupConfig, MemoryWorthConfig
-from agent.memory.adapter import KNOWN_KINDS, LONG_TERM_NAMESPACE, MemoryStore
+from agent.memory.adapter import (
+    KNOWN_KINDS,
+    KIND_FACT,
+    KIND_PREFERENCE,
+    LONG_TERM_NAMESPACE,
+    MemoryStore,
+)
 from agent.memory.extractor import MemoryExtractor
 from agent.memory.judge import MemoryRelationJudge
 from agent.memory.models import (
+    KEEP_PREFERENCE,
     RELATION_EXACT,
     RELATION_OVERLAP,
     WORTH_COMMONSENSE,
@@ -79,6 +86,26 @@ def should_keep(extraction: MemoryExtraction, *, cfg: MemoryWorthConfig) -> bool
 def _worth_rank(extractions: Sequence[MemoryExtraction]) -> list[MemoryExtraction]:
     """按 `worth_score` 降序排（稳定排序：同分保持模型输出顺序，跨运行可复现）。"""
     return sorted(extractions, key=lambda e: e.worth_score, reverse=True)
+
+
+def _normalize_kind(kind: str, category: str) -> str:
+    """把非规范 kind 按 category 归一（O5-F1：只发生在写入单点）。
+
+    WHY 必须归一：模型易把 `kind` 填成 `category`（两字段语义重叠，如 kind=identity），
+    而召回端只请求 fact/episode/preference 三类（graph.recall_memory），未知 kind 条目
+    会成为「存了但永远召不回」的死数据。映射规则：category=preference → kind=preference；
+    其余保留类别（identity/goal/plan/relation/constraint/explicit）→ kind=fact。
+    规范三类（fact/episode/preference）原样透传。
+
+    WHY 不改 `MemoryExtraction.kind` 本身：宽松 str 是防「模型偶发超纲值导致整批校验
+    失败被丢弃」的降级保险（models.py docstring），归一化只改落库标签、不新增丢弃路径
+    （宁漏不误丢）。
+    """
+    if kind in KNOWN_KINDS:
+        return kind
+    if category == KEEP_PREFERENCE:
+        return KIND_PREFERENCE
+    return KIND_FACT
 
 
 def _select_keepable(
@@ -185,12 +212,19 @@ async def save_conversation_memory(
         "记忆抽取完成：%d 条待判定（session=%s, user=%s）", len(extractions), session_id, user_id
     )
     for e in _select_keepable(extractions, cfg=worth_cfg):
+        kind = _normalize_kind(e.kind, e.category)
         if e.kind not in KNOWN_KINDS:
-            # 模型漂移信号：不丢内容、不 re-label，仅告警；召回端归入 other 组仍可达。
-            logger.warning("抽取到未知记忆类型 kind=%s（召回时归入 other 组）", e.kind)
+            # 模型漂移信号：不丢内容、不 re-label 抽取结果本身，仅在写入单点把 kind
+            # 按 category 归一（原样落库会让召回端永远查不到这条记忆，O5-F1）。
+            logger.warning(
+                "抽取到未知记忆类型 kind=%s（category=%s）→ 已归一为 kind=%s（保证召回可达）",
+                e.kind,
+                e.category,
+                kind,
+            )
         item = MemoryItem(
             id=uuid4().hex,
-            kind=e.kind,
+            kind=kind,
             content=e.content,
             session_id=session_id,
             user_id=user_id,
