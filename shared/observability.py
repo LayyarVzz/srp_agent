@@ -43,6 +43,10 @@ DEFAULT_BASE_URL: Final = "https://cloud.langfuse.com"
 # 云端 trace 展示名（固定值：按入口筛 trace 时不必记调用点的字面量）。
 TRACE_NAME: Final = "agent.chat"
 
+# 带外记忆保存的 trace 名（O3）：与对话 trace `agent.chat` 分开呈现，云端按 trace name
+# 即可区分「对话本体」与「带外抽取/判重」——后者靠归因键与对话 trace 对齐，不混入成本口径。
+OUT_OF_BAND_TRACE_NAME: Final = "memory.out_of_band_save"
+
 # —— langchain metadata → Langfuse 归因键（**SDK 契约名，禁止改写**）——
 # SDK v4 在**根 run** 上读这些键并自行 `propagate_attributes(...)`
 # （`langfuse/langchain/CallbackHandler.py` 的 `_parse_langfuse_trace_attributes`），
@@ -340,17 +344,24 @@ class Observability:
         return [self._handler_factory(self._config)]
 
     def trace_metadata(
-        self, *, session_id: str, user_id: str, trace_id: str | None = None
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        trace_id: str | None = None,
+        name: str = TRACE_NAME,
     ) -> dict[str, object]:
         """归因元数据：会话 / 用户 / trace 名（+ 本地 trace_id 关联键）。
 
         `thread_id == session_id` 契约直接成为 Langfuse 的 `session_id`；`user_id` 与
         记忆 / 飞书同一身份口径 —— 三处身份一致才谈得上「按人回溯」。
+        `name` 为 trace 展示名：对话链路用默认 `agent.chat`；带外保存（O3）传
+        `memory.out_of_band_save`，其余归因键保持与对话 trace 同值以便对齐。
         """
         metadata: dict[str, object] = {
             _META_SESSION: session_id,
             _META_USER: user_id,
-            _META_TRACE_NAME: TRACE_NAME,
+            _META_TRACE_NAME: name,
         }
         if trace_id:
             metadata[_META_REQUEST_TRACE] = trace_id
@@ -427,6 +438,7 @@ def reset_observability() -> None:
 __all__ = [
     "DEFAULT_BASE_URL",
     "FULLY_MASKED",
+    "OUT_OF_BAND_TRACE_NAME",
     "TRACE_NAME",
     "ClientFactory",
     "HandlerFactory",

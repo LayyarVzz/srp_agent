@@ -13,6 +13,11 @@ token 经 langchain `UsageMetadataCallbackHandler` 随 graph config 的 callback
 观测（Phase D）：同一处 config 再挂 Langfuse 回调（**每请求新建 handler**）与归因 metadata，
 一处注入覆盖全图 —— 图节点与 `agent/llm.py` **零改动**。未配置 `LANGFUSE_*` 时句柄为 None，
 config 与 C4 时期**逐字相同**（零回归）。
+
+观测（O3）：带外记忆保存的 LLM 调用（抽取/判重）回调上下文**不继承**（task 上下文来自
+`chat_stream` 调用方而非图运行时），故在 finally 里**显式**构造回调 + 归因 metadata 传入
+`submit_memory_save`（独立 trace `memory.out_of_band_save`，归因键与对话 trace 同值）；
+未配置观测时传 None，行为与接线前逐字相同。平凡输入（寒暄等）轮直接跳过带外抽取。
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from agent.memory import (
     submit_memory_save,
     wait_pending_saves,
 )
+from agent.query.gate import is_trivial_input
 from agent.response.models import AgentResponse, AnswerToken
 from agent.response.status import StatusEvent
 from agent.session import SessionBackend, SessionManager, build_session_backend
@@ -74,7 +80,7 @@ from settings import RuntimeSettings, get_settings
 from shared.embeddings import EmbeddingConfig
 from shared.lark import LARK_MCP_SERVER_NAME
 from shared.logging import EVENT_LOGGER_NAME, current_trace_id, log_request_finished
-from shared.observability import Observability, install_observability
+from shared.observability import OUT_OF_BAND_TRACE_NAME, Observability, install_observability
 
 logger = logging.getLogger(__name__)
 # 结构化事件专用 logger（与业务日志分开：便于只过滤事件流；口径与 api/MCP 侧一致）。
@@ -247,12 +253,13 @@ class AgentRuntime:
         观测 flush 紧随其后（代价为零，且覆盖「带外保存期间仍在缓冲的最后一批**图内**
         span」）。其余按装配逆序（tools → session → memory）关闭，句柄置 None 保证幂等。
 
-        **实测修正（Phase D）**：plan §5.2 曾把 flush 排在此处的理由写成「否则带外保存
-        的 LLM span 会丢在缓冲区」—— 该理由已被实测证伪：带外抽取走
+        **实测修正（Phase D）→ O3 接线后语义反转**：带外保存走
         `persist.submit_memory_save` 的 `asyncio.create_task`，其 context 是 `chat_stream`
-        **调用方**的（不是图运行时的），故 langchain 回调上下文不继承
-        → 带外抽取调用既不产生观测 span、也不计入 C4 的 token 累计。
-        顺序保持不变（无副作用；若将来把回调显式传进带外路径，此处即为正确位置）。
+        **调用方**的（不是图运行时的），langchain 回调上下文不继承 —— Phase D 时带外
+        调用零 span，flush 顺序无副作用；O3 起回调**显式**传进带外路径（见 chat_stream
+        finally），带外 span 在观测客户端缓冲，本顺序**成为必要条件**：先
+        `wait_pending_saves()` 排干带外保存（其 span 随调用完成进入缓冲），再 flush，
+        才不会把带外 span 丢在 flush 之后。
         """
         await wait_pending_saves()
         if self.observability is not None:
@@ -366,9 +373,30 @@ class AgentRuntime:
             )
             # 带外记忆保存（尽力而为，绝不阻塞/中断主流程；客户端中途断开也会走到这里）。
             # stream_mode="updates" 拿不到完整 messages，必须在图结束后读最终 state。
-            if self.extractor is not None:
+            # 平凡输入门控（O3/§7.1）：寒暄/确认/无意义字符轮无记忆可抽，跳过以省一次
+            # 抽取 LLM 调用（与查询理解同一判据；「记住我是程序员」这类非平凡输入不受影响）。
+            if self.extractor is not None and not is_trivial_input(
+                text, min_query_chars=self.cfg.query_understanding.min_query_chars
+            ):
                 try:
                     final = await self.graph.aget_state(config)
+                    # 观测接线（O3）：带外 task 的回调上下文不继承（task 上下文来自
+                    # chat_stream 调用方而非图运行时），必须显式构造 callbacks + 归因
+                    # metadata 传入，否则 Langfuse 零 span、trace 成本偏低。带外调用呈
+                    # 独立 trace（名 memory.out_of_band_save），归因键与对话 trace 同值，
+                    # 云端按 session 即可对齐；未配置观测时两者为 None，与现状逐字相同。
+                    callbacks: list[Any] | None = None
+                    metadata: dict[str, object] | None = None
+                    if self.observability is not None:
+                        observed = self.observability.langchain_callbacks()
+                        if observed:
+                            callbacks = list(observed)
+                            metadata = self.observability.trace_metadata(
+                                session_id=session_id,
+                                user_id=user_id,
+                                trace_id=current_trace_id(),
+                                name=OUT_OF_BAND_TRACE_NAME,
+                            )
                     submit_memory_save(
                         final.values.get("messages") or [],
                         session_id=session_id,
@@ -379,6 +407,8 @@ class AgentRuntime:
                         judge=self.judge,
                         # 写入价值判定（v6.0 T1）：抽取后按类别+阈值丢弃不值得记的内容。
                         worth=self.cfg.memory.worth,
+                        callbacks=callbacks,
+                        metadata=metadata,
                     )
                 except BaseException as exc:
                     # 含 CancelledError（客户端断开取消生成器）：带外路径失败仅记日志。
