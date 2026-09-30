@@ -27,6 +27,7 @@ from shared.observability import (
     _ENV_KEYS,
     DEFAULT_BASE_URL,
     FULLY_MASKED,
+    OUT_OF_BAND_TRACE_NAME,
     TRACE_NAME,
     Observability,
     ObservabilityConfig,
@@ -299,6 +300,18 @@ def test_trace_metadata_keys() -> None:
     assert "request_trace_id" not in obs.trace_metadata(session_id="s", user_id="u")
 
 
+def test_trace_metadata_name_override_for_out_of_band() -> None:
+    """`name` 覆盖 trace 展示名（O3 带外用 memory.out_of_band_save），其余归因键不变。"""
+    obs = Observability(ObservabilityConfig(enabled=True), client=FakeClient())
+    metadata = obs.trace_metadata(
+        session_id="s-1", user_id="u-1", trace_id="req_abc", name=OUT_OF_BAND_TRACE_NAME
+    )
+    assert metadata["langfuse_trace_name"] == OUT_OF_BAND_TRACE_NAME
+    assert metadata["langfuse_session_id"] == "s-1"
+    assert metadata["langfuse_user_id"] == "u-1"
+    assert metadata["request_trace_id"] == "req_abc"
+
+
 def test_mask_recurses_and_keeps_json_serializable() -> None:
     """掩码递归生效且结果可 JSON 序列化（SDK 对 mask 返回值的硬要求）。"""
     payload = {
@@ -470,6 +483,7 @@ def runtime_factory(build_graph: Any) -> Any:
         *,
         tools: list[Any] | None = None,
         observability: Any = None,
+        extractor: Any = None,
     ) -> Any:
         from langgraph.store.memory import InMemoryStore
 
@@ -486,6 +500,7 @@ def runtime_factory(build_graph: Any) -> Any:
             cfg=AgentFrameworkConfig.get_default(),
             _session_backend=backend,
             observability=observability,
+            extractor=extractor,
         )
 
     return _make
@@ -562,6 +577,96 @@ async def test_callbacks_reach_node_level_llm_and_tools(runtime_factory: Any) ->
     # `status == "error"` 的工具结果自动置 span level=ERROR）——故这里按 content 断言。
     assert [getattr(item, "content", item) for item in handler.tool_ends] == ["10:00"]
     assert any(handler.chain_runs), "未收到任何 chain 回调（节点名无从归因）"
+
+
+# —— 带外保存观测接线（O3）：callbacks + metadata 显式传入 submit_memory_save ——
+
+
+def _capture_submit(monkeypatch: Any, captured: dict[str, Any]) -> None:
+    """把 `agent.runtime.submit_memory_save` 换成记录器（不真正保存，只捕获入参）。"""
+    import agent.runtime as runtime_module
+
+    def _fake_submit(messages: Any, **kwargs: Any) -> None:
+        captured["messages"] = messages
+        captured.update(kwargs)
+
+    monkeypatch.setattr(runtime_module, "submit_memory_save", _fake_submit)
+
+
+async def test_out_of_band_save_receives_callbacks_and_metadata(
+    runtime_factory: Any, monkeypatch: Any
+) -> None:
+    """观测已配置 → 带外保存携带新回调 + 归因 metadata（独立 trace 名，归因键同对话）。
+
+    带外 task 的回调上下文不继承（task 上下文来自 chat_stream 调用方），不显式传 config
+    就是 Langfuse 零 span —— 本用例锁定「有回调且 metadata 正确」的接线契约。
+    """
+    made: list[RecordingHandler] = []
+
+    def _factory(_config: ObservabilityConfig) -> RecordingHandler:
+        made.append(RecordingHandler())
+        return made[-1]
+
+    obs = Observability(
+        ObservabilityConfig(enabled=True), client=FakeClient(), handler_factory=_factory
+    )
+    runtime = await runtime_factory(
+        chat_turn_messages(Intent.CHAT, "你好！"), observability=obs, extractor=object()
+    )
+    captured: dict[str, Any] = {}
+    _capture_submit(monkeypatch, captured)
+    try:
+        async for _ in runtime.chat_stream(user_id="u1", session_id="s1", text="我叫小明"):
+            pass
+    finally:
+        await runtime.aclose()
+
+    # 带外用**新建**的 handler（每请求新建契约）：图 config 拿第 1 个，带外拿第 2 个。
+    assert captured["callbacks"] == [made[1]]
+    metadata = captured["metadata"]
+    assert metadata["langfuse_session_id"] == "s1"
+    assert metadata["langfuse_user_id"] == "u1"
+    assert metadata["langfuse_trace_name"] == OUT_OF_BAND_TRACE_NAME
+    # 归因键与对话 trace 同值：本地 trace_id 关联键两边同源（测试无请求上下文时同为缺省）。
+    assert (
+        metadata.get("request_trace_id")
+        == runtime.graph.configs[0]["metadata"].get("request_trace_id")
+    )
+    # 对话 trace 本体不受影响：仍是默认 trace 名。
+    assert runtime.graph.configs[0]["metadata"]["langfuse_trace_name"] == TRACE_NAME
+
+
+async def test_out_of_band_save_without_observability_stays_none(
+    runtime_factory: Any, monkeypatch: Any
+) -> None:
+    """未配置观测 → 带外保存 callbacks/metadata 均为 None（行为与接线前逐字相同）。"""
+    runtime = await runtime_factory(chat_turn_messages(Intent.CHAT, "你好！"), extractor=object())
+    captured: dict[str, Any] = {}
+    _capture_submit(monkeypatch, captured)
+    try:
+        async for _ in runtime.chat_stream(user_id="u1", session_id="s1", text="我叫小明"):
+            pass
+    finally:
+        await runtime.aclose()
+
+    assert captured["callbacks"] is None
+    assert captured["metadata"] is None
+
+
+async def test_trivial_input_skips_out_of_band_save(
+    runtime_factory: Any, monkeypatch: Any
+) -> None:
+    """平凡输入（寒暄/确认/无意义字符）→ 跳过带外抽取（§7.1，每轮寒暄省一次抽取调用）。"""
+    runtime = await runtime_factory(chat_turn_messages(Intent.CHAT, "你好！"), extractor=object())
+    captured: dict[str, Any] = {}
+    _capture_submit(monkeypatch, captured)
+    try:
+        async for _ in runtime.chat_stream(user_id="u1", session_id="s1", text="好的"):
+            pass
+    finally:
+        await runtime.aclose()
+
+    assert "messages" not in captured  # submit_memory_save 未被调用
 
 
 async def test_aclose_flushes_after_pending_saves(runtime_factory: Any, monkeypatch: Any) -> None:

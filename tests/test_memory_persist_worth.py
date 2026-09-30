@@ -32,12 +32,16 @@ from agent.memory.persist import REJECT_CATEGORIES, should_keep
 
 
 class _StubExtractor:
-    """固定返回给定抽取列表的 stub 抽取器（顺序即模型输出顺序）。"""
+    """固定返回给定抽取列表的 stub 抽取器（顺序即模型输出顺序）；记录 config 供透传断言。"""
 
     def __init__(self, extractions: Sequence[MemoryExtraction]) -> None:
         self._extractions = list(extractions)
+        self.configs: list[dict | None] = []
 
-    async def extract(self, messages: Sequence[BaseMessage]) -> list[MemoryExtraction]:
+    async def extract(
+        self, messages: Sequence[BaseMessage], *, config: dict | None = None
+    ) -> list[MemoryExtraction]:
+        self.configs.append(config)
         return list(self._extractions)
 
 

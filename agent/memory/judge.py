@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 
 from agent.memory.models import (
     CandidateVerdict,
@@ -94,17 +95,22 @@ class MemoryRelationJudge:
         self,
         item: MemoryItem,
         candidates: Sequence[MemoryItem],
+        *,
+        config: RunnableConfig | None = None,
     ) -> list[CandidateVerdict]:
         """判定 `item` 与每条候选的关系；任何失败返回空列表（尽力而为，绝不中断保存）。
 
         校验：只保留 index 落在合法区间内的判定；非法/重复 index 丢弃，
         防止模型产出越界引用污染决策（缺失的候选按「未判定 → 不参与合并」处理）。
+
+        `config` 透传给结构化调用（默认 None，与不传逐字同路）：带外 task 的 langchain
+        回调上下文**不继承**，观测回调必须经此显式挂载（O3，与 extractor 同口径）。
         """
         if not candidates:
             return []
         try:
             result = await self._llm.ainvoke_structured(
-                MergeDecisionResult, self._build_prompt(item, candidates)
+                MergeDecisionResult, self._build_prompt(item, candidates), config=config
             )
         except Exception as exc:
             # 裸 Exception：判定是带外尽力而为路径，失败即空结果（与 extractor 风格一致）。

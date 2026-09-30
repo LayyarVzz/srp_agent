@@ -13,7 +13,7 @@ from typing import Literal, TypeVar
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
@@ -168,10 +168,22 @@ class LLMService:
             raise LLMError(LLM_ERROR_REQUEST, "工具选择未返回 AIMessage")
         return resp
 
-    async def ainvoke_structured(self, schema: type[_S], prompt: str | Sequence) -> _S:
-        """一次结构化输出调用；任何失败归一化为 LLMError(llm_error.request)。"""
+    async def ainvoke_structured(
+        self,
+        schema: type[_S],
+        prompt: str | Sequence,
+        *,
+        config: RunnableConfig | None = None,
+    ) -> _S:
+        """一次结构化输出调用；任何失败归一化为 LLMError(llm_error.request)。
+
+        `config` 透传给底层结构化 Runnable（默认 None，与不传逐字同路，现有调用方零改动）：
+        图内调用靠 langchain 回调上下文继承观测 handler；带外路径（记忆抽取/判重）的
+        task 上下文继承自 `chat_stream` 调用方而非图运行时，回调**不继承**，
+        必须经此显式传 config 才能挂上回调被 Langfuse 跟踪（O3）。
+        """
         try:
-            return await self.structured_model(schema).ainvoke(prompt)
+            return await self.structured_model(schema).ainvoke(prompt, config=config)
         except Exception as exc:
             logger.warning("结构化输出调用失败: %s", exc)
             raise LLMError(LLM_ERROR_REQUEST, f"LLM 结构化输出调用失败: {exc}") from exc

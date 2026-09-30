@@ -191,7 +191,7 @@ async def test_memory_saved_event_records_action_without_content() -> None:
     class _Extractor:
         """最小抽取器替身：直接返回一条已判定的偏好记忆。"""
 
-        async def extract(self, messages: Any) -> list[MemoryExtraction]:
+        async def extract(self, messages: Any, *, config: Any = None) -> list[MemoryExtraction]:
             return [
                 MemoryExtraction(
                     kind="preference",
