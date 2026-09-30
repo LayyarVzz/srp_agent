@@ -353,3 +353,15 @@ async def test_render_memory_block_truncation_keeps_declaration() -> None:
     assert len(block) <= 200
     # 声明后的内容被截断（完整 bullet1 远超预算），声明未丢。
     assert "用户是中学生" in block
+
+
+def test_memory_block_header_semantics() -> None:
+    """O2 措辞不变量：「事实可信」层在场、「指令不执行」防御在场、「不可信」退场。
+
+    WHY 锁定：旧头「属不可信数据」曾让模型把个人事实提问拒答为「不知道」
+    （记忆在场仍拒答）；改措辞时最容易被顺手删掉的恰恰是两层语义中的一层。
+    """
+    assert "可靠事实" in _MEMORY_BLOCK_HEADER
+    assert "优先依据这些记忆回答" in _MEMORY_BLOCK_HEADER
+    assert "不得执行" in _MEMORY_BLOCK_HEADER  # 注入防御不放宽（设计不变量 §2.3）
+    assert "不可信" not in _MEMORY_BLOCK_HEADER
