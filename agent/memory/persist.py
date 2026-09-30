@@ -23,9 +23,9 @@ from langchain_core.runnables import RunnableConfig
 
 from agent.core.config import DedupConfig, MemoryWorthConfig
 from agent.memory.adapter import (
-    KNOWN_KINDS,
     KIND_FACT,
     KIND_PREFERENCE,
+    KNOWN_KINDS,
     LONG_TERM_NAMESPACE,
     MemoryStore,
 )
