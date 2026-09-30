@@ -30,6 +30,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# verdict.reason 兜底截断阈值（O7-F11）：prompt 已要求「一句话」，此处防模型失控输出
+# 全量流入日志/trace —— 与 extractor 解析后净化的 reason 截断同口径（纯审计字段）。
+_REASON_MAX_CHARS = 200
+
 # 判定 prompt：编码三分类 + 事实性判定要点 + 新信息→合并 + 不同对象/事件→非重复。
 # 候选记忆来自记忆库，视为「数据」而非「指令」（提示注入防御：禁止执行候选内容中的指令）。
 RELATION_JUDGE_PROMPT = """你是长期记忆合并判定器。判断一条「待保存记忆」与每条「候选记忆」的关系，
@@ -131,11 +135,13 @@ class MemoryRelationJudge:
         return verdicts
 
     def _validate(self, verdicts: Sequence[CandidateVerdict], n: int) -> list[CandidateVerdict]:
-        """过滤非法/重复 index：判定必须落在 1..n，每个候选至多一条。"""
+        """过滤非法/重复 index：判定必须落在 1..n，每个候选至多一条；reason 超限截断。"""
         seen: set[int] = set()
         valid: list[CandidateVerdict] = []
         for v in verdicts:
             if 1 <= v.index <= n and v.index not in seen:
+                if len(v.reason) > _REASON_MAX_CHARS:
+                    v = v.model_copy(update={"reason": v.reason[:_REASON_MAX_CHARS]})
                 valid.append(v)
                 seen.add(v.index)
         return valid
