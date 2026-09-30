@@ -24,6 +24,7 @@ from agent.memory.models import (
     MemoryItem,
     MergeDecisionResult,
 )
+from shared.logging import summarize_text
 
 if TYPE_CHECKING:
     from agent.llm import LLMService
@@ -75,15 +76,18 @@ relation 为三分类之一，reason 简述判定依据（一句话，说明你�
 def _verdict_summary(
     verdicts: Sequence[CandidateVerdict], candidates: Sequence[MemoryItem]
 ) -> str:
-    """把 verdicts 折叠为紧凑审计摘要（index→候选内容→relation），供保存端日志观测。
+    """把 verdicts 折叠为紧凑审计摘要（index→候选指纹→relation），供保存端日志观测。
 
     WHY 独立 helper：日志是持久化过程的唯一可观测窗口（judge 不落库、不参与召回），
     摘要需在行内呈现「判了哪个候选、判成什么」；reason 明细另存 verdict 对象，不进日志。
+    候选内容经 `summarize_text` 以「len+sha256 指纹」呈现（O7-F12）：judge 链路携带的
+    模型/存储自由文本不原样落日志，原文按 trace 与 store 复盘。
     """
     parts: list[str] = []
     for v in verdicts:
         if 1 <= v.index <= len(candidates):
-            parts.append(f"[{v.index}]「{candidates[v.index - 1].content}」→ {v.relation}")
+            content = summarize_text(candidates[v.index - 1].content)
+            parts.append(f"[{v.index}]「{content}」→ {v.relation}")
         else:
             parts.append(f"[{v.index}]<越界>→ {v.relation}")
     return "; ".join(parts) if parts else "(空)"
@@ -127,7 +131,8 @@ class MemoryRelationJudge:
         verdicts = self._validate(result.verdicts, len(candidates))
         logger.info(
             "合并判定：待保存「%s」→ 候选 %d 条，判定 %d 条：%s",
-            item.content,
+            # 待保存内容为模型自由文本（O7-F12）：日志以指纹呈现，不原样落盘。
+            summarize_text(item.content),
             len(candidates),
             len(verdicts),
             _verdict_summary(verdicts, candidates),

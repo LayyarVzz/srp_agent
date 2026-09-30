@@ -29,6 +29,7 @@ from agent.memory import (
     wait_pending_saves,
 )
 from agent.memory.persist import REJECT_CATEGORIES, should_keep
+from shared.logging import summarize_text
 
 
 class _StubExtractor:
@@ -220,7 +221,7 @@ async def test_turn_cap_counts_only_kept_items() -> None:
 
 
 async def test_drop_is_logged_with_category_and_score(caplog: pytest.LogCaptureFixture) -> None:
-    """丢弃走 INFO 日志，且带 category / score / reason / 内容（可审计、可复盘误丢）。"""
+    """丢弃走 INFO 日志，带 category / score；内容以 len+sha256 指纹呈现（O7-F12）。"""
     store = MemoryStore(InMemoryStore())
     with caplog.at_level(logging.INFO, logger="agent.memory.persist"):
         await _save(
@@ -235,7 +236,9 @@ async def test_drop_is_logged_with_category_and_score(caplog: pytest.LogCaptureF
     assert "记忆丢弃（不值得）" in text
     assert "category=commonsense" in text
     assert "score=0.20" in text
-    assert "Python 是解释型语言" in text
+    # 模型自由文本不原样落日志：以「len=N sha256=…」指纹呈现，可对齐 trace 复盘。
+    assert summarize_text("Python 是解释型语言") in text
+    assert "Python 是解释型语言" not in text
     assert "落库 1 条" in text
     assert "不值得 1" in text
 
@@ -280,7 +283,9 @@ async def test_turn_cap_is_logged(caplog: pytest.LogCaptureFixture) -> None:
         )
 
     assert "记忆条数超上限" in caplog.text
-    assert "事实 B" in caplog.text
+    # 被截断条目以指纹呈现（O7-F12），不再打印原文。
+    assert summarize_text("事实 B") in caplog.text
+    assert "事实 B" not in caplog.text
 
 
 # —— 带外入口（submit_memory_save）透传 worth ——
@@ -323,3 +328,30 @@ def test_memory_item_carries_no_worth_fields() -> None:
     assert "worth_score" not in MemoryItem.model_fields
     assert "category" not in MemoryItem.model_fields
     assert "worth_reason" not in MemoryItem.model_fields
+
+
+async def test_drop_log_never_prints_runaway_text(caplog: pytest.LogCaptureFixture) -> None:
+    """O7-F12 最后一道防线：失控/超长自由文本不进丢弃日志，仅 len+sha256 指纹。"""
+    store = MemoryStore(InMemoryStore())
+    runaway = "失控循环文本" * 80
+    reason = "失控审计文本" * 80
+    with caplog.at_level(logging.INFO, logger="agent.memory.persist"):
+        await _save(
+            store,
+            [
+                MemoryExtraction(
+                    kind=KIND_FACT,
+                    content=runaway,
+                    category=WORTH_COMMONSENSE,
+                    worth_score=0.2,
+                    worth_reason=reason,
+                )
+            ],
+        )
+
+    text = caplog.text
+    assert "记忆丢弃（不值得）" in text  # 丢弃事实仍可见
+    assert runaway not in text  # 原文不落日志
+    assert reason not in text
+    assert summarize_text(runaway) in text
+    assert summarize_text(reason) in text

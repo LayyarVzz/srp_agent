@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from agent.memory import (
     RELATION_EXACT,
     RELATION_NOT_DUPLICATE,
@@ -187,3 +189,33 @@ async def test_judge_truncates_overlong_reason(make_llm_service) -> None:
     assert len(verdicts) == 1
     assert len(verdicts[0].reason) == 200  # 截断到 200 字（与 extractor 净化同口径）
     assert verdicts[0].relation == RELATION_OVERLAP  # 判定本身不受影响
+
+
+async def test_judge_log_summarizes_content_fingerprint(
+    make_llm_service, caplog: pytest.LogCaptureFixture
+) -> None:
+    """O7-F12：合并判定日志的待保存/候选内容以 len+sha256 指纹呈现，不落原文。"""
+    import logging
+
+    from shared.logging import summarize_text
+
+    svc = make_llm_service(
+        [
+            fake_structured_message(
+                MergeDecisionResult(
+                    verdicts=[CandidateVerdict(index=1, relation=RELATION_OVERLAP)]
+                )
+            )
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="agent.memory.judge"):
+        await MemoryRelationJudge(svc).judge(
+            _item("用户喜欢喝咖啡"), [_item("用户喜欢喝奶茶")]
+        )
+
+    text = caplog.text
+    assert "合并判定" in text
+    assert "用户喜欢喝咖啡" not in text
+    assert "用户喜欢喝奶茶" not in text
+    assert summarize_text("用户喜欢喝咖啡") in text
+    assert summarize_text("用户喜欢喝奶茶") in text

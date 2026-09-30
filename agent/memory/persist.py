@@ -136,16 +136,19 @@ def _select_keepable(
             cfg.memories_max_per_turn,
             len(ranked),
             len(overflow),
-            "；".join(f"{e.content}（{e.worth_score:.2f}）" for e in overflow),
+            # summarize_text（O7-F12）：模型自由文本以「len+sha256 指纹」落日志——
+            # 净化之后的最后一道防线，失控/超长文本不再原样进日志；原文按 trace 复盘。
+            "；".join(f"{summarize_text(e.content)}（{e.worth_score:.2f}）" for e in overflow),
         )
     for e in _worth_rank(worth_dropped):
-        # 值得性丢弃：类别 + 分数 + 模型自述理由全量落日志（可审计、可复盘误丢）。
+        # 值得性丢弃：类别 + 分数 + 理由/内容指纹落日志（可对齐 Langfuse trace 复盘误丢；
+        # O7-F12 前这道日志全量打印模型自由文本，是失控文本的最后一个未设防出口）。
         logger.info(
             "记忆丢弃（不值得）category=%s score=%.2f reason=%s（%s）",
             e.category,
             e.worth_score,
-            e.worth_reason or "无",
-            e.content,
+            summarize_text(e.worth_reason) if e.worth_reason else "无",
+            summarize_text(e.content),
         )
     if worth_dropped or overflow:
         logger.info(
