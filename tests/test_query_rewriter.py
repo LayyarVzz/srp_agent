@@ -13,7 +13,6 @@ from agent.intent.models import Intent, IntentContext
 from agent.query import (
     REWRITE_PROMPT,
     QueryRewriter,
-    QueryUnderstanding,
     QueryUnderstandingResult,
 )
 from tests.conftest import RecordingFakeChatModel, fake_structured_message, fake_text_message
@@ -31,7 +30,8 @@ def _rewriter(svc, **kwargs) -> QueryRewriter:
 
 
 def _understanding(**kwargs) -> QueryUnderstandingResult:
-    return QueryUnderstandingResult(understanding=QueryUnderstanding(**kwargs))
+    """构造扁平结构化输出（`QueryUnderstandingResult` 与领域模型同源，直接构造）。"""
+    return QueryUnderstandingResult(**kwargs)
 
 
 async def test_rewrite_returns_understanding(make_llm_service) -> None:
@@ -69,7 +69,7 @@ async def test_rewrite_none_result_returns_none(make_llm_service) -> None:
 
 
 async def test_rewrite_empty_understanding_returns_none(make_llm_service) -> None:
-    """模型显式返回 understanding=None → None（视为无产出）。"""
+    """模型产出了空结构化结果（main_query 为空）→ None（视为无产出）。"""
     svc = make_llm_service([fake_structured_message(QueryUnderstandingResult())])
     assert await _rewriter(svc).rewrite("我们公司年假怎么算") is None
 
