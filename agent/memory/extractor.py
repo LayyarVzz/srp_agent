@@ -94,6 +94,63 @@ def _recent_messages(messages: Sequence[BaseMessage], max_input_chars: int) -> l
     return list(reversed(recent))
 
 
+# —— 解析后净化（O7-F10）：模型输出失控（自回归循环重复）不得流向落库与日志/trace ——
+# 阈值口径：worth_reason 是纯审计字段，超限一律截断；content 循环重复丢弃、超长截断；
+# max_tokens 只兜底规模，单次失控仍白烧 token 并把脏文本灌进日志，故在解析后净化。
+_WORTH_REASON_MAX_CHARS = 200
+_CONTENT_MAX_CHARS = 500
+_DEGENERATE_WINDOW = 16  # 滑窗大小（字符）
+_DEGENERATE_REPEATS = 3  # 任一窗口子串出现 ≥3 次 → 判循环重复
+
+
+def _is_degenerate(
+    text: str, *, window: int = _DEGENERATE_WINDOW, repeats: int = _DEGENERATE_REPEATS
+) -> bool:
+    """判定文本是否陷入自回归循环重复：任一 window 长子串出现 ≥ repeats 次。
+
+    WHY 滑窗子串计数而非整串比较：循环重复的「周期」未知（整句/半句/多句皆可），
+    固定窗口对任意周期都成立；正常文本几乎不可能让同一 16 字子串原样出现 3 次。
+    """
+    cleaned = text.strip()
+    if len(cleaned) < window:
+        return False
+    counts: dict[str, int] = {}
+    for i in range(len(cleaned) - window + 1):
+        sub = cleaned[i : i + window]
+        n = counts.get(sub, 0) + 1
+        if n >= repeats:
+            return True
+        counts[sub] = n
+    return False
+
+
+def _sanitize_extraction(extraction: MemoryExtraction) -> MemoryExtraction | None:
+    """净化单条解析成功的抽取结果（纯函数，便于单测；O7-F10）。
+
+    - worth_reason：超 200 字一律截断（纯审计字段，不影响内容本身）；
+    - content：判循环重复 → 丢弃该条（返回 None）+ 告警日志；非重复但超 500 字 → 截断；
+    - 正常条目原对象逐字透传，同批好内容不受影响。
+
+    WHY 不新增整批丢弃路径：净化只作用于单条、且仅「确证失控」才丢——
+    宁漏不误丢（与 O7 弃选的「schema max_length 硬校验」整批失败方案相对）。
+    """
+    reason = extraction.worth_reason
+    content = extraction.content
+    if _is_degenerate(content):
+        logger.warning(
+            "记忆抽取输出失控（循环重复 len=%d），丢弃该条目（不落库、不进日志）",
+            len(content),
+        )
+        return None
+    if len(reason) > _WORTH_REASON_MAX_CHARS:
+        reason = reason[:_WORTH_REASON_MAX_CHARS]
+    if len(content) > _CONTENT_MAX_CHARS:
+        content = content[:_CONTENT_MAX_CHARS]
+    if reason == extraction.worth_reason and content == extraction.content:
+        return extraction
+    return extraction.model_copy(update={"worth_reason": reason, "content": content})
+
+
 class MemoryExtractor:
     """结构化 LLM 输出：从对话抽取值得记住的事实（可空、永不抛）。"""
 
@@ -143,7 +200,14 @@ class MemoryExtractor:
                 "记忆抽取无候选产出（模型未抽取任何条目且未自报拒收）；"
                 "如本轮含身份/计划陈述，请结合原文核查是否漏提"
             )
-        return result.memories
+        # 解析后净化（O7-F10）：失控文本不得流向落库与日志/trace；净化只处理解析成功
+        # 的输出、绝不抛错，失败语义与现状逐字一致（带外路径绝不中断）。
+        sanitized = [
+            cleaned
+            for extraction in result.memories
+            if (cleaned := _sanitize_extraction(extraction)) is not None
+        ]
+        return sanitized
 
     def _build_prompt(self, messages: Sequence[BaseMessage]) -> list[BaseMessage]:
         """组装抽取 prompt：SystemMessage 指令 + 最近对话消息（保留 human/ai/tool 角色结构）。"""

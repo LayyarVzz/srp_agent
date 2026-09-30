@@ -156,3 +156,91 @@ async def test_extract_empty_with_rejections_no_signal(
         assert await MemoryExtractor(svc).extract([HumanMessage(content="地球绕太阳转吗")]) == []
     assert "无候选产出" not in caplog.text
     assert "自报拒收 2 条" in caplog.text
+
+
+# —— 解析后净化（O7-F10）：失控输出不落库、不进日志/trace ——
+
+
+async def test_extract_truncates_overlong_worth_reason(make_llm_service) -> None:
+    """worth_reason 超 200 字 → 截断（纯审计字段），条目本身保留。"""
+    svc = make_llm_service(
+        [
+            fake_structured_message(
+                MemoryExtractionResult(
+                    memories=[
+                        MemoryExtraction(
+                            kind="fact", content="用户叫小明", worth_reason="审计" * 150
+                        )
+                    ]
+                )
+            )
+        ]
+    )
+    result = await MemoryExtractor(svc).extract([HumanMessage(content="我叫小明")])
+
+    assert len(result) == 1
+    assert result[0].worth_reason == "审计" * 100  # 200 字截断
+    assert result[0].content == "用户叫小明"  # 内容不受审计字段超限影响
+
+
+async def test_extract_drops_degenerate_content_keeps_rest(make_llm_service) -> None:
+    """content 循环重复 → 丢弃该条；同批好内容不受影响（净化不整批连坐）。"""
+    degenerate = "注意：本条与下周要出差同句出现，用户自述职业身份，属稳定事实。保留。" * 8
+    svc = make_llm_service(
+        [
+            fake_structured_message(
+                MemoryExtractionResult(
+                    memories=[
+                        MemoryExtraction(kind="fact", content=degenerate, importance=0.9),
+                        MemoryExtraction(kind="fact", content="用户叫小明"),
+                    ]
+                )
+            )
+        ]
+    )
+    result = await MemoryExtractor(svc).extract([HumanMessage(content="x")])
+
+    assert [m.content for m in result] == ["用户叫小明"]
+
+
+async def test_extract_truncates_overlong_non_repeating_content(make_llm_service) -> None:
+    """content 非重复但超 500 字 → 截断到 500（不丢弃，与循环重复的处理相区分）。"""
+    long_unique = "".join(f"第{i}条记忆内容" for i in range(120))  # 远超 500 且无循环子串
+    svc = make_llm_service(
+        [
+            fake_structured_message(
+                MemoryExtractionResult(
+                    memories=[MemoryExtraction(kind="fact", content=long_unique)]
+                )
+            )
+        ]
+    )
+    result = await MemoryExtractor(svc).extract([HumanMessage(content="x")])
+
+    assert len(result) == 1
+    assert len(result[0].content) == 500
+    assert result[0].content == long_unique[:500]
+
+
+async def test_extract_passes_normal_output_verbatim(make_llm_service) -> None:
+    """正常输出逐字透传：净化不改动任何字段（含中文短句与正常 reason）。"""
+    normal = MemoryExtraction(
+        kind="fact", content="用户是一名程序员", worth_reason="用户自述职业身份", importance=0.8
+    )
+    svc = make_llm_service(
+        [fake_structured_message(MemoryExtractionResult(memories=[normal]))]
+    )
+    result = await MemoryExtractor(svc).extract([HumanMessage(content="我是一名程序员")])
+
+    assert result == [normal]
+    assert result[0].content == "用户是一名程序员"
+    assert result[0].worth_reason == "用户自述职业身份"
+
+
+def test_is_degenerate_boundaries() -> None:
+    """滑窗判定的边界：短文本不判、恰好重复窗口判、非循环长文不判。"""
+    from agent.memory.extractor import _is_degenerate
+
+    assert _is_degenerate("短句") is False  # 不足一个窗口
+    assert _is_degenerate("abcdefgh" * 8) is True  # 周期性重复（窗口 16 命中 3+ 次）
+    assert _is_degenerate("".join(f"第{i}条" for i in range(60))) is False  # 非循环长文
