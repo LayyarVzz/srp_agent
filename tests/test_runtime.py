@@ -4,7 +4,8 @@
 - chat_stream：status 事件先实时下发 + done 兜底完整 AgentResponse（会话编排挂接点）；
 - chat（非流式）：与流式 done 语义一致；
 - 澄清链路：意图低置信 → finished_reason=needs_clarification + clarification 载荷
-  （前端 phase=clarify 的判定依据）。
+  （前端 phase=clarify 的判定依据）；
+- 断连取消防护（O5-F3）：消费任务被取消后，带外记忆保存仍触发。
 
 WHY 不调用 AgentRuntime.create()：create 会拉起 MCP stdio 子进程并读环境配置，
 单元测试直接构造 dataclass（注入 fake 图/后端）即可验证编排逻辑；extractor=None
@@ -13,14 +14,18 @@ WHY 不调用 AgentRuntime.create()：create 会拉起 MCP stdio 子进程并读
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
+from langchain_core.messages import BaseMessage
 from langgraph.store.memory import InMemoryStore
 
 from agent.core.config import AgentFrameworkConfig
 from agent.intent.models import Intent, IntentResult
-from agent.memory import MemoryStore
+from agent.memory import MemoryStore, wait_pending_saves
 from agent.response.models import (
     FINISHED_REASON_NEEDS_CLARIFICATION,
     AgentResponse,
@@ -187,5 +192,81 @@ async def test_chat_clarify_flow(runtime_factory: Any) -> None:
         assert resp.clarification.question == "你是想查询 A 还是 B？"
         assert resp.clarification.options == ["查 A", "查 B"]
         assert resp.reply == resp.clarification.question
+    finally:
+        await runtime.aclose()
+
+
+# —— 断连取消防护（O5-F3）：消费任务被取消后，带外保存仍必须提交 ——
+
+
+class _CancelledStateGraph:
+    """aget_state 恒抛 CancelledError 的假图（其余调用透传内层真图）。
+
+    WHY 这个形态：生产中客户端断开 = starlette/anyio 取消作用域被取消，它对作用域内的
+    **每个** await 重投取消——finally 里的 `await aget_state` 必然抛 CancelledError
+    （O5 分支 C① 的实测根因：保存连提交都没发生）。恒抛 fake 确定性地复现该形态，
+    不依赖真实取消时机。
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def aget_state(self, config: Any) -> Any:
+        raise asyncio.CancelledError()
+
+
+class _RecordingExtractor:
+    """记录抽取输入的 stub 抽取器（返回空列表：本测试只关心保存是否触发）。"""
+
+    def __init__(self) -> None:
+        self.inputs: list[Sequence[BaseMessage]] = []
+
+    async def extract(
+        self, messages: Sequence[BaseMessage], *, config: Any = None
+    ) -> list[Any]:
+        self.inputs.append(list(messages))
+        return []
+
+
+async def test_chat_stream_cancelled_turn_still_submits_memory_save(build_graph: Any) -> None:
+    """客户端断开（消费任务被 cancel）→ 带外保存仍触发，且输入含本轮用户消息（O5-F3）。
+
+    WHY 端到端而非只测 _final_messages_for_save：修复的是「finally 里的触发链路」，
+    回归断言必须是「抽取器确实收到输入」这条业务可见的结果，而非某个内部方法的行为。
+    """
+    extractor = _RecordingExtractor()
+    inner = build_graph(chat_turn_messages(Intent.CHAT, "好的"))
+    backend = await build_session_backend(None)
+    runtime = AgentRuntime(
+        graph=_CancelledStateGraph(inner),
+        sessions=backend.manager,
+        memory_store=MemoryStore(InMemoryStore()),
+        cfg=AgentFrameworkConfig.get_default(),
+        extractor=extractor,  # type: ignore[arg-type]
+        _session_backend=backend,
+    )
+    try:
+
+        async def _consume() -> int:
+            count = 0
+            async for _event, _payload in runtime.chat_stream(
+                user_id="u1", session_id="s1", text="我叫小明，请记住"
+            ):
+                count += 1
+            return count
+
+        task = asyncio.create_task(_consume())
+        await asyncio.sleep(0.01)  # 让流先推进（fake 图完成大部分节点）
+        task.cancel()  # 模拟客户端断开：取消消费任务
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await wait_pending_saves()
+
+        assert extractor.inputs, "断连后带外保存未提交（O5-F3 回归）"
+        texts = [str(m.content) for m in extractor.inputs[0]]
+        assert any("我叫小明" in t for t in texts), f"保存输入缺少本轮用户消息：{texts}"
     finally:
         await runtime.aclose()
