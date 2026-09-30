@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 
 from agent.memory.models import MemoryExtraction, MemoryExtractionResult
 
@@ -97,11 +98,18 @@ class MemoryExtractor:
         self._llm = llm
         self._max_input_chars = max_input_chars
 
-    async def extract(self, messages: Sequence[BaseMessage]) -> list[MemoryExtraction]:
-        """抽取本轮值得记住的事实；任何失败返回空列表（尽力而为，绝不中断主流程）。"""
+    async def extract(
+        self, messages: Sequence[BaseMessage], *, config: RunnableConfig | None = None
+    ) -> list[MemoryExtraction]:
+        """抽取本轮值得记住的事实；任何失败返回空列表（尽力而为，绝不中断主流程）。
+
+        `config` 透传给结构化调用（默认 None，与不传逐字同路）：带外 task 的 langchain
+        回调上下文**不继承**（task 上下文来自 `chat_stream` 调用方而非图运行时），
+        观测回调必须经此显式挂载，否则 Langfuse 零 span（O3）。
+        """
         try:
             result = await self._llm.ainvoke_structured(
-                MemoryExtractionResult, self._build_prompt(messages)
+                MemoryExtractionResult, self._build_prompt(messages), config=config
             )
         except Exception as exc:
             # 裸 Exception：抽取是带外尽力而为路径，失败即空结果（与 adapter 既有风格一致）。
