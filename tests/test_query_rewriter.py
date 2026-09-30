@@ -145,5 +145,6 @@ def test_prompt_declares_untrusted_and_semantic_boundaries() -> None:
         "仅当输入包含多个可独立检索的信息需求时",  # 子查询节流
         "不得扩大或收窄语义范围",  # 同义边界
         "retrieval_needed",  # 是否值得检索
+        "个人身份/偏好/过往陈述的提问必须为 true",  # 个人事实查询不得漏放行
     ):
         assert marker in REWRITE_PROMPT, f"改写提示词缺少关键判据：{marker}"
