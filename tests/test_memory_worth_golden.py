@@ -368,6 +368,7 @@ def test_prompt_keeps_hard_case_boundaries() -> None:
         "用户对电子产品有消费意愿",  # 拒收（推导品）
         "explicit",  # 显式记住旁路
         "worth_score",  # 值得性字段
+        "一句话（≤30 字）说明判定依据，禁止重复展开",  # O7：worth_reason 篇幅硬约束
     ):
         assert marker in EXTRACT_PROMPT, f"提示词缺少关键分界/字段：{marker}"
 
