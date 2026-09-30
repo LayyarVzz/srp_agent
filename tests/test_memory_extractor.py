@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import logging
+
+import pytest
 from langchain_core.messages import HumanMessage
 
 from agent.memory.extractor import MemoryExtractor
@@ -119,3 +122,37 @@ async def test_extract_truncates_recent_messages(make_llm_service) -> None:
     contents = [str(m.content) for m in prompt_messages]
     assert "新消息" in contents
     assert "很早以前" not in contents
+
+
+# —— 空结果可观测（O5-F4）：区分「未产出候选」与「自报拒收」两种空 ——
+
+
+async def test_extract_empty_without_rejections_logs_signal(
+    make_llm_service, caplog: pytest.LogCaptureFixture
+) -> None:
+    """空结果且无自报拒收 → INFO 信号（漏提排查入口：与「无记忆可存」可区分）。"""
+
+
+    svc = make_llm_service([fake_structured_message(MemoryExtractionResult())])
+    with caplog.at_level(logging.INFO, logger="agent.memory.extractor"):
+        assert await MemoryExtractor(svc).extract([HumanMessage(content="现在几点了？")]) == []
+    assert "无候选产出" in caplog.text
+
+
+async def test_extract_empty_with_rejections_no_signal(
+    make_llm_service, caplog: pytest.LogCaptureFixture
+) -> None:
+    """模型自报拒收的空 → 不打「无候选产出」信号（两种空语义不同，不混报）。"""
+
+
+    svc = make_llm_service(
+        [
+            fake_structured_message(
+                MemoryExtractionResult(rejected_count=2, rejected_categories=["commonsense"])
+            )
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="agent.memory.extractor"):
+        assert await MemoryExtractor(svc).extract([HumanMessage(content="地球绕太阳转吗")]) == []
+    assert "无候选产出" not in caplog.text
+    assert "自报拒收 2 条" in caplog.text

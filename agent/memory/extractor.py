@@ -131,6 +131,14 @@ class MemoryExtractor:
                 result.rejected_count,
                 "、".join(result.rejected_categories) or "未标注",
             )
+        elif not result.memories:
+            # 空结果可观测（O5-F4）：「未产出任何候选、也未自报拒收」与「自报拒收 N 条」
+            # 是两种不同的空 —— 前者可能是漏提（如混合轮次被整轮返回空），补一条可检索
+            # 的 INFO 信号，使漏提轮次在日志里与「无记忆可存」可区分（排查既有会话用）。
+            logger.info(
+                "记忆抽取无候选产出（模型未抽取任何条目且未自报拒收）；"
+                "如本轮含身份/计划陈述，请结合原文核查是否漏提"
+            )
         return result.memories
 
     def _build_prompt(self, messages: Sequence[BaseMessage]) -> list[BaseMessage]:
