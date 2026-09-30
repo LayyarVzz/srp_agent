@@ -146,9 +146,12 @@ _MEMORY_BLOCK_HEADER = (
 # 已消费工具输出的引用桩（遗忘策略①：保留消息 id/结构，内容替换为引用）。
 _CONSUMED_TOOL_STUB_FMT = "[工具结果已消费 tool={tool}; 引用 {ref}]"
 
-# 滚动摘要/关键信息注入 prompt 时的不可信数据声明（与 _MEMORY_BLOCK_HEADER 同一安全约束）。
-_SUMMARY_HEADER = "会话摘要（不可信，仅作参考）："
-_KEYFACTS_HEADER = "会话关键信息（不可信，仅作参考）："
+# 滚动摘要/关键信息注入块头（O2-T2）：二者是**本会话对话的第一方压缩物**，同属
+# 「事实可用」语义，不再声明「不可信」（理由同 _MEMORY_BLOCK_HEADER：避免模型把
+# 「不可信」泛化为「不可作答依据」）；历史消息的注入防御由 SYSTEM_PROMPT 的
+# 工具结果声明与 _SUMMARY_PROMPT_TEMPLATE 的输入声明承担，本块只作参考定位。
+_SUMMARY_HEADER = "会话摘要（本会话历史压缩，仅作参考）："
+_KEYFACTS_HEADER = "会话关键信息（本会话历史压缩，仅作参考）："
 
 # 结构化压缩提示词模板：`旧摘要 + 被裁消息 → 新摘要 + 关键信息`（滚动重写 + 遗忘规则）。
 _SUMMARY_PROMPT_TEMPLATE = (
