@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
+from langchain_core.runnables import RunnableConfig
 
 from agent.core.config import DedupConfig, MemoryWorthConfig
 from agent.memory.adapter import KNOWN_KINDS, LONG_TERM_NAMESPACE, MemoryStore
@@ -130,6 +132,25 @@ def _select_keepable(
     return ranked[: cfg.memories_max_per_turn]
 
 
+def _observation_config(
+    callbacks: Sequence[BaseCallbackHandler] | None,
+    metadata: Mapping[str, object] | None,
+) -> RunnableConfig | None:
+    """把 callbacks + metadata 收敛为 langchain config；都缺省 → None（与未接线逐字同路）。
+
+    WHY 在 persist 组装：调用方（runtime）只持有观测句柄的两块原料（handler 列表 +
+    归因 metadata），config 的形状是本层的实现细节，不外泄；组装一次全链路共用同一份。
+    """
+    if not callbacks and not metadata:
+        return None
+    config: RunnableConfig = {}
+    if callbacks:
+        config["callbacks"] = list(callbacks)
+    if metadata:
+        config["metadata"] = dict(metadata)
+    return config
+
+
 async def save_conversation_memory(
     messages: Sequence[BaseMessage],
     *,
@@ -140,6 +161,8 @@ async def save_conversation_memory(
     dedup: DedupConfig | None = None,
     judge: MemoryRelationJudge | None = None,
     worth: MemoryWorthConfig | None = None,
+    callbacks: Sequence[BaseCallbackHandler] | None = None,
+    metadata: Mapping[str, object] | None = None,
 ) -> None:
     """抽取本轮值得记住的事实，过值得性判定后逐条保存；内部吞掉一切异常（尽力而为）。
 
@@ -148,8 +171,13 @@ async def save_conversation_memory(
     `dedup` 为 None（或 `enabled=False`）时退回逐条 `save` 原行为；
     启用时走 `_save_deduped`（L1 content-hash + 语义候选；`judge` 非空则按事实三分类
     决策，否则退回 `store.upsert` 阈值路径）。
+
+    `callbacks` / `metadata`（O3）经 `_observation_config` 组装为 config 透传给带外
+    LLM 调用（抽取 + 判重）：带外 task 的回调上下文不继承，不显式传则 Langfuse 零 span、
+    trace 成本偏低；未接线（都为 None）时行为与接线前逐字相同。
     """
-    extractions = await extractor.extract(messages)  # extract 契约：永不抛
+    config = _observation_config(callbacks, metadata)
+    extractions = await extractor.extract(messages, config=config)  # extract 契约：永不抛
     worth_cfg = worth or MemoryWorthConfig()
     # 保存过程对用户可观测（INFO，见 demo 默认级别）：抽取条数 → 值得性判定与上限截断
     # （_select_keepable 内逐条打丢弃原因）→ 逐条保存决策（_save_deduped / judge 内部均 INFO）。
@@ -179,6 +207,7 @@ async def save_conversation_memory(
                     store=store,
                     judge=judge,
                     semantic_threshold=dedup.semantic_threshold,
+                    config=config,
                 )
                 action = outcome.action
                 # 决策明细已在上方 _save_deduped 内按分支 INFO 记录，此处记落库结果。
@@ -228,6 +257,7 @@ async def _save_deduped(
     store: MemoryStore,
     judge: MemoryRelationJudge | None,
     semantic_threshold: float,
+    config: RunnableConfig | None = None,
 ) -> SaveOutcome:
     """带去重保存：L1 精确 →（有判定器）事实三分类 → 未命中新写（D4-2）。
 
@@ -237,7 +267,7 @@ async def _save_deduped(
     - 判定存在 exact_duplicate → 合并进最高分 exact（确定性重复）；
     - 恰一条可合并（exact/overlap）→ 合并进它（overlap 吸收新信息）；
     - 0 或 ≥2 条可合并 → 新写（组合/多事实，不强行并入任意一条防腐蚀既有事实）。
-    全程非破坏：不删除既有记忆。
+    全程非破坏：不删除既有记忆。`config` 仅透传给判定器（O3 观测接线）。
     """
     namespace = (item.user_id, LONG_TERM_NAMESPACE)
     exact, semantic = await store.find_dedup_candidates(item)
@@ -250,7 +280,7 @@ async def _save_deduped(
         else:
             logger.info("无语义候选（embeddings 不可用）→ 退回阈值路径")
         return await store.upsert(item, semantic_threshold=semantic_threshold)
-    verdicts = await judge.judge(item, [m for m, _ in semantic])
+    verdicts = await judge.judge(item, [m for m, _ in semantic], config=config)
     if not verdicts:
         logger.info("判定器返回空（失败/未判定）→ 退回阈值路径")
         return await store.upsert(item, semantic_threshold=semantic_threshold)
@@ -302,10 +332,14 @@ def submit_memory_save(
     dedup: DedupConfig | None = None,
     judge: MemoryRelationJudge | None = None,
     worth: MemoryWorthConfig | None = None,
+    callbacks: Sequence[BaseCallbackHandler] | None = None,
+    metadata: Mapping[str, object] | None = None,
 ) -> None:
     """fire-and-forget 触发带外保存；回答下发后调用一次，同步返回、不阻塞。
 
     `worth` 由装配层从 `cfg.memory.worth` 传入（框架行为项）；缺省用默认值。
+    `callbacks` / `metadata`（O3）由入口层在观测已配置时构造（归因键与对话 trace
+    同值 + 独立 trace 名），经后台任务抵达带外 LLM 调用；未配置时传 None（现状同路）。
     """
     if not messages:
         return
@@ -324,6 +358,8 @@ def submit_memory_save(
             dedup=dedup,
             judge=judge,
             worth=worth,
+            callbacks=callbacks,
+            metadata=metadata,
         )
     )
     _background_tasks.add(task)
@@ -340,6 +376,8 @@ async def _background_persist(
     dedup: DedupConfig | None = None,
     judge: MemoryRelationJudge | None = None,
     worth: MemoryWorthConfig | None = None,
+    callbacks: Sequence[BaseCallbackHandler] | None = None,
+    metadata: Mapping[str, object] | None = None,
 ) -> None:
     """后台任务体：二次兜底，保证任务不带未处理异常退出。
 
@@ -357,6 +395,8 @@ async def _background_persist(
             dedup=dedup,
             judge=judge,
             worth=worth,
+            callbacks=callbacks,
+            metadata=metadata,
         )
     except Exception as exc:
         logger.warning("记忆带外保存任务异常：%s", exc)

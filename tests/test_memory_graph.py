@@ -40,12 +40,16 @@ from tests.conftest import (
 
 
 class _StubExtractor:
-    """固定返回一条抽取结果的 stub 抽取器。"""
+    """固定返回一条抽取结果的 stub 抽取器；记录 config 供透传断言（O3）。"""
 
     def __init__(self, extraction: MemoryExtraction) -> None:
         self._extraction = extraction
+        self.configs: list[dict | None] = []
 
-    async def extract(self, messages: Sequence[BaseMessage]) -> list[MemoryExtraction]:
+    async def extract(
+        self, messages: Sequence[BaseMessage], *, config: dict | None = None
+    ) -> list[MemoryExtraction]:
+        self.configs.append(config)
         return [self._extraction]
 
 
