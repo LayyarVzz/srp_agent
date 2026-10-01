@@ -369,6 +369,8 @@ def test_prompt_keeps_hard_case_boundaries() -> None:
         "explicit",  # 显式记住旁路
         "worth_score",  # 值得性字段
         "一句话（≤30 字）说明判定依据，禁止重复展开",  # O7：worth_reason 篇幅硬约束
+        "不得把 identity / plan 这类 category 值填进 kind",  # kind/category 两字段区分（防误导）
+        "每条记忆输出完所有字段后立即结束输出",  # 输出即止（防尾部回声循环撑爆截断）
     ):
         assert marker in EXTRACT_PROMPT, f"提示词缺少关键分界/字段：{marker}"
 
