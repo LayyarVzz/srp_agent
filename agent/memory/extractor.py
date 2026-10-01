@@ -186,8 +186,9 @@ class MemoryExtractor:
             logger.warning("记忆抽取失败：%s", exc)
             return []
         if result is None:
-            # 无工具调用时 with_structured_output 返回 None 而非抛错，必须显式守卫。
-            logger.warning("记忆抽取返回空结果（模型未产出工具调用），跳过本轮")
+            # 无有效结构化产出：模型未产出工具调用，或参数被截断且修复失败（llm 层已兜底一次）。
+            # 必须显式守卫——with_structured_output 对无产出返回 None 而非抛错。
+            logger.warning("记忆抽取无有效结构化产出（未产出工具调用或截断后无法修复），跳过本轮")
             return []
         if result.rejected_count:
             # 模型自报的拒收统计：仅作提示词漂移观测（与写入侧 should_keep 的实际丢弃

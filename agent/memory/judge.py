@@ -126,7 +126,7 @@ class MemoryRelationJudge:
             return []
         if result is None:
             # 无工具调用时 with_structured_output 返回 None 而非抛错，必须显式守卫。
-            logger.warning("记忆合并判定返回空结果（模型未产出工具调用），跳过本轮判定")
+            logger.warning("记忆合并判定无有效结构化产出（未产出工具调用或截断后无法修复），跳过本轮判定")
             return []
         verdicts = self._validate(result.verdicts, len(candidates))
         logger.info(
