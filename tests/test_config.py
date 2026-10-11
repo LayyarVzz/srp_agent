@@ -61,22 +61,56 @@ def test_explicit_override_wins_over_preset() -> None:
     assert cfg.effective_model == "llama3"
 
 
-def test_structured_extra_body_deepseek_v4() -> None:
-    """DeepSeek V4 需关闭思考模式：结构化输出请求附加 thinking=disabled。"""
+def test_structured_extra_body_auto_sends_both_flavors() -> None:
+    """默认 auto：两套口径**同时**下发，换取跨端点最广兼容。
+
+    WHY 不是按 provider/模型名挑一种（旧行为）：托管平台与口径**不同源** ——
+    实测阿里云 MaaS 上跑的 `deepseek-v4.1-flash` 由 DashScope 兼容层解析，
+    按模型名猜必然猜错一侧；而各端点会忽略自己不认识的字段，故「都发」最稳。
+    """
     cfg = LLMConfig(provider=LLMProvider.DEEPSEEK, api_key=SecretStr("sk-x"))
+    assert cfg.structured_extra_body == {
+        "enable_thinking": False,
+        "thinking": {"type": "disabled"},
+    }
+
+
+def test_structured_extra_body_provider_independent() -> None:
+    """Qwen 同样收到两套口径（provider 不再决定字段选择，仅决定端点预设）。"""
+    cfg = LLMConfig(provider=LLMProvider.QWEN, api_key=SecretStr("sk-x"))
+    assert cfg.structured_extra_body == {
+        "enable_thinking": False,
+        "thinking": {"type": "disabled"},
+    }
+
+
+def test_structured_extra_body_model_name_independent() -> None:
+    """模型名不再参与判据：非 V4 名字（deepseek-chat）也照发两套口径。"""
+    cfg = LLMConfig(provider=LLMProvider.DEEPSEEK, api_key=SecretStr("sk-x"), model="deepseek-chat")
+    assert cfg.structured_extra_body == {
+        "enable_thinking": False,
+        "thinking": {"type": "disabled"},
+    }
+
+
+def test_structured_extra_body_narrowed_to_deepseek_flavor() -> None:
+    """确知端点只认 DeepSeek 口径时，可用 thinking_param 收窄为单一口径。"""
+    cfg = LLMConfig(
+        provider=LLMProvider.DEEPSEEK,
+        api_key=SecretStr("sk-x"),
+        thinking_param="thinking",
+    )
     assert cfg.structured_extra_body == {"thinking": {"type": "disabled"}}
 
 
-def test_structured_extra_body_qwen_none() -> None:
-    """Qwen 不识别 thinking 参数：一律不附加 extra_body。"""
-    cfg = LLMConfig(provider=LLMProvider.QWEN, api_key=SecretStr("sk-x"))
-    assert cfg.structured_extra_body is None
-
-
-def test_structured_extra_body_non_v4_none() -> None:
-    """非 V4 模型（deepseek-chat 等）无思考模式限制：不附加 extra_body。"""
-    cfg = LLMConfig(provider=LLMProvider.DEEPSEEK, api_key=SecretStr("sk-x"), model="deepseek-chat")
-    assert cfg.structured_extra_body is None
+def test_structured_extra_body_narrowed_to_qwen_flavor() -> None:
+    """确知端点只认 Qwen/DashScope 口径时，收窄为 enable_thinking。"""
+    cfg = LLMConfig(
+        provider=LLMProvider.QWEN,
+        api_key=SecretStr("sk-x"),
+        thinking_param="enable_thinking",
+    )
+    assert cfg.structured_extra_body == {"enable_thinking": False}
 
 
 def test_structured_extra_body_disabled_flag() -> None:
