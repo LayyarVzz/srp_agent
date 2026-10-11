@@ -203,3 +203,15 @@ def test_worth_config_validation() -> None:
         MemoryWorthConfig(min_worth_score=-0.1)
     with pytest.raises(ValidationError):
         MemoryWorthConfig(memories_max_per_turn=0)
+
+
+def test_extraction_kind_content_not_required() -> None:
+    """O7-F2：kind/content 不设 required（缺字段不再让整批 memories 校验失败）。
+
+    降级默认 kind="fact"（规范三类、召回可达）、content=""（被 should_keep 空白守卫
+    丢弃，语义安全）；「宁漏不误丢」：单条脏字段不连坐同批好内容。
+    """
+    e = MemoryExtraction()
+    assert e.kind == "fact"
+    assert e.content == ""
+    assert should_keep(e, cfg=MemoryWorthConfig()) is False  # 空 content 不落库

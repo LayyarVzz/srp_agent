@@ -97,8 +97,13 @@ class MemoryExtraction(BaseModel):
     保证既有调用方（stub 抽取器、离线测试、历史数据）零改动、零回归。
     """
 
-    kind: str  # fact / episode / preference（召回端未知值归入 other 组）
-    content: str
+    # kind / content 不设 required（O7-F2，对齐 commit 9742db8「模型可能省略的字段
+    # 不设 required」范式）：required 缺失会让**整批** memories 校验失败被丢弃——
+    # 与 O7 弃选的「schema 硬校验」同病，代价是误杀同批好内容。
+    # 语义安全性：空 content 已被 persist.should_keep 的空白守卫丢弃；
+    # 非规范 kind 在写入单点按 category 归一（persist._normalize_kind，召回可达）。
+    kind: str = "fact"  # fact / episode / preference（召回端未知值归入 other 组）
+    content: str = ""
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
     # —— v6.0 值得性判定（写入侧元数据，不落 MemoryItem）——
     worth_score: float = Field(default=1.0, ge=0.0, le=1.0)  # 值得长期记住的程度

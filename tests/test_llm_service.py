@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.messages.tool import ToolCallChunk
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 
 from agent.core.config import LLMConfig, LLMProvider
 from agent.errors import LLM_ERROR_AUTH, LLM_ERROR_REQUEST, LLMError
@@ -94,8 +94,8 @@ async def test_ainvoke_structured_forwards_config() -> None:
     cfg = LLMConfig(api_key=SecretStr("sk-x"))
     expected = DemoIntent(intent="chat", confidence=0.9, reason="test")
     service = LLMService(config=cfg, chat_model=_fake_tool_model(expected))
-    spy = _SpyStructured(expected)
-    service.structured_model = lambda _schema: spy  # type: ignore[method-assign]
+    spy = _SpyStructured({"raw": None, "parsed": expected, "parsing_error": None})
+    service.structured_model = lambda _schema, **_: spy  # type: ignore[method-assign]
     config: dict[str, Any] = {"callbacks": [], "metadata": {"langfuse_session_id": "s1"}}
     assert await service.ainvoke_structured(DemoIntent, "hi", config=config) is expected
     assert spy.seen == {"prompt": "hi", "config": config}
@@ -106,8 +106,8 @@ async def test_ainvoke_structured_default_config_is_none() -> None:
     cfg = LLMConfig(api_key=SecretStr("sk-x"))
     expected = DemoIntent(intent="chat", confidence=0.9, reason="test")
     service = LLMService(config=cfg, chat_model=_fake_tool_model(expected))
-    spy = _SpyStructured(expected)
-    service.structured_model = lambda _schema: spy  # type: ignore[method-assign]
+    spy = _SpyStructured({"raw": None, "parsed": expected, "parsing_error": None})
+    service.structured_model = lambda _schema, **_: spy  # type: ignore[method-assign]
     await service.ainvoke_structured(DemoIntent, "hi")
     assert spy.seen == {"prompt": "hi", "config": None}
 
@@ -337,3 +337,91 @@ async def test_ainvoke_tools_error_normalized() -> None:
     with pytest.raises(LLMError) as exc:
         await service.ainvoke_tools([make_fake_tool("calc")], "hi")
     assert exc.value.code == LLM_ERROR_REQUEST
+
+
+# —— 截断修复（宁漏不误丢的解析侧兜底）：max_tokens 截断的 tool call 参数不再静默丢 ——
+
+
+class DemoItem(BaseModel):
+    content: str = ""
+    category: str = ""
+    worth_reason: str = ""
+
+
+class DemoResult(BaseModel):
+    memories: list[DemoItem] = Field(default_factory=list)
+
+
+def _fake_invalid_tool_call_model(args_text: str) -> _StructuredFakeModel:
+    """构造 tool_call 参数非法（被截断）的 AIMessage：langchain 会归入 invalid_tool_calls。"""
+    msg = AIMessage(
+        content="",
+        invalid_tool_calls=[
+            {
+                "name": "DemoResult",
+                "args": args_text,
+                "id": "call_x",
+                "error": "arguments are not valid JSON",
+            }
+        ],
+    )
+    return _StructuredFakeModel(messages=iter([msg]))
+
+
+async def test_ainvoke_structured_repairs_truncated_args() -> None:
+    """参数 JSON 被截断（字符串未闭合 + 括号未配平）→ 修复后重验 schema，产出不丢。
+
+    复现生产故障：模型在 worth_reason 写完合规短句后滑入换行回声循环，
+    直至 max_tokens 截断 —— 已完整产出的 content/category 随整条 tool call 被丢弃。
+    """
+    truncated = (
+        '{"memories": [{"content": "用户是一名程序员。", "category": "identity", '
+        '"worth_reason": "用户自述职业，稳定身份事实。\n\n\n\n\n'
+    )
+    cfg = LLMConfig(api_key=SecretStr("sk-x"))
+    service = LLMService(config=cfg, chat_model=_fake_invalid_tool_call_model(truncated))
+    result = await service.ainvoke_structured(DemoResult, "hi")
+
+    assert result is not None
+    assert result.memories[0].content == "用户是一名程序员。"
+    assert result.memories[0].category == "identity"
+    # EOF 补收尾引号：字段已写出的部分全部保住（含已输出的换行）。
+    assert result.memories[0].worth_reason == "用户自述职业，稳定身份事实。" + "\n" * 5
+
+
+async def test_ainvoke_structured_repairs_truncated_args_keeps_raw_newlines() -> None:
+    """截断点之前的完整字符串值若含裸控制字符（模型未转义的换行）→ strict=False 口径可解析。"""
+    truncated = (
+        '{"memories": [{"content": "第一行\n第二行", '
+        '"worth_reason": "依据\n\n\n\n\n'
+    )
+    cfg = LLMConfig(api_key=SecretStr("sk-x"))
+    service = LLMService(config=cfg, chat_model=_fake_invalid_tool_call_model(truncated))
+    result = await service.ainvoke_structured(DemoResult, "hi")
+
+    assert result is not None
+    assert result.memories[0].content == "第一行\n第二行"
+    assert result.memories[0].worth_reason == "依据" + "\n" * 5
+
+
+async def test_ainvoke_structured_unrepairable_args_returns_none() -> None:
+    """参数完全无法修复（无任何完整闭合边界）→ 返回 None（与现状同语义）。"""
+    cfg = LLMConfig(api_key=SecretStr("sk-x"))
+    service = LLMService(config=cfg, chat_model=_fake_invalid_tool_call_model('{"memories": ['))
+    assert await service.ainvoke_structured(DemoResult, "hi") is None
+
+
+def test_repair_truncated_json_multivalue_tail_salvages_prefix() -> None:
+    """多条记忆中第二条被截断 → 保留完整的第一条（部分抢救优于整体丢弃）。"""
+    from agent.llm import _repair_truncated_json
+
+    truncated = (
+        '{"memories": [{"content": "第一条", "worth_reason": "a"}, '
+        '{"content": "第二条", "worth_reason": "b'
+    )
+    repaired = _repair_truncated_json(truncated)
+    assert repaired is not None
+    parsed = DemoResult.model_validate_json(repaired)
+    # 第二条的 worth_reason 值已完整写出（仅缺收尾引号）→ 两条都保住（宁多勿丢）。
+    assert [m.content for m in parsed.memories] == ["第一条", "第二条"]
+    assert parsed.memories[1].worth_reason == "b"

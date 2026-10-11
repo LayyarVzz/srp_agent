@@ -7,16 +7,17 @@ Provider 无关：经 langchain-openai 的 ChatOpenAI 包装任意 OpenAI 兼容
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agent.core.config import LLMConfig
 from agent.errors import (
@@ -29,6 +30,124 @@ from agent.errors import (
 logger = logging.getLogger(__name__)
 
 _S = TypeVar("_S", bound=BaseModel)
+
+
+def _repair_truncated_json(text: str) -> str | None:
+    """把被截断的 JSON 参数补全为可解析字符串（尽力而为，纯函数）。
+
+    策略：从「最后一个可能完整闭合的位置」（字符串收尾引号或右括号）向前尝试；
+    若截断发生在字符串值内部（回声循环的常态），EOF 处补收尾引号也是候选 ——
+    保住该字段已写出的部分。越靠后的候选保住的字段越多（宁多勿丢），
+    结构不完整的候选在 JSON 校验时自然失败被跳过。
+    解析用 `strict=False`（与 provider 侧参数解析同口径，容忍字符串内裸控制字符）。
+    """
+    if not text or not text.strip():
+        return None
+    candidates: list[int] = []
+    stack: list[str] = []
+    in_string = escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+                candidates.append(i)
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch in "{[":
+                stack.append(ch)
+            elif ch in "}]" and stack:
+                stack.pop()
+                candidates.append(i)
+    if in_string:
+        # 字符串被截断未闭合：EOF 处补收尾引号也是候选（第一个尝试，保住字段已写出的部分）。
+        candidates.append(len(text) - 1)
+    for cut in reversed(candidates):
+        candidate = _balanced_json(text[: cut + 1])
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _balanced_json(prefix: str) -> str | None:
+    """把 JSON 前缀补全为可解析字符串；失败 → None。
+
+    三步：① 字符串内的裸控制字符（回声循环常见的未转义换行等）转义为合法转义序列
+    —— pydantic 的 JSON 校验是严格模式，raw 控制字符会让重验失败；
+    ② 未终止的字符串补收尾引号（悬空反斜杠会转义补上的引号，奇数个则去掉一个）；
+    ③ 配平未闭合括号。
+    """
+    out: list[str] = []
+    stack: list[str] = []
+    in_string = escape = False
+    for ch in prefix:
+        if in_string:
+            if escape:
+                escape = False
+                out.append(ch)
+            elif ch == "\\":
+                escape = True
+                out.append(ch)
+            elif ch == '"':
+                in_string = False
+                out.append(ch)
+            elif ord(ch) < 0x20:
+                out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(ch, f"\\u{ord(ch):04x}"))
+            else:
+                out.append(ch)
+        else:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            elif ch in "{[":
+                stack.append(ch)
+            elif ch in "}]" and stack:
+                stack.pop()
+    if in_string:
+        if escape:
+            out = out[:-1]  # 末尾是悬空反斜杠：去掉它，避免转义补上的收尾引号
+        out.append('"')
+    out.extend("}" if c == "{" else "]" for c in reversed(stack))
+    candidate = "".join(out)
+    try:
+        json.loads(candidate, strict=False)
+        return candidate
+    except ValueError:
+        return None
+
+
+def _salvage_truncated_args[S: BaseModel](
+    raw: BaseMessage | None, schema: type[S]
+) -> S | None:
+    """从被截断的 tool_call 参数中抢救结构化输出（宁漏不误丢的解析侧兜底）。
+
+    触发场景（实测）：模型在某个字符串字段写完后滑入回声循环（连发换行/重复句），
+    直至 max_tokens 截断 —— `arguments` JSON 结构不完整（字符串未闭合、括号未配平），
+    langchain 把该 tool call 归入 `invalid_tool_calls`，结构化解析**整体返回 None**，
+    已完整产出的字段（如 content/category）随之静默丢失。
+
+    修复：对原始 arguments 串做 `_repair_truncated_json` 后用 schema 重验；
+    重验通过 → 返回实例（缺失字段由 schema 默认值兜底）；无原始消息 / 无可修复参数 /
+    修复后校验失败 → None（与现状同语义，由调用方守卫）。
+    """
+    if not isinstance(raw, BaseMessage):
+        return None
+    for invalid in getattr(raw, "invalid_tool_calls", None) or []:
+        args_text = invalid.get("args") if isinstance(invalid, dict) else None
+        if not args_text or not isinstance(args_text, str):
+            continue
+        repaired = _repair_truncated_json(args_text)
+        if repaired is None:
+            continue
+        try:
+            return schema.model_validate_json(repaired)
+        except ValidationError:
+            continue
+    return None
 
 
 def merge_ai_message_chunks(chunks: Sequence[AIMessageChunk]) -> AIMessage:
@@ -109,7 +228,8 @@ class LLMService:
         schema: type[_S],
         *,
         method: Literal["function_calling", "json_mode", "json_schema"] | None = None,
-    ) -> Runnable[..., _S]:
+        include_raw: bool = False,
+    ) -> Runnable[..., Any]:
         """把 schema 绑定为工具调用，返回可解析出 schema 实例的 Runnable。
 
         WHY 默认 method=function_calling：
@@ -118,11 +238,17 @@ class LLMService:
         - DashScope 兼容模式同样走 tool-calling；
         - function_calling 是 DeepSeek / Qwen / 任意兼容端点最广的公共能力。
         不要传 strict=True（DeepSeek 不支持强制 JSON Schema）。
+
+        `include_raw=True`：返回 `{"raw": AIMessage, "parsed": _S | None,
+        "parsing_error": ...}` —— 截断修复路径需要原始消息里的 invalid_tool_calls
+        （仅解析后的形态拿不到原始参数，无法抢救被截断的输出）。
         """
         effective_method = method or self._config.structured_method
         # chat_model 已在懒构造时统一关闭思考（structured_extra_body），直接复用即可，
         # 无需再构造带 extra_body 的专用模型。
-        return self.chat_model.with_structured_output(schema, method=effective_method)
+        return self.chat_model.with_structured_output(
+            schema, method=effective_method, include_raw=include_raw
+        )
 
     def tool_model(self, tools: Sequence[BaseTool]) -> Runnable:
         """把工具列表绑定到模型，返回可产出 `AIMessage.tool_calls` 的 Runnable。
@@ -174,8 +300,17 @@ class LLMService:
         prompt: str | Sequence,
         *,
         config: RunnableConfig | None = None,
-    ) -> _S:
+    ) -> _S | None:
         """一次结构化输出调用；任何失败归一化为 LLMError(llm_error.request)。
+
+        返回 None 的语义：模型未产出有效结构化产出（无工具调用，或参数被截断
+        且修复失败）——调用方（意图/改写/抽取/判重等）一律按「无产出」守卫。
+
+        截断修复：模型在字符串字段滑入回声循环直至 max_tokens 截断时，tool call
+        参数 JSON 不完整，langchain 把它归入 invalid_tool_calls、解析整体返回 None，
+        已完整产出的字段会静默丢失。此处对原始参数做括号配平修复后重验 schema
+        （`_salvage_truncated_args`），救回即返回实例（带 warning 可观测）；救不回
+        才返回 None。解析成功的主路径与修复前的行为逐字一致。
 
         `config` 透传给底层结构化 Runnable（默认 None，与不传逐字同路，现有调用方零改动）：
         图内调用靠 langchain 回调上下文继承观测 handler；带外路径（记忆抽取/判重）的
@@ -183,10 +318,25 @@ class LLMService:
         必须经此显式传 config 才能挂上回调被 Langfuse 跟踪（O3）。
         """
         try:
-            return await self.structured_model(schema).ainvoke(prompt, config=config)
+            bundle = await self.structured_model(schema, include_raw=True).ainvoke(
+                prompt, config=config
+            )
         except Exception as exc:
             logger.warning("结构化输出调用失败: %s", exc)
             raise LLMError(LLM_ERROR_REQUEST, f"LLM 结构化输出调用失败: {exc}") from exc
+        if not isinstance(bundle, dict):
+            return None
+        parsed = bundle.get("parsed")
+        if parsed is not None:
+            return parsed
+        salvaged = _salvage_truncated_args(bundle.get("raw"), schema)
+        if salvaged is not None:
+            logger.warning(
+                "结构化输出参数不完整（疑似 max_tokens 截断/回声循环），已修复解析：%s",
+                schema.__name__,
+            )
+            return salvaged
+        return None
 
     async def astream_text(self, prompt: str | Sequence) -> AsyncIterator[str]:
         """流式文本补全：逐增量产出回答文本片段（provider 真流式）。

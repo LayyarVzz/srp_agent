@@ -361,11 +361,16 @@ def test_prompt_keeps_hard_case_boundaries() -> None:
 
     for marker in (
         "我是一个程序员",  # 保留（关于用户）
+        "我是一名程序员，下周三要去广州出差，需要带什么",  # 多意图轮同构示例（O5-F2）
+        "逐条独立抽取",  # 多意图轮指引（O5-F2：不得因提问结尾漏抽身份/计划）
         "程序员是什么",  # 拒收（关于世界）
         "投影仪是一种显示设备",  # 拒收（助手补的背景）
         "用户对电子产品有消费意愿",  # 拒收（推导品）
         "explicit",  # 显式记住旁路
         "worth_score",  # 值得性字段
+        "一句话（≤30 字）说明判定依据，禁止重复展开",  # O7：worth_reason 篇幅硬约束
+        "不得把 identity / plan 这类 category 值填进 kind",  # kind/category 两字段区分（防误导）
+        "每条记忆输出完所有字段后立即结束输出",  # 输出即止（防尾部回声循环撑爆截断）
     ):
         assert marker in EXTRACT_PROMPT, f"提示词缺少关键分界/字段：{marker}"
 

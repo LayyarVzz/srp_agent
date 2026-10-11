@@ -263,3 +263,12 @@ async def test_build_prompt_injection_order(make_llm_service, run_graph) -> None
     rest = last[len(sys_parts) :]
     assert isinstance(rest[-1], HumanMessage)
     assert rest[-1].content == "第3问"
+
+
+def test_summary_keyfacts_headers_are_first_party() -> None:
+    """O2 措辞不变量：摘要/关键信息是本会话第一方压缩物，不再声明「不可信」。"""
+    assert "本会话历史压缩" in _SUMMARY_HEADER
+    assert "仅作参考" in _SUMMARY_HEADER
+    assert "不可信" not in _SUMMARY_HEADER
+    assert "本会话历史压缩" in _KEYFACTS_HEADER
+    assert "不可信" not in _KEYFACTS_HEADER

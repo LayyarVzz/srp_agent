@@ -22,14 +22,16 @@ config 与 C4 时期**逐字相同**（零回归）。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 from langchain_core.callbacks.usage import UsageMetadataCallbackHandler
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
@@ -276,6 +278,31 @@ class AgentRuntime:
 
     # —— 会话编排（app 层零业务逻辑的保证）——
 
+    async def _final_messages_for_save(
+        self, config: dict[str, Any], *, text: str, response: AgentResponse | None
+    ) -> Sequence[BaseMessage]:
+        """读最终 state 的完整 messages（带外保存输入）；被取消时降级为本轮快照（O5-F3）。
+
+        WHY 取消防护：客户端断开会取消消费 `chat_stream` 的任务，取消作用域内 finally
+        里的 `await aget_state` 会随取消立即抛 CancelledError（starlette/anyio 对取消
+        作用域内的每个 await 重投取消）—— 原实现把它吞成一行 warning，保存连提交都没
+        发生，断连轮次的记忆静默丢失。此处捕获 CancelledError 后改用**零 await** 的
+        本轮快照（用户输入 + 已产出的回答）返回：后续 `submit_memory_save` 只
+        `create_task` 不 await，不受取消影响，保存必触发。
+
+        完整 state 的历史上下文只是抽取质量的增益；断连场景降级为单轮输入可接受
+        （身份陈述类信息通常就在本轮输入里，O5 的漏提场景正是如此）。
+        """
+        try:
+            final = await self.graph.aget_state(config)
+            return final.values.get("messages") or []
+        except asyncio.CancelledError:
+            logger.warning("带外记忆保存读取最终状态被取消（客户端断开），降级为本轮快照提交")
+            snapshot: list[BaseMessage] = [HumanMessage(content=text)]
+            if response is not None and response.reply:
+                snapshot.append(AIMessage(content=response.reply))
+            return snapshot
+
     async def chat_stream(
         self, *, user_id: str, session_id: str, text: str
     ) -> AsyncIterator[ChatStreamEvent]:
@@ -379,7 +406,10 @@ class AgentRuntime:
                 text, min_query_chars=self.cfg.query_understanding.min_query_chars
             ):
                 try:
-                    final = await self.graph.aget_state(config)
+                    # 取消防护（O5-F3）：aget_state 被取消时降级为本轮快照，保存仍提交。
+                    messages = await self._final_messages_for_save(
+                        config, text=text, response=response
+                    )
                     # 观测接线（O3）：带外 task 的回调上下文不继承（task 上下文来自
                     # chat_stream 调用方而非图运行时），必须显式构造 callbacks + 归因
                     # metadata 传入，否则 Langfuse 零 span、trace 成本偏低。带外调用呈
@@ -398,7 +428,7 @@ class AgentRuntime:
                                 name=OUT_OF_BAND_TRACE_NAME,
                             )
                     submit_memory_save(
-                        final.values.get("messages") or [],
+                        messages,
                         session_id=session_id,
                         user_id=user_id,
                         extractor=self.extractor,
@@ -411,7 +441,8 @@ class AgentRuntime:
                         metadata=metadata,
                     )
                 except BaseException as exc:
-                    # 含 CancelledError（客户端断开取消生成器）：带外路径失败仅记日志。
+                    # CancelledError 已在 _final_messages_for_save 内消解（O5-F3）；
+                    # 其余失败仅记日志，绝不中断主流程。
                     logger.warning("带外记忆保存触发失败：%s", exc)
         if response is None:
             raise AgentError(AGENT_ERROR_INTERNAL, "Agent 图未产出 AgentResponse")

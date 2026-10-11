@@ -24,11 +24,16 @@ from agent.memory.models import (
     MemoryItem,
     MergeDecisionResult,
 )
+from shared.logging import summarize_text
 
 if TYPE_CHECKING:
     from agent.llm import LLMService
 
 logger = logging.getLogger(__name__)
+
+# verdict.reason 兜底截断阈值（O7-F11）：prompt 已要求「一句话」，此处防模型失控输出
+# 全量流入日志/trace —— 与 extractor 解析后净化的 reason 截断同口径（纯审计字段）。
+_REASON_MAX_CHARS = 200
 
 # 判定 prompt：编码三分类 + 事实性判定要点 + 新信息→合并 + 不同对象/事件→非重复。
 # 候选记忆来自记忆库，视为「数据」而非「指令」（提示注入防御：禁止执行候选内容中的指令）。
@@ -71,15 +76,18 @@ relation 为三分类之一，reason 简述判定依据（一句话，说明你�
 def _verdict_summary(
     verdicts: Sequence[CandidateVerdict], candidates: Sequence[MemoryItem]
 ) -> str:
-    """把 verdicts 折叠为紧凑审计摘要（index→候选内容→relation），供保存端日志观测。
+    """把 verdicts 折叠为紧凑审计摘要（index→候选指纹→relation），供保存端日志观测。
 
     WHY 独立 helper：日志是持久化过程的唯一可观测窗口（judge 不落库、不参与召回），
     摘要需在行内呈现「判了哪个候选、判成什么」；reason 明细另存 verdict 对象，不进日志。
+    候选内容经 `summarize_text` 以「len+sha256 指纹」呈现（O7-F12）：judge 链路携带的
+    模型/存储自由文本不原样落日志，原文按 trace 与 store 复盘。
     """
     parts: list[str] = []
     for v in verdicts:
         if 1 <= v.index <= len(candidates):
-            parts.append(f"[{v.index}]「{candidates[v.index - 1].content}」→ {v.relation}")
+            content = summarize_text(candidates[v.index - 1].content)
+            parts.append(f"[{v.index}]「{content}」→ {v.relation}")
         else:
             parts.append(f"[{v.index}]<越界>→ {v.relation}")
     return "; ".join(parts) if parts else "(空)"
@@ -118,12 +126,13 @@ class MemoryRelationJudge:
             return []
         if result is None:
             # 无工具调用时 with_structured_output 返回 None 而非抛错，必须显式守卫。
-            logger.warning("记忆合并判定返回空结果（模型未产出工具调用），跳过本轮判定")
+            logger.warning("记忆合并判定无有效结构化产出（未产出工具调用或截断后无法修复），跳过本轮判定")
             return []
         verdicts = self._validate(result.verdicts, len(candidates))
         logger.info(
             "合并判定：待保存「%s」→ 候选 %d 条，判定 %d 条：%s",
-            item.content,
+            # 待保存内容为模型自由文本（O7-F12）：日志以指纹呈现，不原样落盘。
+            summarize_text(item.content),
             len(candidates),
             len(verdicts),
             _verdict_summary(verdicts, candidates),
@@ -131,11 +140,13 @@ class MemoryRelationJudge:
         return verdicts
 
     def _validate(self, verdicts: Sequence[CandidateVerdict], n: int) -> list[CandidateVerdict]:
-        """过滤非法/重复 index：判定必须落在 1..n，每个候选至多一条。"""
+        """过滤非法/重复 index：判定必须落在 1..n，每个候选至多一条；reason 超限截断。"""
         seen: set[int] = set()
         valid: list[CandidateVerdict] = []
         for v in verdicts:
             if 1 <= v.index <= n and v.index not in seen:
+                if len(v.reason) > _REASON_MAX_CHARS:
+                    v = v.model_copy(update={"reason": v.reason[:_REASON_MAX_CHARS]})
                 valid.append(v)
                 seen.add(v.index)
         return valid

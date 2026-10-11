@@ -21,7 +21,7 @@ from agent.memory import (
     submit_memory_save,
     wait_pending_saves,
 )
-from agent.memory.models import MemoryExtraction
+from agent.memory.models import KEEP_PREFERENCE, MemoryExtraction
 from agent.memory.persist import _background_tasks
 
 
@@ -132,10 +132,15 @@ async def test_save_conversation_memory_single_failure_continues() -> None:
     assert [m.content for m in result.items] == ["成功条目"]
 
 
-async def test_save_conversation_memory_unknown_kind_kept() -> None:
-    """未知 kind（模型漂移）条目原样保存、不抛（召回端归入 other 组仍可达）。"""
+async def test_save_conversation_memory_unknown_kind_normalized() -> None:
+    """未知 kind（模型漂移）按 category 归一后落库，不抛、不丢内容（O5-F1）。
+
+    WHY 不再原样保存：召回只请求 fact/episode/preference，未知 kind 条目是
+    「存了但永远召不回」的死数据；归一化只改落库标签、不新增丢弃路径（宁漏不误丢）。
+    """
     store = MemoryStore(InMemoryStore())
     extractor = _StubExtractor(
+        # category 缺省为 identity（保留类别）→ 应归一为 fact。
         [MemoryExtraction(kind="profile", content="漂移数据", importance=0.5)]
     )
     await save_conversation_memory(
@@ -148,7 +153,37 @@ async def test_save_conversation_memory_unknown_kind_kept() -> None:
 
     result = await store.recall(user_id="u1")
     assert len(result.items) == 1
-    assert result.items[0].kind == "profile"
+    assert result.items[0].kind == KIND_FACT
+    assert result.items[0].content == "漂移数据"
+    # 归一化后条目可被既有召回请求（kinds=[fact, episode]，graph.recall_memory 同参）命中。
+    result = await store.recall(user_id="u1", kinds=[KIND_FACT])
+    assert [m.content for m in result.items] == ["漂移数据"]
+
+
+async def test_save_conversation_memory_kind_normalized_by_category() -> None:
+    """模型把 kind 填成 category 值（identity）时，按 category=preference 归一（O5-F1）。"""
+    store = MemoryStore(InMemoryStore())
+    extractor = _StubExtractor(
+        [
+            MemoryExtraction(
+                kind="identity",
+                content="用户偏好简洁回答",
+                category=KEEP_PREFERENCE,
+                importance=0.9,
+            )
+        ]
+    )
+    await save_conversation_memory(
+        [HumanMessage(content="我喜欢简洁回答")],
+        session_id="s1",
+        user_id="u1",
+        extractor=extractor,
+        store=store,
+    )
+
+    # 归一为 preference 后可被身份预加载的定向召回（kinds=[preference]）命中。
+    result = await store.recall(user_id="u1", kinds=[KIND_PREFERENCE])
+    assert [m.content for m in result.items] == ["用户偏好简洁回答"]
 
 
 async def test_submit_memory_save_fire_and_forget() -> None:
