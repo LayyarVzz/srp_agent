@@ -13,6 +13,7 @@ import json
 import re
 import sys
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -35,6 +36,7 @@ from agent.response.models import AgentResponse
 from agent.runtime import AgentRuntime
 from agent.session import build_session_backend
 from app.main import create_app
+from settings import get_settings
 from shared.events_sink import EventStoreSink
 from shared.events_store import build_event_repository
 from shared.logging import listener_count, unsubscribe_events
@@ -58,6 +60,46 @@ def _no_event_listener_leak() -> Any:
     yield
     leaked = listener_count() - before
     assert leaked <= 0, f"事件监听器泄漏：用例结束时多出 {leaked} 个订阅（未 unsubscribe）"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """把工作目录切到临时目录并放一个**空 `.env`**，使 `RuntimeSettings()` /
+    `A2AMCPRuntimeSettings()` 读不到开发者本机的 `.env`。
+
+    WHY 必须隔离（可靠性硬要求，非洁癖）：两个 settings 类都是
+    `SettingsConfigDict(env_file=".env")`，而 `env_file` 是**相对当前工作目录**解析的。
+    开发机上的 `.env` 属于运行期配置（`LOG_FORMAT=json` 会改日志形态、`A2A_MCP_AGENTS`
+    会改远端注册表、`DATABASE_URL` 会改后端选择），它一旦被测试读到：
+
+    - 断言「默认值」的用例（如 `A2AMCPRuntimeSettings().a2a_mcp_agents == {}`）会随
+      开发机配置红掉 —— 测试结果取决于谁在什么机器上跑，等于没有测试；
+    - 断言「text 形态带 `trace=` 前缀」的用例会在 `LOG_FORMAT=json` 下必失败。
+
+    实测（本机 `.env` 含 `LOG_FORMAT=json` 与 `A2A_MCP_AGENTS`）：不隔离时 14 个失败，
+    隔离后仅剩与 `.env` 无关的真实失败。
+
+    WHY 用「切目录 + 空 `.env`」而不是「删掉 `.env`」或设 `_env_file=None`：
+    前者会动到仓库文件（测试有副作用），后者要逐个 settings 调用点改（散落且易漏）。
+    切 cwd 是**唯一一处**收口，且放空文件可覆盖「pydantic 已缓存/找不到文件」的分支差异。
+
+    WHY 还必须清 `get_settings` 的 lru_cache：`RuntimeSettings()` 是**即时**读 cwd 的，
+    但 `settings.get_settings()` 是 `@lru_cache(maxsize=1)` 单例，而 `app.main` 在**模块
+    导入期**（收集阶段、cwd 仍是仓库根）就调用过它 —— 只切目录会让那个陈旧实例继续生效，
+    表现为「`RuntimeSettings().log_format == 'text'` 但 `get_settings().log_format == 'json'`」
+    这种自相矛盾的状态，测出来的仍是开发机 `.env`。清缓存后两者同源。
+
+    WHY 必须与 `tmp_path` 配对：仓库根的相对路径访问（若有）会因此在用例里失效 ——
+    这恰是想要的显式化：需要仓库文件的测试应经 `Path(__file__).parents[1]` 取绝对路径
+    （MCP stdio 连接配置即如此），而不是依赖「碰巧在仓库根运行」。
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    # 导入期缓存的实例属于「仓库根 + 开发机 .env」，必须先丢弃（见上 WHY）。
+    get_settings.cache_clear()
+    yield
+    # 收尾再清一次：把缓存重置为「未加载」，下一个用例的夹具会重新按自己的 cwd 加载。
+    get_settings.cache_clear()
 
 
 # fake 自报的模型名：`UsageMetadataCallbackHandler` 以 `response_metadata["model_name"]`
