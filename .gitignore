@@ -40,5 +40,5 @@ logs/
 # 属于**运行结果**而非源码；趋势对比靠本地历史文件，不入库）
 eval_reports/
 
-/scripts
-/tests
+# /scripts
+# /tests

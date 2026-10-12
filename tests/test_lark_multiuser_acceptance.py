@@ -52,7 +52,7 @@ from shared.lark import (
     build_lark_binding_repository,
     build_token_cipher,
 )
-from shared.lark.oauth import PATH_DEVICE_AUTHORIZATION, PATH_TOKEN_ENDPOINT
+from shared.lark.oauth import DEVICE_CODE_GRANT_TYPE, PATH_DEVICE_AUTHORIZATION, PATH_TOKEN_ENDPOINT
 
 APP_ID = "cli_acceptance_app"
 APP_SECRET = "acceptance-secret"
@@ -135,9 +135,13 @@ def _oauth_handler() -> Any:
             return httpx.Response(200, json=_device_payload())
         if path == PATH_TOKEN_ENDPOINT:
             body = json.loads(request.content)
-            # 按 grant_type 分流（**不要**按 device_code 字段判定：换码请求体里
-            # 设备码的字段名是 `code`，按 device_code 判会静默落到刷新分支）。
-            if body.get("grant_type") == "authorization_code":  # 换码
+            # 按 grant_type 分流。**换码的 grant_type 是 RFC 8628 设备码 URN**
+            # （`urn:ietf:params:oauth:grant-type:device_code` + `device_code=`），
+            # 不是 OAuth 常规的 `authorization_code` —— 后者在飞书设备码链路上**从不出现**。
+            # 曾按 `authorization_code` 判：条件永不成立 → 每次换码都落进下方刷新分支 →
+            # 两个用户都拿到 `sequence[-1]`（B 的令牌），表现为「A 绑定后 open_id 是 B 的」。
+            # 刷新走独立值 `refresh_token`（oauth.refresh），两者互斥，判据可靠。
+            if body.get("grant_type") == DEVICE_CODE_GRANT_TYPE:  # 换码
                 uat, rt = sequence[min(issued["n"], len(sequence) - 1)]
                 issued["n"] += 1
                 return httpx.Response(
