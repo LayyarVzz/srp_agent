@@ -8,9 +8,6 @@
 Vue 3 + Three.js 前端  ←→  FastAPI 交互服务（SSE）  ←→  LangChain/LangGraph Agent  ←→  MCP 工具服务  ←→  LLM / ASR
 ```
 
-> **范围说明**：`services/rag_mcp/`（RAG 检索服务）不属于本文档覆盖范围，其部署与接口见该模块自身文档。
-> 本仓库 Agent 主流程默认不调用 RAG。
-
 ---
 
 ## 1. 已实现功能
@@ -53,9 +50,63 @@ Vue 3 + Three.js 前端  ←→  FastAPI 交互服务（SSE）  ←→  LangChai
 - **A2A 智能体互联**：入站 `AgentCard` 发现 + JSON-RPC 2.0 单端点（`message/send`、`message/stream`、`task/get`、`task/cancel`）；
   出站经 `a2a_mcp` 把远端智能体当普通 MCP 工具调用。
 
+语音输入接入讯飞语音听写 IAT，需在 `.env` 中配置（未配置时语音接口返回 `asr.missing_credentials`，
+文本链路与 `transcript` 直传降级不受影响）：
+
+```env
+XF_IAT_APP_ID=
+XF_IAT_API_KEY=
+XF_IAT_API_SECRET=
+```
+
+音频文件使用 16kHz、16bit、单声道 PCM。可用脚本单独测试语音识别：
+
+```bash
+uv run python scripts/test_xfyun_iat.py path/to/audio.pcm
+```
+
 ---
 
-## 2. 目录结构
+## 2. A2A 智能体互联（扩展项，仅供脚本级验证）
+
+**定位**：A2A 是**编排层的扩展点举证**，不是主链路的必需能力。
+
+### 2.1 实现边界
+
+| 支持 | 不支持（刻意裁剪） |
+|---|---|
+| `GET /.well-known/agent.json` AgentCard 发现 | file / function-call Part（仅 text Part） |
+| `message/send`（同步到终态） | 多技能协商（`skills` 仅声明 1 项） |
+| `message/stream`（SSE 过程帧 + 终态 Task） | 推送 webhook（`pushNotifications: false`） |
+| `task/get`、`task/cancel` | 状态迁移历史（`stateTransitionHistory: false`） |
+| peer 身份：配置级注册表（`A2A_PEER_MAP`） | 复杂认证（OAuth / mTLS / 卡片签名） |
+
+
+### 2.2 已知边界
+
+- **协议版本**：`protocolVersion = 0.3.0`
+- **验证方式仅脚本级**：无常驻远端智能体、`tests/` 中无用例覆盖；验证完全依赖
+  `scripts/demo_a2a.py`（进程内 uvicorn 起 B 实例、强制 `MCP_TRANSPORT=stdio` 自包含，零成本可跑）。
+  CI 不覆盖，无 Docker 级端到端用例。
+- **任务注册表是进程内的**：无持久化，`task/get` / `task/cancel` 必须打到处理该任务的**同一实例**；
+  多副本部署下会随机失效。`message/send` 返回即终态（拿不到 task_id），**只有 `message/stream`
+  路径的取消才真正生效**。
+- **容器环境下默认不可用**：compose 未注入 `A2A_PEER_MAP` → 入站调用一律 `a2a.invalid_request`
+  （仅 AgentCard 发现可用）；`A2A_MCP_AGENTS` 未配置 → 出站工具**不登记**。两项均在
+  `AgentRuntime` 装配期读入、**不热加载**，改配置后须 `--force-recreate` 而非 `restart`。
+- **peer 身份为配置级约定**：`A2A_MCP_PEER_ID`（默认 `srp-agent`）必须与对端 `A2A_PEER_MAP`
+  的登记项**精确匹配**，否则对端返回 `a2a.invalid_request`。peer 的入站身份落匿名命名空间
+  `a2a:<peer_id>`，与人类用户的记忆/会话物理隔离。
+
+### 2.3 验证命令
+
+```bash
+uv run python -m scripts.demo_a2a     # 双实例互联：发现 → 调用 → 流式 → 整合（需 LLM_API_KEY）
+```
+
+---
+
+## 3. 目录结构
 
 ```
 srp_agent/
@@ -77,9 +128,9 @@ srp_agent/
 
 ---
 
-## 3. 本地部署
+## 4. 本地部署
 
-### 3.1 最小路径（全内存，零外部依赖）
+### 4.1 最小路径（全内存，零外部依赖）
 
 ```bash
 # 1) 安装依赖（uv 自动按 .python-version 建 .venv）
@@ -107,7 +158,7 @@ uv run python scripts/run_api.py
 > 故必须用 `scripts/run_api.py`（内部显式指定 loop 工厂），直接 `uvicorn main:app` 会报
 > `Psycopg cannot use the 'ProactorEventLoop'`。Linux / 容器内无此问题。
 
-### 3.2 接入 Postgres（持久化 + 语义召回）
+### 4.2 接入 Postgres（持久化 + 语义召回）
 
 ```bash
 docker run -d --name srp-agent-pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
@@ -115,61 +166,7 @@ docker run -d --name srp-agent-pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD
   pgvector/pgvector:pg17        # 必须 pgvector 镜像，postgres:latest 不含 vector 扩展
 ```
 
-## Git 使用
-
-```bash
-# 克隆仓库
-git clone xxx
-
-# 添加所有更改
-git add .
-
-# 提交
-git commit -m "<提交信息>"
-
-# 推送到远程
-git push origin fearture
-```
-
-建议使用可视化的git提交，比如vscode或PyCharm等软件自带的git提交。
-
-分支合并不需要使用rebase，使用commit就可以。
-
-## Agent 交互接口
-
-当前 FastAPI 入口提供以下接口：
-
-```text
-POST   /api/v1/sessions            # 创建会话
-GET    /api/v1/sessions            # 会话列表
-DELETE /api/v1/sessions/{id}       # 删除会话
-POST   /api/v1/interactions/text   # 文字输入
-POST   /api/v1/interactions/voice  # 语音输入
-GET    /api/v1/logs/recent         # 最近交互事件（按用户过滤；?limit=1..200）
-GET    /api/v1/logs/trace/{id}     # 按 trace_id 取一条链路（响应头 X-Request-Id）
-GET    /healthz                    # 健康检查
-```
-
-会话和交互接口需要带请求头 `X-User-Id`。MVP 阶段只是用于区分用户，不做真实登录。
-
-## 日志与可观测性
-
-每个请求都会分配 `trace_id` 并回写响应头 `X-Request-Id`，该 id 贯穿 api → Agent → MCP 子进程，
-可用它把一次交互在各进程日志里串起来：
-
-```bash
-docker compose logs -f api | grep trace=req_xxxx      # 容器聚合
-uv run pytest tests/test_log_events.py -q             # 事件链路与脱敏口径
-```
-
-- **形态**：`LOG_FORMAT=text`（默认，人眼可读）/ `json`（一行一条 JSONL，供采集器）；
-  4 个进程共用同一开关，避免混合形态。
-- **结构化事件**：`request.received / intent.classified / tool.called / answer.generated /
-  memory.saved / request.finished` 同时落库到 `interaction_events` 表，支持跨进程、跨重启回溯。
-- **脱敏**：日志与事件只记消息体的 `len=` 与 `sha256=` 摘要，从不记原文；token/密钥/邮箱/手机号
-  在写出前统一替换为 `***`。
-
-语音输入目前接入讯飞语音听写 IAT，需要在 `.env` 中配置：
+`.env` 中配置：
 
 ```env
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/srp_agent
@@ -182,7 +179,7 @@ EMBEDDING_API_KEY=<密钥>
 
 首次启动自动建表（`checkpoints` / `store` / `sessions` / `interaction_events` / `lark_bindings`），无需手动迁移。
 
-### 3.3 容器化部署（compose）
+### 4.3 容器化部署（compose）
 
 ```bash
 docker compose up -d --build     # 首次：构建全部镜像并启动
@@ -216,28 +213,31 @@ LOG_FORMAT=text                                     # text | json
 
 > `DATABASE_URL` / `MCP_*` / `LARK_MCP_*` / `A2A_MCP_HOST` 由 compose 写成服务名，**不要**在 `.env` 覆盖。
 
-### 3.4 验收脚本
+### 4.4 验收脚本
 
 ```bash
 uv run pytest                      # ① 离线单测（fake LLM，零网络）
 uv run ruff check .                # ② Lint
-uv run python -m scripts.demo_chat # ③ Agent 全流程（需 LLM_API_KEY）
+uv run pytest tests/test_log_events.py -q   # ③ 事件链路口径与日志脱敏
+uv run python -m scripts.demo_chat # ④ Agent 全流程（需 LLM_API_KEY）
 uv run python -m scripts.demo_session   # 会话管理（无需 LLM）
 uv run python -m scripts.demo_plan      # 多步规划 + 并行子代理
 uv run python -m scripts.demo_clarify   # 澄清式追问
 uv run python -m scripts.demo_a2a       # A2A 双实例互联（进程内自包含）
 ```
 
-详见 [docs/TESTING.md](docs/TESTING.md)。
+> **测试前请留意**：`tests/` 的用例依赖环境独立。本地 `.env` 中的 `LOG_FORMAT` / `A2A_MCP_AGENTS`
+> 等运行期项会影响断言（`tests/conftest.py` 已做隔离，见该文件说明）。
+
 
 ---
 
-## 4. API 层接口
+## 5. API 层接口
 
 Base URL：`http://<host>:8000`，业务接口统一前缀 `/api/v1`。
 **除健康检查、指标、A2A 与日志链路回溯外，均需请求头 `X-User-Id`**（MVP 身份约定，不做真实登录；仅用于会话归属隔离）。
 
-### 4.1 会话管理
+### 5.1 会话管理
 
 | 方法 | 路径 | 说明 | 响应 |
 |---|---|---|---|
@@ -245,7 +245,7 @@ Base URL：`http://<host>:8000`，业务接口统一前缀 `/api/v1`。
 | `GET` | `/api/v1/sessions?limit=1..100` | 会话列表（按创建时间降序） | `200` |
 | `DELETE` | `/api/v1/sessions/{session_id}` | 删除会话（仅元数据） | `204` |
 
-### 4.2 交互
+### 5.2 交互
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -275,7 +275,7 @@ Base URL：`http://<host>:8000`，业务接口统一前缀 `/api/v1`。
 - 过程层 `status`：`listening / thinking / retrieving / using_tool / planning / delegating / clarifying / speaking / error`；
 - 内部层 `finished_reason`：`completed / tool_limit / partial / fallback / error / needs_clarification`。
 
-### 4.3 A2A 智能体互联
+### 5.3 A2A 智能体互联
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -286,7 +286,7 @@ Base URL：`http://<host>:8000`，业务接口统一前缀 `/api/v1`。
 - `task_id == session_id`；任务注册表为**进程内**（无持久化），`message/send` 返回即终态，`task/cancel` 仅对流式任务生效。
 - HTTP 恒 `200`，协议错误以 JSON-RPC error 信封表达（标准码 + `error.data.code` 承载 `a2a.*`）。
 
-### 4.4 日志与指标
+### 5.4 日志与指标
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -303,9 +303,9 @@ Base URL：`http://<host>:8000`，业务接口统一前缀 `/api/v1`。
 
 ---
 
-## 5. 日志观测
+## 6. 日志观测
 
-### 5.1 全链路 trace
+### 6.1 全链路 trace
 
 api 入口为每个请求分配/沿用 `trace_id`（`req_` + 16 字节 hex）并**回写响应头 `X-Request-Id`**。
 该 id 经 ContextVar 注入**每一条日志**（含第三方库），并在 api 与 3 个 MCP 进程的日志里统一可 grep：
@@ -321,7 +321,7 @@ docker compose logs api | grep trace=req_a3273356c5994378
 
 text 形态前缀固定为 `[trace=… session=… user=…]`，可直接 `grep`/`awk` 初筛。
 
-### 5.2 形态与开关
+### 6.2 形态与开关
 
 | env | 默认 | 说明 |
 |---|---|---|
@@ -332,7 +332,7 @@ text 形态前缀固定为 `[trace=… session=… user=…]`，可直接 `grep`
 容器内**一切走 stdout/stderr，不写文件**：聚合交 `docker compose logs -f`，轮转交 compose 的 `json-file`
 driver（`max-size=10m` / `max-file=3`）。4 个进程共用同一 `LOG_FORMAT`，避免混合行格式。
 
-### 5.3 结构化事件
+### 6.3 结构化事件
 
 六类事件同时写 stdout 与 `interaction_events` 表（跨进程、跨重启可回溯）：
 
@@ -350,13 +350,13 @@ driver（`max-size=10m` / `max-file=3`）。4 个进程共用同一 `LOG_FORMAT`
   Agent runtime 那条记**一轮交互**（`source == "agent"`，带 LLM token 累计）。
 - `tool.called.duration_ms` 是**批次级**（`ToolNode` 并行执行同批 `tool_calls`）；子代理工具为整段子图级。
 
-### 5.4 指标
+### 6.4 指标
 
 `GET /metrics` 消费**同一条事件总线**（口径与结构化事件同名同源，不引入第二套），返回
 请求/回答计数、错误计数、`finished_reason` 分布、按来源的耗时分布（`count / avg / p50 / p95 / max`）、工具调用统计等。
 响应含 `service` / `pid` —— **多副本时指标只代表本进程**，不要误读为全局数。
 
-### 5.5 安全口径（硬约束）
+### 6.5 安全口径（硬约束）
 
 - 消息体**只记 `len=` 与 `sha256[:8]`**，从不记原文（提示词、回答、工具参数一律如此）。
 - 脱敏在写出前完成：`api_key / authorization / token / user_access_token / refresh_token / secret`
@@ -368,12 +368,12 @@ driver（`max-size=10m` / `max-file=3`）。4 个进程共用同一 `LOG_FORMAT`
 
 ---
 
-## 6. Langfuse 跟踪
+## 7. Langfuse 跟踪
 
 **默认关闭**：未配置 `LANGFUSE_*` 即全程零观测回调（图 config 不带 handler，逐字零回归），
 云端不可达时 Agent 照常回答（fail-open）。观测是外挂能力，**不得成为对话链路的前置条件**。
 
-### 6.1 开启
+### 7.1 开启
 
 ```env
 LANGFUSE_TRACING_ENABLED=true
@@ -387,7 +387,7 @@ LANGFUSE_TIMEOUT=5                               # SDK API 请求超时（秒）
 
 只有 `api` 进程需要注入 `LANGFUSE_*`（MCP 服务容器的工具 span 由 api 侧回调统一产出）。
 
-### 6.2 设计要点
+### 7.2 设计要点
 
 | 要点 | 实现 |
 |---|---|
@@ -398,26 +398,3 @@ LANGFUSE_TIMEOUT=5                               # SDK API 请求超时（秒）
 | trace 名 | 对话链路 `agent.chat`；带外记忆保存 `memory.out_of_band_save`（与对话成本口径分开呈现） |
 | 脱敏 | 走 SDK 原生 `mask=`：按键名（复用 `shared.logging.is_sensitive_field`，口径不分叉）+ 正则兜底；掩码函数自身失败则返回整车掩码占位 |
 | 关闭语义 | flush（带超时）+ shutdown，任何失败只记日志；`aclose()` 幂等 |
-
-### 6.3 已知边界（验收时注意）
-
-- **数据出境**：Langfuse Cloud 是境外 SaaS，开启即代表接受把对话样本（prompt / 回答 / 工具入参与结果，
-  密钥已掩码）发往所选区域。生产建议 `SAMPLE_RATE < 1.0`，或仅在 `ENVIRONMENT=dev` 开启。
-- **入库异步**：SDK `flush()` 只保证「已送达 API」，服务端入库可能 15–30s 后才可查询 ——
-  **验收脚本不得在 flush 后立即断言**，需留等待窗口。
-- **不装配 OTel**：不设任何 `OTEL_*`、不自建 collector、不装 `openinference-*`。Langfuse SDK 内部
-  以 OTLP-HTTP 上报是其实现细节，端点由 `BASE_URL` 决定。
-- 不要设 `LANGFUSE_HOST`（废弃旧名，与 `BASE_URL` 同设时 SDK 静默取后者）、
-  `LANGCHAIN_TRACING*`（v1 变量 → RuntimeError）、`LANGSMITH_TRACING*`（与 Langfuse 双写，无收益）。
-
----
-
-## 7. 相关文档
-
-| 主题 | 文档 |
-|---|---|
-| 前端接口契约（状态码 / SSE 帧 / 动画驱动） | [docs/api.md](docs/api.md) |
-| 部署运维（compose 拓扑 / 日志排查 / 备份回滚） | [docs/deploy.md](docs/deploy.md) |
-| 测试指南（三档验收 / 环境变量 / demo 脚本） | [docs/TESTING.md](docs/TESTING.md) |
-| 开发硬约束（编排 / 记忆 / 安全口径） | [CLAUDE.md](CLAUDE.md) |
-| MCP 服务各自说明 | [tools_mcp](services/tools_mcp/README.md) · [lark_mcp](services/lark_mcp/README.md) · [a2a_mcp](services/a2a_mcp/README.md) |
