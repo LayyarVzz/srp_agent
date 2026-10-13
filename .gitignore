@@ -42,3 +42,6 @@ eval_reports/
 
 # /scripts
 # /tests
+
+# RAG generated indexes
+services/rag_mcp/knowledge/index/
